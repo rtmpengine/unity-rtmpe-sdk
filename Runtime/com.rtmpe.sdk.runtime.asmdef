@@ -1,0 +1,14 @@
+{
+    "name": "RTMPE.SDK.Runtime",
+    "rootNamespace": "RTMPE",
+    "references": [],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

@@ -1,0 +1,4 @@
+# Generated FlatBuffers code — Unity SDK (C#)
+# Do NOT edit these files by hand.
+# Regenerate with: bash scripts/generate-contracts.sh
+*.cs

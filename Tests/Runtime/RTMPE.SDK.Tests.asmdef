@@ -1,0 +1,17 @@
+{
+    "name": "RTMPE.SDK.Tests",
+    "rootNamespace": "RTMPE.Tests",
+    "references": [
+        "RTMPE.SDK.Runtime"
+    ],
+    "optionalUnityReferences": [
+        "TestAssemblies"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": []
+}

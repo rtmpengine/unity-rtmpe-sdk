@@ -33,10 +33,22 @@ namespace RTMPE.Transport
         private Socket   _socket;
         private EndPoint _remoteEndPoint;
         private bool     _disposed;
+        // Populated by Connect() after the socket is bound.
+        // Reflects the actual outgoing source IP (discovered via a routing probe),
+        // not 0.0.0.0 that would result from Bind(IPAddress.Any, 0).
+        private System.Net.IPEndPoint _localEndPoint;
 
         // ── Properties ─────────────────────────────────────────────────────────
         /// <inheritdoc/>
         public override bool IsConnected => _socket != null && !_disposed;
+
+        /// <summary>
+        /// The local source endpoint (IP + ephemeral port) the OS assigned when
+        /// the socket was bound. Populated after <see cref="Connect"/> is called.
+        /// The IP reflects the actual outgoing interface (not 0.0.0.0).
+        /// Returns <see langword="null"/> before <see cref="Connect"/>.
+        /// </summary>
+        public override System.Net.IPEndPoint LocalEndPoint => _localEndPoint;
 
         // ── Construction ───────────────────────────────────────────────────────
 
@@ -101,6 +113,27 @@ namespace RTMPE.Transport
 
             // Bind to any local address/port — the OS assigns an ephemeral source port.
             _socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+
+            // Discover the actual outgoing source IP via a temporary routing probe.
+            // Socket.Connect for UDP just records the destination and triggers the
+            // kernel routing table lookup without sending any data. Reading
+            // LocalEndPoint after connect gives the real outgoing interface IP
+            // (not 0.0.0.0 that Bind(Any) would produce).
+            int boundPort = ((IPEndPoint)_socket.LocalEndPoint).Port;
+            try
+            {
+                using var probe = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                probe.Connect(_remoteEndPoint);
+                var probeLocal = probe.LocalEndPoint as IPEndPoint;
+                _localEndPoint = probeLocal != null
+                    ? new IPEndPoint(probeLocal.Address, boundPort)
+                    : new IPEndPoint(IPAddress.Loopback, boundPort);
+            }
+            catch
+            {
+                // Fallback: use loopback IP (works for localhost dev/test).
+                _localEndPoint = new IPEndPoint(IPAddress.Loopback, boundPort);
+            }
         }
 
         /// <inheritdoc/>

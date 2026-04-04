@@ -24,6 +24,8 @@ using System.Collections;
 using UnityEngine;
 using RTMPE.Threading;
 using RTMPE.Transport;
+using RTMPE.Crypto;
+using RTMPE.Protocol;
 
 namespace RTMPE.Core
 {
@@ -104,18 +106,25 @@ namespace RTMPE.Core
         private NetworkSettings _settings;
 
         // ── Runtime state (main-thread only) ──────────────────────────────────
-        private NetworkState  _state = NetworkState.Disconnected;
-        private NetworkThread _networkThread;
-        private NetworkTransport _transport;
+        private NetworkState      _state = NetworkState.Disconnected;
+        private NetworkThread     _networkThread;
+        private NetworkTransport  _transport;
         private MainThreadDispatcher _dispatcher;
-        private Coroutine _timeoutCoroutine;
+        private Coroutine         _timeoutCoroutine;
+        private Coroutine         _connectCoroutine;
 
-        // Session tokens populated on SessionAck (Week 9+)
+        // Session tokens populated on SessionAck
         private uint   _cryptoId;
         private string _jwtToken;
         private string _reconnectToken;
         private ulong  _localPlayerId;
         private ulong  _currentRoomId;
+
+        // Session crypto state (Week 9)
+        private HandshakeHandler _handshakeHandler;
+        private SessionKeys      _sessionKeys;
+        private PacketBuilder    _packetBuilder;
+        private HeartbeatManager _heartbeatManager;
 
         // ── Properties ─────────────────────────────────────────────────────────
 
@@ -127,22 +136,22 @@ namespace RTMPE.Core
                                 || _state == NetworkState.InRoom;
 
         /// <summary>True when connected and inside a room.</summary>
-        /// <remarks>
-        /// State is the authoritative source for "are we in a room". <c>CurrentRoomId</c>
-        /// is populated in Week 9 when <c>OnRoomJoinAck</c> parses the payload; do not
-        /// gate this property on <c>CurrentRoomId != 0</c> or it will always return
-        /// <see langword="false"/> until that parsing is implemented.
-        /// </remarks>
         public bool IsInRoom => _state == NetworkState.InRoom;
 
         /// <summary>Settings asset in use (may be the built-in default).</summary>
         public NetworkSettings Settings => _settings;
 
-        /// <summary>Local player ID — valid after SessionAck (Week 9+).</summary>
+        /// <summary>Local player ID — valid after SessionAck.</summary>
         public ulong LocalPlayerId => _localPlayerId;
 
         /// <summary>Current room ID — valid after RoomJoin.</summary>
         public ulong CurrentRoomId => _currentRoomId;
+
+        /// <summary>JWT bearer token — valid after SessionAck. Use for Room Service calls.</summary>
+        public string JwtToken => _jwtToken;
+
+        /// <summary>Last measured round-trip time in milliseconds (-1 if not yet available).</summary>
+        public float LastRttMs { get; private set; } = -1f;
 
         // ── Events ─────────────────────────────────────────────────────────────
 
@@ -169,6 +178,9 @@ namespace RTMPE.Core
         /// packet is received. Argument is the full raw packet (header + payload).
         /// </summary>
         public event Action<byte[]> OnDataReceived;
+
+        /// <summary>Fired on each successful heartbeat with the measured RTT in ms.</summary>
+        public event Action<float> OnRttUpdated;
 
         // ── Unity lifecycle ────────────────────────────────────────────────────
 
@@ -198,6 +210,12 @@ namespace RTMPE.Core
             // background threads are started) so the first Enqueue() call is free
             // of the one-time GameObject allocation cost.
             _dispatcher = MainThreadDispatcher.Instance;
+        }
+
+        private void Update()
+        {
+            // Drive the heartbeat tick each frame.
+            _heartbeatManager?.Tick(packet => _networkThread?.Send(packet));
         }
 
         private void OnDestroy()
@@ -230,12 +248,23 @@ namespace RTMPE.Core
             _networkThread = new NetworkThread(_transport, _settings.networkThreadBufferBytes);
             _networkThread.OnPacketReceived += HandlePacketReceived;
             _networkThread.OnError          += HandleTransportError;
+
+            _packetBuilder = new PacketBuilder();
         }
 
         private void Cleanup()
         {
-            // Dispose stops the thread and disconnects the transport.
-            _networkThread?.Dispose();
+            _heartbeatManager?.Stop();
+            _heartbeatManager = null;
+            _handshakeHandler = null;
+            _sessionKeys      = null;
+            // Unsubscribe before dispose to break delegate references.
+            if (_networkThread != null)
+            {
+                _networkThread.OnPacketReceived -= HandlePacketReceived;
+                _networkThread.OnError          -= HandleTransportError;
+                _networkThread.Dispose();
+            }
             _networkThread = null;
             _transport     = null;
         }
@@ -263,11 +292,14 @@ namespace RTMPE.Core
 
             TransitionTo(NetworkState.Connecting);
 
+            // Create a fresh handshake handler (generates a new X25519 ephemeral keypair).
+            _handshakeHandler = new HandshakeHandler();
+
             _networkThread.Start();
 
-            // TODO (Week 9): replace legacy stub with full ECDH 4-step flow:
-            //   HandshakeInit → Challenge → HandshakeResponse → SessionAck
-            SendHandshakeInit(apiKey);
+            // Kick off the async handshake-init coroutine — it waits for the transport
+            // to be bound (LocalEndPoint != null) before building and sending the packet.
+            _connectCoroutine = StartCoroutine(HandshakeInitCoroutine(apiKey));
 
             _timeoutCoroutine = StartCoroutine(ConnectionTimeoutRoutine());
         }
@@ -281,8 +313,6 @@ namespace RTMPE.Core
             if (_state == NetworkState.Disconnected ||
                 _state == NetworkState.Disconnecting) return;
 
-            // Capture connected status BEFORE transitioning — IsConnected checks State,
-            // and after we enter Disconnecting that check would return false.
             bool wasConnected = IsConnected;
 
             if (_timeoutCoroutine != null)
@@ -290,17 +320,18 @@ namespace RTMPE.Core
                 StopCoroutine(_timeoutCoroutine);
                 _timeoutCoroutine = null;
             }
+            if (_connectCoroutine != null)
+            {
+                StopCoroutine(_connectCoroutine);
+                _connectCoroutine = null;
+            }
 
-            // Announce that teardown has begun.  Listeners can react (e.g. show UI).
             TransitionTo(NetworkState.Disconnecting);
 
             if (wasConnected)
                 SendDisconnect();
 
-            // NOTE: Stop() joins the background thread with a 2-second timeout.
-            // In the worst case (thread stuck in a blocking socket call), this
-            // blocks the Unity main thread for up to 2 seconds.
-            // Week 10 will replace this with cooperative CancellationToken shutdown.
+            _heartbeatManager?.Stop();
             _networkThread?.Stop();
             ClearSessionData();
             TransitionTo(NetworkState.Disconnected, DisconnectReason.ClientRequest);
@@ -309,11 +340,6 @@ namespace RTMPE.Core
         /// <summary>
         /// Enqueue a raw packet for transmission. Thread-safe.
         /// </summary>
-        /// <param name="data">Raw bytes to send (header + payload).</param>
-        /// <param name="reliable">
-        /// When <see langword="true"/>, the packet is marked with
-        /// <see cref="PacketFlags.Reliable"/> — used by KCP transport (Week 10+).
-        /// </param>
         public void Send(byte[] data, bool reliable = false)
         {
             if (!IsConnected)
@@ -327,24 +353,53 @@ namespace RTMPE.Core
             _networkThread?.Send(data, reliable);
         }
 
+        // ── Handshake coroutine ────────────────────────────────────────────────
+
+        /// <summary>
+        /// Wait for the UDP transport to bind (background thread sets LocalEndPoint),
+        /// then build and transmit the encrypted HandshakeInit packet.
+        ///
+        /// Polls LocalEndPoint each frame — the background thread calls
+        /// _transport.Connect() which binds the socket and sets the endpoint
+        /// within the first loop iteration (~1 ms after Start()).
+        /// </summary>
+        private IEnumerator HandshakeInitCoroutine(string apiKey)
+        {
+            const float maxWaitSecs = 2f;
+            float waited = 0f;
+
+            while (_transport.LocalEndPoint == null && waited < maxWaitSecs)
+            {
+                yield return null;
+                waited += Time.unscaledDeltaTime;
+            }
+
+            _connectCoroutine = null;
+
+            if (_transport.LocalEndPoint == null)
+            {
+                LogDebug("Transport did not bind within 2 s — timeout coroutine will handle failure.");
+                yield break;
+            }
+
+            SendHandshakeInit(apiKey);
+        }
+
         // ── Receive path (raised on network thread → marshalled to main thread) ─
 
         private void HandlePacketReceived(byte[] data)
         {
-            // Marshal to main thread — Unity APIs are not safe to call here.
             _dispatcher?.Enqueue(() => ProcessPacket(data));
         }
 
         private void ProcessPacket(byte[] data)
         {
-            // ─ Minimum length check ─────────────────────────────────────────────
             if (data == null || data.Length < PacketProtocol.HEADER_SIZE)
             {
                 Debug.LogWarning("[RTMPE] Dropped packet: too short to contain a valid header.");
                 return;
             }
 
-            // ─ Magic validation (bytes 0-1, little-endian u16) ──────────────────
             var magic = (ushort)(
                 data[PacketProtocol.OFFSET_MAGIC]
               | (data[PacketProtocol.OFFSET_MAGIC + 1] << 8));
@@ -357,7 +412,6 @@ namespace RTMPE.Core
                 return;
             }
 
-            // ─ Version validation (byte 2) ───────────────────────────────────────
             if (data[PacketProtocol.OFFSET_VERSION] != PacketProtocol.VERSION)
             {
                 Debug.LogWarning(
@@ -367,58 +421,132 @@ namespace RTMPE.Core
             }
 
             var packetType = (PacketType)data[PacketProtocol.OFFSET_TYPE];
-            // var flags   = (PacketFlags)data[PacketProtocol.OFFSET_FLAGS];  // Week 9+
 
             LogDebug($"Received {packetType} ({data.Length} B).");
 
             switch (packetType)
             {
-                case PacketType.HandshakeAck:    OnHandshakeAck(data);    break;
-                case PacketType.SessionAck:      OnSessionAck(data);      break;
-                case PacketType.HeartbeatAck:    OnHeartbeatAck(data);    break;
+                // ── W6 ECDH 4-step handshake ────────────────────────────────
+                case PacketType.Challenge:    OnChallenge(data);    break;
+                case PacketType.SessionAck:   OnSessionAck(data);   break;
+
+                // ── Legacy W3 handshake (backward compatibility) ─────────────
+                case PacketType.HandshakeAck: OnHandshakeAck(data); break;
+
+                // ── Keep-alive ───────────────────────────────────────────────
+                case PacketType.HeartbeatAck: OnHeartbeatAck(data); break;
+
+                // ── Room / session ────────────────────────────────────────────
                 case PacketType.RoomJoin:        OnRoomJoinAck(data);     break;
                 case PacketType.Disconnect:      OnServerDisconnect(data); break;
                 case PacketType.Data:
-                case PacketType.StateSync:       OnDataReceived?.Invoke(data); break;
-
-                // TODO (Week 9): add Challenge + HandshakeResponse handlers for the
-                // full ECDH 4-step flow. Challenge carries [ephemeral:32][static:32][sig:64]
-                // and must be verified with Ed25519 before proceeding.
-                case PacketType.Challenge:
-                case PacketType.HandshakeResponse:
-                    LogDebug($"Packet type {packetType} requires Week 9 ECDH handler — stub.");
-                    break;
+                case PacketType.StateSync:        OnDataReceived?.Invoke(data); break;
 
                 default:
-                    LogDebug($"No handler registered for packet type 0x{(byte)packetType:X2}.");
+                    LogDebug($"No handler for packet type 0x{(byte)packetType:X2}.");
                     break;
             }
         }
 
-        // ── Packet handlers (main thread) ──────────────────────────────────────
+        // ── W6 Handshake packet handlers ───────────────────────────────────────
 
-        // Legacy Handshake (Week 3 compat path — kept for backward compatibility)
-        private void OnHandshakeAck(byte[] _)
+        /// <summary>
+        /// Handle an incoming <c>Challenge</c> (0x06) from the server.
+        ///
+        /// 1. Parse 128-byte payload: [ephemeral:32][static:32][sig:64].
+        /// 2. Verify Ed25519 signature (H4 fix) — reject on failure.
+        /// 3. Derive session keys via X25519 ECDH + HKDF-SHA256 (G-H1).
+        /// 4. Send <c>HandshakeResponse</c> containing the client public key.
+        /// </summary>
+        private void OnChallenge(byte[] data)
         {
-            // Guard: ignore stale ACKs that arrive after a timeout has already
-            // transitioned us away from Connecting (U-C1 fix — no ghost Connected).
+            // Guard: only process Challenge while we are actively connecting.
             if (_state != NetworkState.Connecting) return;
+            if (_handshakeHandler == null)         return;
+
+            var payload = PacketParser.ExtractPayload(data);
+
+            byte[] pinnedKey = null;
+            try { pinnedKey = _settings?.PinnedServerPublicKeyBytes; }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[RTMPE] Invalid pinnedServerPublicKeyHex in settings: {ex.Message}");
+                return;
+            }
+
+            if (!_handshakeHandler.ValidateChallenge(
+                    payload,
+                    out _,                  // serverEphemeralPub (stored inside handler)
+                    out _,                  // serverStaticPub    (stored inside handler)
+                    pinnedKey))
+            {
+                Debug.LogError("[RTMPE] Challenge validation failed — Ed25519 signature invalid or " +
+                               "Challenge payload malformed. Possible MITM attack. Disconnecting.");
+                // Let the timeout coroutine fire OnConnectionFailed cleanly.
+                return;
+            }
+
+            // Derive directional session keys (G-H1 fix: two independent keys).
+            _sessionKeys = _handshakeHandler.DeriveSessionKeys();
+            if (_sessionKeys == null)
+            {
+                Debug.LogError("[RTMPE] ECDH key derivation failed (degenerate shared secret). Disconnecting.");
+                return;
+            }
+
+            // Send the client's X25519 ephemeral public key to the server.
+            var response = _packetBuilder.BuildHandshakeResponse(_handshakeHandler.ClientPublicKey);
+            _networkThread.Send(response);
+            LogDebug("Sent HandshakeResponse — awaiting SessionAck.");
+        }
+
+        /// <summary>
+        /// Handle <c>SessionAck</c> (0x08): parse crypto_id, JWT, and reconnect token,
+        /// then transition to <see cref="NetworkState.Connected"/> and start heartbeat.
+        /// </summary>
+        private void OnSessionAck(byte[] data)
+        {
+            // Guard: ignore stale ACKs that arrive after a timeout.
+            if (_state != NetworkState.Connecting) return;
+
+            var payload = PacketParser.ExtractPayload(data);
+
+            if (!PacketParser.ParseSessionAck(payload,
+                    out uint   cryptoId,
+                    out string jwtToken,
+                    out string reconnectToken))
+            {
+                Debug.LogError("[RTMPE] SessionAck parse failed — malformed payload. Disconnecting.");
+                return;
+            }
+
+            _cryptoId       = cryptoId;
+            _jwtToken       = jwtToken;
+            _reconnectToken = reconnectToken;
+
+            LogDebug($"SessionAck received: crypto_id={cryptoId}, jwt_len={jwtToken?.Length ?? 0}");
 
             if (_timeoutCoroutine != null)
             {
                 StopCoroutine(_timeoutCoroutine);
                 _timeoutCoroutine = null;
             }
+
             TransitionTo(NetworkState.Connected);
+
+            // Start keep-alive heartbeat.
+            _heartbeatManager = new HeartbeatManager(_settings.heartbeatIntervalMs);
+            _heartbeatManager.OnRttUpdated     += rtt => { LastRttMs = rtt; OnRttUpdated?.Invoke(rtt); };
+            _heartbeatManager.OnHeartbeatTimeout += OnHeartbeatTimeout;
+            _heartbeatManager.Start();
         }
 
-        // Production 4-step ECDH path (Week 9+ parse of JWT / reconnect token)
-        private void OnSessionAck(byte[] _)
+        // ── Legacy / other handlers ────────────────────────────────────────────
+
+        private void OnHandshakeAck(byte[] _)
         {
-            // Guard: ignore stale ACKs that arrive after timeout/disconnect (U-C1 fix).
             if (_state != NetworkState.Connecting) return;
 
-            // TODO (Week 9): deserialise [crypto_id:4 LE][jwt_len:2 LE][jwt:N][rc_len:2 LE][rc:N]
             if (_timeoutCoroutine != null)
             {
                 StopCoroutine(_timeoutCoroutine);
@@ -429,15 +557,21 @@ namespace RTMPE.Core
 
         private void OnHeartbeatAck(byte[] _)
         {
-            // TODO (Week 9): record last-seen timestamp; compute RTT.
+            _heartbeatManager?.OnAckReceived();
+        }
+
+        private void OnHeartbeatTimeout()
+        {
+            Debug.LogWarning("[RTMPE] Heartbeat timeout — 3 consecutive misses. Disconnecting.");
+            _networkThread?.Stop();
+            ClearSessionData();
+            TransitionTo(NetworkState.Disconnected, DisconnectReason.ConnectionLost);
         }
 
         private void OnRoomJoinAck(byte[] _)
         {
-            // Guard: only transition from Connected; ignore stale packets (U-C1 fix).
             if (_state != NetworkState.Connected) return;
-
-            // TODO (Week 9): parse room ID from payload.
+            // TODO (Week 10): parse room ID from payload.
             TransitionTo(NetworkState.InRoom);
             OnJoinedRoom?.Invoke(_currentRoomId);
         }
@@ -449,7 +583,7 @@ namespace RTMPE.Core
             TransitionTo(NetworkState.Disconnected, DisconnectReason.ServerRequest);
         }
 
-        // ── Transport error path (raised on network thread) ────────────────────
+        // ── Transport error path ───────────────────────────────────────────────
 
         private void HandleTransportError(Exception ex)
         {
@@ -457,10 +591,6 @@ namespace RTMPE.Core
 
             _dispatcher?.Enqueue(() =>
             {
-                // Capture state BEFORE any transition so event semantics are correct:
-                // OnConnectionFailed is for failed *connection attempts* (Connecting state).
-                // A transport error while Connected/InRoom is a connection-loss — only
-                // OnDisconnected (fired by TransitionTo) is appropriate in that case.
                 bool wasConnecting = _state == NetworkState.Connecting;
 
                 if (_timeoutCoroutine != null)
@@ -468,19 +598,17 @@ namespace RTMPE.Core
                     StopCoroutine(_timeoutCoroutine);
                     _timeoutCoroutine = null;
                 }
+                if (_connectCoroutine != null)
+                {
+                    StopCoroutine(_connectCoroutine);
+                    _connectCoroutine = null;
+                }
 
-                // Fire OnConnectionFailed BEFORE transitioning state — matching the
-                // ordering in ConnectionTimeoutRoutine so that handlers always see
-                // NetworkState.Connecting when OnConnectionFailed fires, regardless
-                // of whether the failure was a timeout or a transport error.
                 if (wasConnecting)
                     OnConnectionFailed?.Invoke(ex.Message);
 
-                // Join the background thread (Stop() is a no-op if already exited).
-                // OnServerDisconnect and Disconnect() both call Stop() before state
-                // transitions; HandleTransportError must be consistent.
                 _networkThread?.Stop();
-
+                _heartbeatManager?.Stop();
                 ClearSessionData();
                 TransitionTo(NetworkState.Disconnected, DisconnectReason.ConnectionLost);
             });
@@ -506,25 +634,59 @@ namespace RTMPE.Core
                     break;
 
                 case NetworkState.Disconnected when prev != NetworkState.Disconnected:
-                    // Fire with the reason supplied by the caller — never silently
-                    // default to Unknown when the actual cause is known.
                     OnDisconnected?.Invoke(reason);
                     break;
             }
         }
 
-        // ── Outbound stubs (Week 8 — packet serialisation added in Week 9) ──────
+        // ── Outbound helpers ───────────────────────────────────────────────────
 
         private void SendHandshakeInit(string apiKey)
         {
-            // Week 9: serialise PacketType.HandshakeInit + [api_key_len:2 LE][api_key:N].
-            LogDebug("SendHandshakeInit — stub (Week 9 will serialise real packet).");
+            byte[] psk = null;
+            try { psk = _settings?.ApiKeyPskBytes; }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[RTMPE] Invalid apiKeyPskHex in settings: {ex.Message}");
+                // Fall through — will send without encryption (insecure dev path).
+            }
+
+            byte[] encryptedPayload;
+            if (psk != null)
+            {
+                var localEp = _transport.LocalEndPoint;
+                if (localEp == null)
+                {
+                    Debug.LogError("[RTMPE] SendHandshakeInit: transport not yet bound, aborting.");
+                    return;
+                }
+                encryptedPayload = ApiKeyCipher.Encrypt(psk, apiKey, localEp);
+                LogDebug($"SendHandshakeInit: API key encrypted with PSK, source={localEp}");
+            }
+            else
+            {
+                // No PSK configured — build unencrypted payload for local dev only.
+                // WARNING: this is insecure. Configure apiKeyPskHex in production.
+                Debug.LogWarning("[RTMPE] apiKeyPskHex is not configured — sending API key unencrypted. " +
+                                 "This is insecure. Set apiKeyPskHex in NetworkSettings for production.");
+                var keyBytes = System.Text.Encoding.UTF8.GetBytes(apiKey);
+                encryptedPayload = new byte[2 + keyBytes.Length];
+                encryptedPayload[0] = (byte)(keyBytes.Length & 0xFF);
+                encryptedPayload[1] = (byte)((keyBytes.Length >> 8) & 0xFF);
+                Buffer.BlockCopy(keyBytes, 0, encryptedPayload, 2, keyBytes.Length);
+            }
+
+            var packet = _packetBuilder.BuildHandshakeInit(encryptedPayload);
+            _networkThread.Send(packet);
+            LogDebug($"HandshakeInit sent ({packet.Length} B).");
         }
 
         private void SendDisconnect()
         {
-            // Week 9: serialise PacketType.Disconnect packet and flush before Stop().
-            LogDebug("SendDisconnect — stub (Week 9 will serialise real packet).");
+            if (_packetBuilder == null) return;
+            var packet = _packetBuilder.BuildDisconnect();
+            _networkThread?.Send(packet);
+            LogDebug("Sent Disconnect packet.");
         }
 
         // ── Helpers ────────────────────────────────────────────────────────────
@@ -537,6 +699,7 @@ namespace RTMPE.Core
             {
                 OnConnectionFailed?.Invoke("Connection timeout.");
                 _networkThread?.Stop();
+                _heartbeatManager?.Stop();
                 ClearSessionData();
                 TransitionTo(NetworkState.Disconnected, DisconnectReason.Timeout);
             }
@@ -546,11 +709,14 @@ namespace RTMPE.Core
 
         private void ClearSessionData()
         {
-            _cryptoId       = 0;
-            _jwtToken       = null;
-            _reconnectToken = null;
-            _localPlayerId  = 0;
-            _currentRoomId  = 0;
+            _cryptoId         = 0;
+            _jwtToken         = null;
+            _reconnectToken   = null;
+            _localPlayerId    = 0;
+            _currentRoomId    = 0;
+            _handshakeHandler = null;
+            _sessionKeys      = null;
+            LastRttMs         = -1f;
         }
 
         private void LogDebug(string message)
@@ -559,6 +725,7 @@ namespace RTMPE.Core
                 Debug.Log($"[RTMPE] {message}");
         }
     }
+
 
     // ── Connection state ──────────────────────────────────────────────────────
 

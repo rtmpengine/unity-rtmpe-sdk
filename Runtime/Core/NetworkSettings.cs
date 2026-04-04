@@ -71,10 +71,50 @@ namespace RTMPE.Core
         [Tooltip("Log verbose NetworkManager state transitions to the Unity Console.")]
         public bool enableDebugLogs;
 
+        // ── Crypto (Week 9+) ─────────────────────────────────────────────────────
+
+        [Header("Crypto")]
+        [Tooltip(
+            "64-character lowercase hex string encoding the 32-byte pre-shared key used to " +
+            "encrypt the API key in HandshakeInit packets (C1 / M-12 fix).\n\n" +
+            "Copy this value from the RTMPE developer dashboard. " +
+            "It must match GATEWAY_API_KEY_ENCRYPTION_KEY_HEX on the server.\n\n" +
+            "Leave blank to disable API-key encryption (insecure — dev/local only).")]
+        public string apiKeyPskHex = "";
+
+        [Tooltip(
+            "Optional: 64-character lowercase hex string of the 32-byte Ed25519 static public key " +
+            "of the gateway you expect to connect to (H4 server pinning).\n\n" +
+            "Copy from the gateway startup log or developer dashboard. " +
+            "Leaving blank skips pinning and trusts any valid Ed25519 signature.")]
+        public string pinnedServerPublicKeyHex = "";
+
         // ── Derived ──────────────────────────────────────────────────────────────
 
         /// <summary>Tick interval in seconds (<c>1 / tickRate</c>).</summary>
         public float TickInterval => 1f / Mathf.Max(1, tickRate);
+
+        /// <summary>
+        /// Decode <see cref="apiKeyPskHex"/> to a 32-byte array, or return
+        /// <see langword="null"/> if the field is empty (insecure dev path).
+        /// Throws <see cref="System.ArgumentException"/> if the value is non-empty but invalid.
+        /// </summary>
+        public byte[] ApiKeyPskBytes =>
+            string.IsNullOrEmpty(apiKeyPskHex) ? null : Crypto.ApiKeyCipher.PskFromHex(apiKeyPskHex);
+
+        /// <summary>
+        /// Decode <see cref="pinnedServerPublicKeyHex"/> to 32 bytes, or return
+        /// <see langword="null"/> if pinning is not configured.
+        /// Throws <see cref="System.ArgumentException"/> if the value is non-empty but invalid.
+        /// </summary>
+        public byte[] PinnedServerPublicKeyBytes
+        {
+            get
+            {
+                if (string.IsNullOrEmpty(pinnedServerPublicKeyHex)) return null;
+                return Crypto.ApiKeyCipher.PskFromHex(pinnedServerPublicKeyHex);
+            }
+        }
 
         // ── Internal helpers ──────────────────────────────────────────────────────
 

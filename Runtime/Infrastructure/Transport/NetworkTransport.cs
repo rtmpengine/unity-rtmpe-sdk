@@ -18,7 +18,13 @@ namespace RTMPE.Transport
     {
         /// <summary>True while the underlying socket is open and ready for I/O.</summary>
         public abstract bool IsConnected { get; }
-
+        /// <summary>
+        /// The local endpoint (source IP and port) that the OS assigned to this socket
+        /// after <see cref="Connect"/> binds it.
+        /// Returns <see langword="null"/> before <see cref="Connect"/> is called.
+        /// Used by <see cref="Crypto.ApiKeyCipher"/> to build the M-12 AAD.
+        /// </summary>
+        public virtual System.Net.IPEndPoint LocalEndPoint => null;
         /// <summary>
         /// Open the socket and connect to the configured remote endpoint.
         /// Called once from the network background thread before the I/O loop begins.

@@ -18,6 +18,11 @@
 //   1. Verifies the Ed25519 signature: Verify(server_static_pub, server_ephemeral_pub, sig)
 //   2. Performs X25519: SharedSecret(client_private, server_ephemeral_pub)
 //   3. Derives directional SessionKeys via HKDF-SHA256
+//
+// W9-2 fix: HandshakeHandler implements IDisposable.  Dispose() zeros the
+// ephemeral private key and the server ephemeral public key in-place, reducing
+// the window in which sensitive key material can be recovered from a heap dump.
+// The caller (NetworkManager) disposes this handler on disconnect.
 
 using System;
 using System.Text;
@@ -28,8 +33,10 @@ namespace RTMPE.Crypto
     /// <summary>
     /// Per-session handshake state machine.
     /// Create one instance per <c>Connect()</c> call; discard on disconnect.
+    /// Implements <see cref="IDisposable"/> — call Dispose() (or use a using-statement)
+    /// after the handshake completes to zero the ephemeral private key in-place.
     /// </summary>
-    public sealed class HandshakeHandler
+    public sealed class HandshakeHandler : IDisposable
     {
         // HKDF constants must match the gateway exactly.
         private static readonly byte[] HkdfSalt = Encoding.ASCII.GetBytes("RTMPE-v3-hkdf-salt-2026");
@@ -41,6 +48,8 @@ namespace RTMPE.Crypto
 
         // Stored on Challenge receipt; needed for ECDH completion.
         private byte[] _serverEphemeralPub;
+
+        private bool _disposed;
 
         // ── Construction ─────────────────────────────────────────────────────
 
@@ -134,39 +143,57 @@ namespace RTMPE.Crypto
             var sharedSecret = Curve25519.SharedSecret(_clientPrivateKey, _serverEphemeralPub);
             if (sharedSecret == null) return null; // degenerate key — reject
 
-            // G-H1: determine which side is the "initiator" (smaller public key).
-            bool iAmInitiator = ComparePublicKeys(_clientPublicKey, _serverEphemeralPub) <= 0;
+            SessionKeys result;
+            // M-17 fix: declare prk OUTSIDE the try block so the finally clause can
+            // zero it.  prk is derived from the ECDH shared secret and must not
+            // linger in the managed heap after the session keys are produced.
+            byte[] prk = null;
+            try
+            {
+                // G-H1: determine which side is the "initiator" (smaller public key).
+                bool iAmInitiator = ComparePublicKeys(_clientPublicKey, _serverEphemeralPub) <= 0;
 
-            // Build the HKDF info: base || min(clientPub, serverPub) || max(clientPub, serverPub)
-            var (first, second) = iAmInitiator
-                ? (_clientPublicKey, _serverEphemeralPub)
-                : (_serverEphemeralPub, _clientPublicKey);
+                // Build the HKDF info: base || min(clientPub, serverPub) || max(clientPub, serverPub)
+                var (first, second) = iAmInitiator
+                    ? (_clientPublicKey, _serverEphemeralPub)
+                    : (_serverEphemeralPub, _clientPublicKey);
 
-            var info = new byte[HkdfInfoBase.Length + 32 + 32];
-            Buffer.BlockCopy(HkdfInfoBase, 0, info, 0,                   HkdfInfoBase.Length);
-            Buffer.BlockCopy(first,        0, info, HkdfInfoBase.Length, 32);
-            Buffer.BlockCopy(second,       0, info, HkdfInfoBase.Length + 32, 32);
+                var info = new byte[HkdfInfoBase.Length + 32 + 32];
+                Buffer.BlockCopy(HkdfInfoBase, 0, info, 0,                   HkdfInfoBase.Length);
+                Buffer.BlockCopy(first,        0, info, HkdfInfoBase.Length, 32);
+                Buffer.BlockCopy(second,       0, info, HkdfInfoBase.Length + 32, 32);
 
-            // HKDF-Extract
-            var prk = HkdfSha256.Extract(HkdfSalt, sharedSecret);
+                // HKDF-Extract
+                prk = HkdfSha256.Extract(HkdfSalt, sharedSecret);
 
-            // HKDF-Expand × 2: info+\x00 → initiator key, info+\x01 → responder key
-            var infoInit = new byte[info.Length + 1];
-            Buffer.BlockCopy(info, 0, infoInit, 0, info.Length);
-            infoInit[info.Length] = 0x00;
-            var keyInit = HkdfSha256.Expand(prk, infoInit, 32);
+                // HKDF-Expand × 2: info+\x00 → initiator key, info+\x01 → responder key
+                var infoInit = new byte[info.Length + 1];
+                Buffer.BlockCopy(info, 0, infoInit, 0, info.Length);
+                infoInit[info.Length] = 0x00;
+                var keyInit = HkdfSha256.Expand(prk, infoInit, 32);
 
-            var infoResp = new byte[info.Length + 1];
-            Buffer.BlockCopy(info, 0, infoResp, 0, info.Length);
-            infoResp[info.Length] = 0x01;
-            var keyResp = HkdfSha256.Expand(prk, infoResp, 32);
+                var infoResp = new byte[info.Length + 1];
+                Buffer.BlockCopy(info, 0, infoResp, 0, info.Length);
+                infoResp[info.Length] = 0x01;
+                var keyResp = HkdfSha256.Expand(prk, infoResp, 32);
 
-            // Assign encrypt/decrypt based on initiator role (mirrors the Rust gateway logic).
-            // Initiator sends with key_init and receives with key_resp; responder is opposite.
-            if (iAmInitiator)
-                return new SessionKeys(encryptKey: keyInit, decryptKey: keyResp);
-            else
-                return new SessionKeys(encryptKey: keyResp, decryptKey: keyInit);
+                // Assign encrypt/decrypt based on initiator role (mirrors the Rust gateway logic).
+                // Initiator sends with key_init and receives with key_resp; responder is opposite.
+                result = iAmInitiator
+                    ? new SessionKeys(encryptKey: keyInit, decryptKey: keyResp)
+                    : new SessionKeys(encryptKey: keyResp, decryptKey: keyInit);
+            }
+            finally
+            {
+                // W9-2 fix: zero the ECDH shared secret immediately after key derivation.
+                // The secret is no longer needed once PRK is derived; clearing it in-place
+                // limits the lifetime of raw DH output in the managed heap.
+                Array.Clear(sharedSecret, 0, sharedSecret.Length);
+                // M-17 fix: also zero the PRK (HKDF pseudo-random key derived from the
+                // shared secret).  prk may be null if Extract threw before assignment.
+                if (prk != null) Array.Clear(prk, 0, prk.Length);
+            }
+            return result;
         }
 
         // ── Helpers ───────────────────────────────────────────────────────────
@@ -183,6 +210,22 @@ namespace RTMPE.Crypto
                 if (diff != 0) return diff;
             }
             return 0;
+        }
+
+        // ── IDisposable ───────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Zero the ephemeral private key and server ephemeral public key in-place.
+        /// Safe to call multiple times (subsequent calls are no-ops).
+        /// </summary>
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            // W9-2 fix: zeroize sensitive key material to minimise the window
+            // in which a managed-heap dump or cold-boot attack can recover keys.
+            if (_clientPrivateKey != null) Array.Clear(_clientPrivateKey, 0, _clientPrivateKey.Length);
+            if (_serverEphemeralPub != null) Array.Clear(_serverEphemeralPub, 0, _serverEphemeralPub.Length);
         }
     }
 }

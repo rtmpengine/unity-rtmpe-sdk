@@ -32,7 +32,7 @@ namespace RTMPE.Transport
         // ── Runtime state ──────────────────────────────────────────────────────
         private Socket   _socket;
         private EndPoint _remoteEndPoint;
-        private bool     _disposed;
+        private volatile bool _disposed;
         // Populated by Connect() after the socket is bound.
         // Reflects the actual outgoing source IP (discovered via a routing probe),
         // not 0.0.0.0 that would result from Bind(IPAddress.Any, 0).
@@ -139,7 +139,8 @@ namespace RTMPE.Transport
         /// <inheritdoc/>
         public override void Disconnect()
         {
-            _socket?.Close();
+            // Dispose() internally calls Close(); calling both is redundant
+            // and may throw on some runtimes (L-SDK5 fix).
             _socket?.Dispose();
             _socket = null;
         }

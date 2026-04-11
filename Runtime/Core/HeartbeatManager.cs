@@ -32,8 +32,9 @@ namespace RTMPE.Core
 
         // ── State ─────────────────────────────────────────────────────────────
         private bool    _running;
-        private long    _lastSendTick;   // Stopwatch ticks at the time of the last send
-        private long    _lastAckTick;    // Stopwatch ticks at the time of the last Ack
+        private long    _lastSendTick;    // Stopwatch ticks at the time of the most-recent send (for interval tracking)
+        private long    _pendingSendTick; // Stopwatch ticks at the time of the FIRST send for the current heartbeat cycle (for RTT)
+        private long    _lastAckTick;     // Stopwatch ticks at the time of the last Ack
         private int     _missedAcks;
         private bool    _awaitingAck;
 
@@ -57,13 +58,22 @@ namespace RTMPE.Core
         // ── Construction ──────────────────────────────────────────────────────
 
         /// <param name="intervalMs">Milliseconds between consecutive heartbeat sends (default 5 000).</param>
-        public HeartbeatManager(int intervalMs = 5_000)
+        /// <param name="sharedBuilder">
+        /// Optional shared <see cref="PacketBuilder"/> whose sequence counter is shared
+        /// with the rest of the connection.  When <see langword="null"/> (default) a new
+        /// private builder is created — useful in unit tests that do not need shared state.
+        /// Pass the NetworkManager's <c>_packetBuilder</c> field in production so that
+        /// heartbeat packets and data packets draw from the same monotone counter,
+        /// preventing sequence-number collisions that could cause nonce reuse once AEAD
+        /// is integrated (H-1 fix).
+        /// </param>
+        public HeartbeatManager(int intervalMs = 5_000, PacketBuilder sharedBuilder = null)
         {
             if (intervalMs < 100)
                 throw new ArgumentOutOfRangeException(nameof(intervalMs), "Heartbeat interval must be >= 100 ms.");
 
             _intervalMs = intervalMs;
-            _builder    = new PacketBuilder();
+            _builder    = sharedBuilder ?? new PacketBuilder();  // H-1 fix: use shared counter when provided
             _clock      = new Stopwatch();
         }
 
@@ -75,10 +85,11 @@ namespace RTMPE.Core
         public void Start()
         {
             if (_running) return;
-            _running     = true;
-            _missedAcks  = 0;
-            _awaitingAck = false;
-            _lastSendTick = 0;
+            _running        = true;
+            _missedAcks     = 0;
+            _awaitingAck    = false;
+            _lastSendTick   = 0;
+            _pendingSendTick = 0;
             _clock.Restart();
         }
 
@@ -108,11 +119,15 @@ namespace RTMPE.Core
 
             if (!_awaitingAck && nowMs - _lastSendTick >= _intervalMs)
             {
-                // Send heartbeat
+                // Send heartbeat — record BOTH the interval-tracking tick and the
+                // per-cycle pending tick used for RTT.  _pendingSendTick must not
+                // be overwritten on retransmits so that a late Ack from the original
+                // send produces a correct RTT (total elapsed since first attempt).
                 var packet = _builder.BuildHeartbeat();
                 sendCallback(packet);
-                _lastSendTick = nowMs;
-                _awaitingAck  = true;
+                _lastSendTick    = nowMs;
+                _pendingSendTick = nowMs;  // start of this heartbeat cycle
+                _awaitingAck     = true;
             }
             else if (_awaitingAck && nowMs - _lastSendTick >= _intervalMs)
             {
@@ -125,6 +140,9 @@ namespace RTMPE.Core
                     return;
                 }
                 // Try again next interval (reset the send timer without requiring an Ack).
+                // _pendingSendTick is intentionally NOT reset here — we keep the original
+                // send time so that if the Ack for the first heartbeat eventually arrives
+                // after a retransmit, the RTT reflects the full round-trip elapsed time.
                 var packet = _builder.BuildHeartbeat();
                 sendCallback(packet);
                 _lastSendTick = nowMs;
@@ -140,9 +158,13 @@ namespace RTMPE.Core
         public void OnAckReceived()
         {
             if (!_running) return;
+            if (!_awaitingAck) return; // Ignore spurious/duplicate ACKs
 
             long nowMs  = _clock.ElapsedMilliseconds;
-            float rttMs = nowMs - _lastSendTick;
+            // Use _pendingSendTick (set at the start of this heartbeat cycle, never
+            // overwritten on retransmits) so RTT reflects the true elapsed time from
+            // the first send attempt — not just the most-recent retransmit interval.
+            float rttMs = nowMs - _pendingSendTick;
 
             _missedAcks  = 0;
             _awaitingAck = false;

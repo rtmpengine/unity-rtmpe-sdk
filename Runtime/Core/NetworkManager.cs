@@ -26,6 +26,7 @@ using RTMPE.Threading;
 using RTMPE.Transport;
 using RTMPE.Crypto;
 using RTMPE.Protocol;
+using RTMPE.Rooms;
 
 namespace RTMPE.Core
 {
@@ -126,6 +127,15 @@ namespace RTMPE.Core
         private PacketBuilder    _packetBuilder;
         private HeartbeatManager _heartbeatManager;
 
+        // Room management (Week 14)
+        private RoomManager _roomManager;
+
+        // M-19 fix: cache the heartbeat send callback to avoid per-frame lambda
+        // allocation. The lambda `packet => _networkThread?.Send(packet)` creates
+        // a new closure object every Update() call (60+ Hz). Caching it once in
+        // Start() eliminates the allocation entirely.
+        private System.Action<byte[]> _sendPacketCallback;
+
         // ── Properties ─────────────────────────────────────────────────────────
 
         /// <summary>Current network state.</summary>
@@ -146,6 +156,9 @@ namespace RTMPE.Core
 
         /// <summary>Current room ID — valid after RoomJoin.</summary>
         public ulong CurrentRoomId => _currentRoomId;
+
+        /// <summary>Room management API — create, join, leave, and list rooms.</summary>
+        public RoomManager Rooms => _roomManager;
 
         /// <summary>JWT bearer token — valid after SessionAck. Use for Room Service calls.</summary>
         public string JwtToken => _jwtToken;
@@ -168,9 +181,11 @@ namespace RTMPE.Core
         public event Action<string> OnConnectionFailed;
 
         /// <summary>Fired when the local player successfully joins a room.</summary>
+        [Obsolete("Use NetworkManager.Rooms.OnRoomJoined or Rooms.OnRoomCreated instead.")]
         public event Action<ulong> OnJoinedRoom;
 
         /// <summary>Fired when the local player leaves a room.</summary>
+        [Obsolete("Use NetworkManager.Rooms.OnRoomLeft instead.")]
         public event Action<ulong> OnLeftRoom;
 
         /// <summary>
@@ -210,12 +225,17 @@ namespace RTMPE.Core
             // background threads are started) so the first Enqueue() call is free
             // of the one-time GameObject allocation cost.
             _dispatcher = MainThreadDispatcher.Instance;
+
+            // M-19 fix: cache the heartbeat send callback once so Update() does
+            // not allocate a new closure object every frame.
+            _sendPacketCallback = packet => _networkThread?.Send(packet);
         }
 
         private void Update()
         {
-            // Drive the heartbeat tick each frame.
-            _heartbeatManager?.Tick(packet => _networkThread?.Send(packet));
+            // Drive the heartbeat tick each frame. Reuse the cached callback to
+            // avoid per-frame heap allocation (M-19 fix).
+            _heartbeatManager?.Tick(_sendPacketCallback);
         }
 
         private void OnDestroy()
@@ -250,13 +270,27 @@ namespace RTMPE.Core
             _networkThread.OnError          += HandleTransportError;
 
             _packetBuilder = new PacketBuilder();
+
+            // Week 14: Room API manager. Receives the shared PacketBuilder for
+            // sequence numbering and a delegate to send fully-built packets.
+            _roomManager = new RoomManager(
+                _packetBuilder,
+                packet => _networkThread?.SendOwned(packet),
+                () => _state);
+
+            // Wire room events to update NetworkManager state.
+            _roomManager.OnRoomJoined += OnRoomManagerJoined;
+            _roomManager.OnRoomLeft   += OnRoomManagerLeft;
+            _roomManager.OnRoomCreated += OnRoomManagerCreated;
         }
 
         private void Cleanup()
         {
             _heartbeatManager?.Stop();
             _heartbeatManager = null;
+            _handshakeHandler?.Dispose();  // C-1 fix: zero key material before GC can observe it
             _handshakeHandler = null;
+            _sessionKeys?.Dispose();       // C-1 fix: zero session keys before GC can observe it
             _sessionKeys      = null;
             // Unsubscribe before dispose to break delegate references.
             if (_networkThread != null)
@@ -291,6 +325,21 @@ namespace RTMPE.Core
             }
 
             TransitionTo(NetworkState.Connecting);
+
+            // Reset the packet builder so sequence numbers start fresh on reconnect.
+            _packetBuilder = new PacketBuilder();
+
+            // CR-1 fix (Week 14): Recreate RoomManager with the new PacketBuilder so
+            // room operations share the same sequence counter as handshake/heartbeat.
+            // Without this, reconnections cause two independent counters on the wire
+            // — a protocol violation that may trigger gateway replay protection.
+            _roomManager = new RoomManager(
+                _packetBuilder,
+                packet => _networkThread?.SendOwned(packet),
+                () => _state);
+            _roomManager.OnRoomJoined  += OnRoomManagerJoined;
+            _roomManager.OnRoomLeft    += OnRoomManagerLeft;
+            _roomManager.OnRoomCreated += OnRoomManagerCreated;
 
             // Create a fresh handshake handler (generates a new X25519 ephemeral keypair).
             _handshakeHandler = new HandshakeHandler();
@@ -436,8 +485,14 @@ namespace RTMPE.Core
                 // ── Keep-alive ───────────────────────────────────────────────
                 case PacketType.HeartbeatAck: OnHeartbeatAck(data); break;
 
-                // ── Room / session ────────────────────────────────────────────
-                case PacketType.RoomJoin:        OnRoomJoinAck(data);     break;
+                // ── Room / session (Week 14) ─────────────────────────────────
+                case PacketType.RoomCreate:
+                case PacketType.RoomJoin:
+                case PacketType.RoomLeave:
+                case PacketType.RoomList:
+                    OnRoomPacket(packetType, data);
+                    break;
+
                 case PacketType.Disconnect:      OnServerDisconnect(data); break;
                 case PacketType.Data:
                 case PacketType.StateSync:        OnDataReceived?.Invoke(data); break;
@@ -495,8 +550,10 @@ namespace RTMPE.Core
             }
 
             // Send the client's X25519 ephemeral public key to the server.
+            // M-13 fix: use SendOwned — response is a freshly allocated array that
+            // we will not reuse, so the copy inside Send() is unnecessary here.
             var response = _packetBuilder.BuildHandshakeResponse(_handshakeHandler.ClientPublicKey);
-            _networkThread.Send(response);
+            _networkThread.SendOwned(response);
             LogDebug("Sent HandshakeResponse — awaiting SessionAck.");
         }
 
@@ -535,7 +592,9 @@ namespace RTMPE.Core
             TransitionTo(NetworkState.Connected);
 
             // Start keep-alive heartbeat.
-            _heartbeatManager = new HeartbeatManager(_settings.heartbeatIntervalMs);
+            // H-1 fix: pass _packetBuilder so heartbeat packets share the same sequence
+            // counter as all other outbound packets (prevents nonce reuse under AEAD).
+            _heartbeatManager = new HeartbeatManager(_settings.heartbeatIntervalMs, _packetBuilder);
             _heartbeatManager.OnRttUpdated     += rtt => { LastRttMs = rtt; OnRttUpdated?.Invoke(rtt); };
             _heartbeatManager.OnHeartbeatTimeout += OnHeartbeatTimeout;
             _heartbeatManager.Start();
@@ -563,17 +622,61 @@ namespace RTMPE.Core
         private void OnHeartbeatTimeout()
         {
             Debug.LogWarning("[RTMPE] Heartbeat timeout — 3 consecutive misses. Disconnecting.");
+            // L-SDK7 fix: transition through Disconnecting first so that
+            // listeners observing state changes see the full lifecycle
+            // (Connected → Disconnecting → Disconnected), consistent with
+            // the explicit Disconnect() path.
+            TransitionTo(NetworkState.Disconnecting);
+            _heartbeatManager?.Stop();
             _networkThread?.Stop();
             ClearSessionData();
             TransitionTo(NetworkState.Disconnected, DisconnectReason.ConnectionLost);
         }
 
-        private void OnRoomJoinAck(byte[] _)
+        /// <summary>
+        /// Route all room packets (0x20–0x23) to the RoomManager.
+        /// </summary>
+        private void OnRoomPacket(PacketType type, byte[] data)
         {
-            if (_state != NetworkState.Connected) return;
-            // TODO (Week 10): parse room ID from payload.
-            TransitionTo(NetworkState.InRoom);
-            OnJoinedRoom?.Invoke(_currentRoomId);
+            if (_roomManager == null) return;
+            var payload = PacketParser.ExtractPayload(data);
+            _roomManager.HandleRoomPacket(type, payload);
+        }
+
+        /// <summary>Week 14: RoomManager fires OnRoomCreated → transition to InRoom.</summary>
+        private void OnRoomManagerCreated(RoomInfo room)
+        {
+            if (_state == NetworkState.Connected)
+            {
+                TransitionTo(NetworkState.InRoom);
+#pragma warning disable CS0618 // Legacy event — users should migrate to RoomManager events
+                OnJoinedRoom?.Invoke(0);
+#pragma warning restore CS0618
+            }
+        }
+
+        /// <summary>Week 14: RoomManager fires OnRoomJoined → transition to InRoom.</summary>
+        private void OnRoomManagerJoined(RoomInfo room)
+        {
+            if (_state == NetworkState.Connected)
+            {
+                TransitionTo(NetworkState.InRoom);
+#pragma warning disable CS0618
+                OnJoinedRoom?.Invoke(0);
+#pragma warning restore CS0618
+            }
+        }
+
+        /// <summary>Week 14: RoomManager fires OnRoomLeft → transition back to Connected.</summary>
+        private void OnRoomManagerLeft()
+        {
+            if (_state == NetworkState.InRoom)
+            {
+                TransitionTo(NetworkState.Connected);
+#pragma warning disable CS0618
+                OnLeftRoom?.Invoke(0);
+#pragma warning restore CS0618
+            }
         }
 
         private void OnServerDisconnect(byte[] _)
@@ -666,7 +769,17 @@ namespace RTMPE.Core
             else
             {
                 // No PSK configured — build unencrypted payload for local dev only.
-                // WARNING: this is insecure. Configure apiKeyPskHex in production.
+                // M-18 fix: abort the connection in release builds rather than
+                // transmitting the API key in plaintext.  The plaintext path is a
+                // developer convenience that MUST NOT ship to production.
+#if !UNITY_EDITOR && !DEVELOPMENT_BUILD
+                Debug.LogError("[RTMPE] SendHandshakeInit: apiKeyPskHex MUST be configured in " +
+                               "release builds. Sending the API key unencrypted exposes it to " +
+                               "any network observer. Aborting connection. " +
+                               "Set apiKeyPskHex in NetworkSettings.");
+                return;
+#else
+                // WARNING: insecure — local dev / editor only.
                 Debug.LogWarning("[RTMPE] apiKeyPskHex is not configured — sending API key unencrypted. " +
                                  "This is insecure. Set apiKeyPskHex in NetworkSettings for production.");
                 var keyBytes = System.Text.Encoding.UTF8.GetBytes(apiKey);
@@ -674,18 +787,23 @@ namespace RTMPE.Core
                 encryptedPayload[0] = (byte)(keyBytes.Length & 0xFF);
                 encryptedPayload[1] = (byte)((keyBytes.Length >> 8) & 0xFF);
                 Buffer.BlockCopy(keyBytes, 0, encryptedPayload, 2, keyBytes.Length);
+#endif
             }
 
+            // M-13 fix: use SendOwned — packet is a freshly built array we do not
+            // reuse after the send call (LogDebug only reads packet.Length, which
+            // is safe since the array is still referenced by the send queue).
             var packet = _packetBuilder.BuildHandshakeInit(encryptedPayload);
-            _networkThread.Send(packet);
+            _networkThread.SendOwned(packet);
             LogDebug($"HandshakeInit sent ({packet.Length} B).");
         }
 
         private void SendDisconnect()
         {
             if (_packetBuilder == null) return;
+            // M-13 fix: BuildDisconnect returns a fresh array; use SendOwned.
             var packet = _packetBuilder.BuildDisconnect();
-            _networkThread?.Send(packet);
+            _networkThread?.SendOwned(packet);
             LogDebug("Sent Disconnect packet.");
         }
 
@@ -714,7 +832,10 @@ namespace RTMPE.Core
             _reconnectToken   = null;
             _localPlayerId    = 0;
             _currentRoomId    = 0;
+            _roomManager?.ClearState();
+            _handshakeHandler?.Dispose();  // C-1 fix: zero key material before GC can observe it
             _handshakeHandler = null;
+            _sessionKeys?.Dispose();       // C-1 fix: zero session keys before GC can observe it
             _sessionKeys      = null;
             LastRttMs         = -1f;
         }

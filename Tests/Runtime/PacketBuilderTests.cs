@@ -138,11 +138,11 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        public void SequenceCounter_FirstPacket_Is1()
+        public void SequenceCounter_FirstPacket_Is0()
         {
             var pkt = new PacketBuilder().BuildHeartbeat(); // fresh builder
             uint seq = (uint)(pkt[5] | (pkt[6] << 8) | (pkt[7] << 16) | (pkt[8] << 24));
-            Assert.AreEqual(1u, seq, "First packet from a fresh builder should have seq=1.");
+            Assert.AreEqual(0u, seq, "First packet from a fresh builder should have seq=0.");
         }
 
         [Test]
@@ -159,9 +159,9 @@ namespace RTMPE.Tests
             uint s2a = (uint)(r2a[5] | (r2a[6] << 8) | (r2a[7] << 16) | (r2a[8] << 24));
             uint s1b = (uint)(r1b[5] | (r1b[6] << 8) | (r1b[7] << 16) | (r1b[8] << 24));
 
-            Assert.AreEqual(1u, s1a);
-            Assert.AreEqual(1u, s2a, "Each builder instance starts at 1 independently.");
-            Assert.AreEqual(2u, s1b);
+            Assert.AreEqual(0u, s1a);
+            Assert.AreEqual(0u, s2a, "Each builder instance starts at 0 independently.");
+            Assert.AreEqual(1u, s1b);
         }
 
         // ── Payload bytes ──────────────────────────────────────────────────────

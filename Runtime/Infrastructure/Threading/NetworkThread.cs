@@ -16,6 +16,7 @@
 //    each iteration. No CancellationToken is used (avoids allocation on hot path).
 
 using System;
+using System.Runtime.InteropServices;
 using System.Threading;
 using RTMPE.Transport;
 
@@ -30,6 +31,18 @@ namespace RTMPE.Threading
     /// </summary>
     public sealed class NetworkThread : IDisposable
     {
+        // ── Windows timer resolution (M-12 fix) ───────────────────────────────
+        // On Windows, Thread.Sleep(1) uses the system timer interrupt (~15.6 ms
+        // default) giving ~64 Hz poll rate instead of the intended ~1 kHz.
+        // timeBeginPeriod(1) requests 1 ms resolution for the process lifetime.
+        // This is standard practice in multimedia / gaming applications.
+        // The companion timeEndPeriod(1) is called in Dispose() to restore the
+        // OS default when the network thread is no longer needed.
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+        [DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint uPeriod);
+        [DllImport("winmm.dll")] private static extern uint timeEndPeriod(uint uPeriod);
+        private bool _timerResSet;
+#endif
         // ── Dependencies ───────────────────────────────────────────────────────
         private readonly NetworkTransport _transport;
         private readonly byte[]           _receiveBuffer;   // shared scratch; never exposed
@@ -82,6 +95,12 @@ namespace RTMPE.Threading
         {
             if (_running) return;
 
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            // M-12 fix: raise Windows timer resolution to 1 ms so Thread.Sleep(1)
+            // actually sleeps ~1 ms instead of the default ~15.6 ms.
+            if (!_timerResSet) { timeBeginPeriod(1); _timerResSet = true; }
+#endif
+
             _running = true;
             _thread  = new Thread(RunLoop)
             {
@@ -105,7 +124,15 @@ namespace RTMPE.Threading
             if (_thread != null && _thread.IsAlive)
             {
                 if (!_thread.Join(2_000))
-                    _thread.Interrupt();  // Force exit if Join timed out
+                {
+                    // L-SDK3 fix: Thread.Interrupt() only works when the thread
+                    // is in a managed blocking state (WaitSleepJoin). When blocked
+                    // in a native ReceiveFrom, it has no effect. Closing the socket
+                    // forces ReceiveFrom to throw a SocketException, which the
+                    // RunLoop catch clause handles gracefully.
+                    _transport.Disconnect();
+                    _thread.Join(500);
+                }
             }
 
             _thread = null;
@@ -113,7 +140,8 @@ namespace RTMPE.Threading
 
         /// <summary>
         /// Enqueue <paramref name="data"/> for transmission on the next loop iteration.
-        /// Thread-safe; returns immediately. The incoming array is copied internally.
+        /// Thread-safe; returns immediately. The incoming array is copied internally
+        /// so the caller can safely reuse or discard its buffer.
         /// </summary>
         public void Send(byte[] data, bool reliable = false)
         {
@@ -125,11 +153,32 @@ namespace RTMPE.Threading
             _sendQueue.Enqueue(copy);
         }
 
+        /// <summary>
+        /// Enqueue <paramref name="ownedData"/> for transmission without copying.
+        /// The caller MUST NOT read or modify <paramref name="ownedData"/> after
+        /// this call — ownership is transferred to the send queue.
+        ///
+        /// Use this instead of <see cref="Send"/> when <paramref name="ownedData"/>
+        /// was freshly allocated (e.g. the return value of
+        /// <see cref="RTMPE.Protocol.PacketBuilder.Build"/>) and will not be
+        /// reused.  Eliminates the redundant copy that <see cref="Send"/> makes,
+        /// halving per-packet GC pressure on the hot data path (M-13 fix).
+        /// </summary>
+        public void SendOwned(byte[] ownedData)
+        {
+            if (!_running || ownedData == null || ownedData.Length == 0) return;
+            _sendQueue.Enqueue(ownedData);
+        }
+
         /// <inheritdoc/>
         public void Dispose()
         {
             Stop();
             _transport.Dispose();
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            // M-12 fix: restore the OS default timer resolution.
+            if (_timerResSet) { timeEndPeriod(1); _timerResSet = false; }
+#endif
         }
 
         // ── Private I/O loop ───────────────────────────────────────────────────

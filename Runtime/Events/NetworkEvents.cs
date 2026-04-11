@@ -44,13 +44,51 @@ namespace RTMPE.Events
             public Core.DisconnectReason Reason;
         }
 
-        // ── Room ──────────────────────────────────────────────────────────────
+        // ── Room (Week 14) ─────────────────────────────────────────────────────
 
         /// <summary>Raised when the local player successfully joins a room.</summary>
         public struct JoinedRoomArgs
         {
             /// <summary>Server-assigned room identifier.</summary>
             public ulong RoomId;
+        }
+
+        /// <summary>Raised when a CreateRoom request succeeds.</summary>
+        public struct RoomCreatedArgs
+        {
+            /// <summary>Info about the newly created room.</summary>
+            public Rooms.RoomInfo Room;
+        }
+
+        /// <summary>Raised when a JoinRoom/JoinRoomByCode request succeeds.</summary>
+        public struct RoomJoinedArgs
+        {
+            /// <summary>Info about the room joined, including player roster.</summary>
+            public Rooms.RoomInfo Room;
+        }
+
+        /// <summary>Raised when the local player leaves a room.</summary>
+        public struct RoomLeftArgs { }
+
+        /// <summary>Raised when another player joins the current room.</summary>
+        public struct PlayerJoinedArgs
+        {
+            /// <summary>Info about the player who joined.</summary>
+            public Rooms.PlayerInfo Player;
+        }
+
+        /// <summary>Raised when another player leaves the current room.</summary>
+        public struct PlayerLeftArgs
+        {
+            /// <summary>ID of the player who left.</summary>
+            public string PlayerId;
+        }
+
+        /// <summary>Raised when a ListRooms response arrives.</summary>
+        public struct RoomListReceivedArgs
+        {
+            /// <summary>Array of available rooms.</summary>
+            public Rooms.RoomInfo[] Rooms;
         }
 
         // ── Heartbeat / RTT ───────────────────────────────────────────────────

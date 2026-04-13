@@ -121,6 +121,13 @@ namespace RTMPE.Core
         private ulong  _localPlayerId;
         private ulong  _currentRoomId;
 
+        // Room-level player identity (UUID string assigned by room service on JoinRoom).
+        // Distinct from the gateway session ID stored in _localPlayerId (u64).
+        // Populated by RoomManager via SetLocalRoomPlayerId() when JoinRoom succeeds,
+        // or by tests via SetLocalPlayerStringId().
+        // Used by NetworkBehaviour.IsOwner for object ownership checks.
+        private string _localPlayerStringId;
+
         // Session crypto state (Week 9)
         private HandshakeHandler _handshakeHandler;
         private SessionKeys      _sessionKeys;
@@ -129,6 +136,9 @@ namespace RTMPE.Core
 
         // Room management (Week 14)
         private RoomManager _roomManager;
+
+        // Spawn management (Week 16)
+        private SpawnManager _spawnManager;
 
         // M-19 fix: cache the heartbeat send callback to avoid per-frame lambda
         // allocation. The lambda `packet => _networkThread?.Send(packet)` creates
@@ -151,14 +161,24 @@ namespace RTMPE.Core
         /// <summary>Settings asset in use (may be the built-in default).</summary>
         public NetworkSettings Settings => _settings;
 
-        /// <summary>Local player ID — valid after SessionAck.</summary>
+        /// <summary>Local player ID (gateway session ID) — valid after SessionAck.</summary>
         public ulong LocalPlayerId => _localPlayerId;
 
         /// <summary>Current room ID — valid after RoomJoin.</summary>
         public ulong CurrentRoomId => _currentRoomId;
 
+        /// <summary>
+        /// Local player's room-level UUID — set by RoomManager when JoinRoom succeeds.
+        /// Valid only while in a room (<see cref="NetworkState.InRoom"/>).
+        /// Used by <see cref="NetworkBehaviour.IsOwner"/> for ownership checks.
+        /// </summary>
+        public string LocalPlayerStringId => _localPlayerStringId;
+
         /// <summary>Room management API — create, join, leave, and list rooms.</summary>
         public RoomManager Rooms => _roomManager;
+
+        /// <summary>Spawn management API — spawn, despawn, prefab registry, owner-leave handling.</summary>
+        public SpawnManager Spawner => _spawnManager;
 
         /// <summary>JWT bearer token — valid after SessionAck. Use for Room Service calls.</summary>
         public string JwtToken => _jwtToken;
@@ -282,6 +302,14 @@ namespace RTMPE.Core
             _roomManager.OnRoomJoined += OnRoomManagerJoined;
             _roomManager.OnRoomLeft   += OnRoomManagerLeft;
             _roomManager.OnRoomCreated += OnRoomManagerCreated;
+
+            // Week 16: Spawn manager (owns registry + ownership manager).
+            var registry  = new NetworkObjectRegistry();
+            var ownership = new OwnershipManager(registry, this);
+            _spawnManager = new SpawnManager(registry, ownership, this);
+
+            // Wire player-left events so SpawnManager can handle DestroyWithOwner.
+            _roomManager.OnPlayerLeft += playerId => _spawnManager?.OnPlayerLeftRoom(playerId);
         }
 
         private void Cleanup()
@@ -340,6 +368,12 @@ namespace RTMPE.Core
             _roomManager.OnRoomJoined  += OnRoomManagerJoined;
             _roomManager.OnRoomLeft    += OnRoomManagerLeft;
             _roomManager.OnRoomCreated += OnRoomManagerCreated;
+
+            // Week 16: Recreate SpawnManager with fresh registry/ownership on reconnect.
+            var registry  = new NetworkObjectRegistry();
+            var ownership = new OwnershipManager(registry, this);
+            _spawnManager = new SpawnManager(registry, ownership, this);
+            _roomManager.OnPlayerLeft += playerId => _spawnManager?.OnPlayerLeftRoom(playerId);
 
             // Create a fresh handshake handler (generates a new X25519 ephemeral keypair).
             _handshakeHandler = new HandshakeHandler();
@@ -581,7 +615,13 @@ namespace RTMPE.Core
             _jwtToken       = jwtToken;
             _reconnectToken = reconnectToken;
 
-            LogDebug($"SessionAck received: crypto_id={cryptoId}, jwt_len={jwtToken?.Length ?? 0}");
+            // Extract gateway session ID from the JWT sub claim (u64 as string, e.g. "123456").
+            // This is the GATEWAY session identity. The ROOM player UUID is set later
+            // by RoomManager via SetLocalRoomPlayerId() when JoinRoom completes.
+            if (ulong.TryParse(TryExtractJwtSub(jwtToken), out var sessionId))
+                _localPlayerId = sessionId;
+
+            LogDebug($"SessionAck received: crypto_id={cryptoId}, session_id={_localPlayerId}, jwt_len={jwtToken?.Length ?? 0}");
 
             if (_timeoutCoroutine != null)
             {
@@ -672,6 +712,7 @@ namespace RTMPE.Core
         {
             if (_state == NetworkState.InRoom)
             {
+                _spawnManager?.ClearAll();  // Week 16: destroy all spawned objects on room leave
                 TransitionTo(NetworkState.Connected);
 #pragma warning disable CS0618
                 OnLeftRoom?.Invoke(0);
@@ -827,17 +868,104 @@ namespace RTMPE.Core
 
         private void ClearSessionData()
         {
-            _cryptoId         = 0;
-            _jwtToken         = null;
-            _reconnectToken   = null;
-            _localPlayerId    = 0;
-            _currentRoomId    = 0;
+            _cryptoId              = 0;
+            _jwtToken              = null;
+            _reconnectToken        = null;
+            _localPlayerId         = 0;
+            _localPlayerStringId   = null;
+            _currentRoomId         = 0;
             _roomManager?.ClearState();
+            _spawnManager?.ClearAll();     // Week 16: destroy all spawned objects
             _handshakeHandler?.Dispose();  // C-1 fix: zero key material before GC can observe it
             _handshakeHandler = null;
             _sessionKeys?.Dispose();       // C-1 fix: zero session keys before GC can observe it
             _sessionKeys      = null;
             LastRttMs         = -1f;
+        }
+
+        /// <summary>
+        /// Called by RoomManager when JoinRoom/CreateRoom succeeds and the server
+        /// confirms the local player's room UUID. This is the identifier used by
+        /// <see cref="NetworkBehaviour.IsOwner"/> for object ownership comparisons.
+        /// </summary>
+        internal void SetLocalRoomPlayerId(string playerId)
+        {
+            _localPlayerStringId = playerId;
+            LogDebug($"LocalRoomPlayerId set to: {playerId}");
+        }
+
+        /// <summary>
+        /// Test-only helper to directly set <see cref="LocalPlayerStringId"/>.
+        /// Accessible from <c>RTMPE.SDK.Tests</c> via <c>InternalsVisibleTo</c>.
+        /// Do NOT call from production code.
+        /// </summary>
+        internal void SetLocalPlayerStringId(string id) => _localPlayerStringId = id;
+
+        /// <summary>
+        /// Wrap <paramref name="payload"/> in a <see cref="PacketType.Data"/> header
+        /// and enqueue it on the network thread for transmission.
+        ///
+        /// Called by <c>NetworkTransform</c> (Week 22) and any other SDK component
+        /// that needs to send a raw data payload without managing the PacketBuilder
+        /// directly.  Must be called from the Unity main thread.
+        /// </summary>
+        /// <param name="payload">
+        /// The serialised payload bytes.  A <see langword="null"/> or empty array
+        /// is silently ignored.
+        /// </param>
+        internal void SendData(byte[] payload)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+            if (payload == null || payload.Length == 0) return;
+
+            var packet = _packetBuilder.Build(
+                PacketType.Data,
+                PacketFlags.None,
+                payload);
+
+            _networkThread.Send(packet);
+        }
+
+        /// <summary>
+        /// Extract the <c>sub</c> claim from a JWT without an external JSON library.
+        /// The JWT claims segment is base64url-decoded to UTF-8 JSON, then a simple
+        /// string search locates the <c>"sub"</c> key.
+        /// Returns <see langword="null"/> if the JWT is malformed or has no sub claim.
+        /// </summary>
+        private static string TryExtractJwtSub(string jwt)
+        {
+            if (string.IsNullOrEmpty(jwt)) return null;
+
+            var parts = jwt.Split('.');
+            if (parts.Length != 3) return null;
+
+            // Convert base64url → base64 (replace URL-safe chars, fix padding).
+            var base64 = parts[1].Replace('-', '+').Replace('_', '/');
+            switch (base64.Length % 4)
+            {
+                case 2: base64 += "=="; break;
+                case 3: base64 += "=";  break;
+            }
+
+            string json;
+            try
+            {
+                var bytes = Convert.FromBase64String(base64);
+                json = System.Text.Encoding.UTF8.GetString(bytes);
+            }
+            catch (FormatException) { return null; }
+
+            // Locate "sub":"<value>" — the sub claim is always a plain string.
+            // This avoids a JSON library dependency for a single string extraction.
+            const string subKey = "\"sub\":\"";
+            var start = json.IndexOf(subKey, StringComparison.Ordinal);
+            if (start < 0) return null;
+
+            start += subKey.Length;
+            var end = json.IndexOf('"', start);
+            if (end < 0 || end == start) return null;
+
+            return json.Substring(start, end - start);
         }
 
         private void LogDebug(string message)

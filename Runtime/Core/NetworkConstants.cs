@@ -92,6 +92,10 @@ namespace RTMPE.Core
         // ── State synchronisation ─────────────────────────────────────────────
         StateSync         = 0x40,   // Server → Client: authoritative full snapshot
 
+        // ── RPC system (Week 17) ─────────────────────────────────────────────
+        Rpc               = 0x50,   // Client → Server: RPC request (method_id dispatch)
+        RpcResponse       = 0x51,   // Server → Client: RPC response (or broadcast)
+
         // ── Session termination ───────────────────────────────────────────────
         Disconnect        = 0xFF,   // Client-initiated graceful disconnect
     }

@@ -9,6 +9,35 @@
 // Key derivation:
 //   GenerateKeyPair()  → (privateKey[32], publicKey[32])
 //   SharedSecret(myPrivate, peerPublic) → sharedSecret[32]
+//
+// ============================================================================
+// SECURITY / THREAT MODEL (M-5)
+// ============================================================================
+// This is a PURE-MANAGED C# cryptographic implementation.
+//
+// WHAT IT PROTECTS AGAINST (in scope):
+//   • Passive key agreement eavesdroppers: the Montgomery ladder DH prevents
+//     a network observer from deriving the shared secret.
+//   • Key substitution attacks: Ed25519 signature on the server ephemeral key
+//     (H4 fix) prevents MITM key replacement before ECDH proceeds.
+//
+// WHAT IT DOES NOT PROTECT AGAINST (out of scope):
+//   • Side-channel timing attacks: System.Numerics.BigInteger uses
+//     variable-time division and modular exponentiation. No constant-time
+//     guarantee exists in managed C#. Local attackers with timing access to
+//     the process could extract private key bits.
+//   • Small-subgroup attacks: the Montgomery ladder clamps the scalar
+//     (RFC 7748 §5) which eliminates low-order point cofactor attacks.
+//
+// RISK ASSESSMENT:
+//   Timing attacks require LOCAL access to the player's process. In-game,
+//   the player owns the device, so extracting their own ephemeral private key
+//   gives them their own session secret only. This is LOW risk for the
+//   game networking use case.
+//
+// TESTING:
+//   RFC 7748 Appendix 6 test vectors plus ScalarMult(n=0) edge case.
+// ============================================================================
 
 using System;
 using System.Numerics;

@@ -10,6 +10,38 @@
 // dependencies and without unsafe code. BigInteger is used for Poly1305
 // 130-bit accumulator arithmetic, which is acceptable for the handshake
 // (once per connection).
+//
+// ============================================================================
+// SECURITY / THREAT MODEL (M-5)
+// ============================================================================
+// This is a PURE-MANAGED C# cryptographic implementation.
+//
+// WHAT IT PROTECTS AGAINST (in scope):
+//   • Network-level attackers: packet injection, tampering, replay.
+//     ChaCha20-Poly1305 provides confidentiality + integrity over the wire.
+//   • Passive eavesdroppers on the UDP path.
+//
+// WHAT IT DOES NOT PROTECT AGAINST (out of scope):
+//   • Side-channel attacks (timing, cache, power, EM): C#/.NET does NOT
+//     guarantee constant-time BigInteger operations or array indexing.
+//     A local attacker with access to the player's process could potentially
+//     extract key material via timing measurements.
+//   • Physical access / process memory dump: secrets live in managed heap.
+//
+// RISK ASSESSMENT:
+//   Side-channel attacks require LOCAL access to the player's machine. In the
+//   game networking threat model the player IS the owner of their machine, so
+//   key exfiltration via side-channel only lets a player read their OWN session
+//   key, which they already implicitly possess. This is accepted as LOW risk.
+//
+//   The IL2CPP / .NET Standard 2.1 constraint makes using platform-native
+//   crypto (e.g. System.Security.Cryptography.AesGcm on .NET 5+) unavailable
+//   on all Unity targets. This implementation is the correct trade-off.
+//
+// TESTING:
+//   RFC 8439 test vectors are verified in CryptoTests.cs. All edge-case
+//   inputs (empty plaintext, zero nonce, max-length AAD) are covered.
+// ============================================================================
 
 using System;
 using System.Numerics;

@@ -10,6 +10,32 @@
 //
 // Pure C# — no native dependencies. System.Security.Cryptography.SHA512 is used
 // for the SHA-512 hash, which is available in .NET Standard 2.1.
+//
+// ============================================================================
+// SECURITY / THREAT MODEL (M-5)
+// ============================================================================
+// This is a PURE-MANAGED C# cryptographic implementation.
+//
+// WHAT IT PROTECTS AGAINST (in scope):
+//   • MITM key substitution: verifying the server's Ed25519 signature on the
+//     ephemeral key ensures the server holds the known static private key.
+//   • Signature forgery by network-level attackers without the private key.
+//
+// WHAT IT DOES NOT PROTECT AGAINST (out of scope):
+//   • Timing side-channels in BigInteger point arithmetic. Variable-time
+//     scalar multiplication could leak bits of the signature scalar to a
+//     local attacker with timing measurement capability.
+//
+// RISK ASSESSMENT:
+//   Signature verification (client role) only — no private key is held by
+//   this code; timing leakage cannot expose a client secret. LOW risk.
+//
+//   Key edge cases fixed: ScalarMult(n=0) would call BigInteger.Log(0,2)
+//   → throws. Fixed: if (n == Zero) return Identity.
+//
+// TESTING:
+//   RFC 8032 test vectors plus n=0 crash guard and signature mutation tests.
+// ============================================================================
 
 using System;
 using System.Numerics;

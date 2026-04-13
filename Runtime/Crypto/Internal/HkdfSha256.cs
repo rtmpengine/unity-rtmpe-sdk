@@ -8,6 +8,27 @@
 // Salt used by the gateway: b"RTMPE-v3-hkdf-salt-2026"
 // Info base used by both sides: b"RTMPE-v3-session-key" + sorted(clientPub, serverPub)
 // Then appended with b"\x00" for the initiator key and b"\x01" for the responder key.
+//
+// ============================================================================
+// SECURITY / THREAT MODEL (M-5)
+// ============================================================================
+// This is a PURE-MANAGED C# cryptographic implementation.
+//
+// WHAT IT PROTECTS AGAINST (in scope):
+//   • Key derivation correctness: HKDF provides domain-separation between the
+//     two directional session keys via distinct info suffixes (\x00 / \x01).
+//   • Weak IKM: HKDF-Extract whitens the ECDH output before expansion.
+//
+// IMPLEMENTATION NOTES:
+//   • HMACSHA256 is from System.Security.Cryptography — this is a
+//     platform-provided implementation, NOT a custom BigInteger one.
+//     It carries the same constant-time properties as the .NET runtime.
+//   • No BigInteger is used in this file; timing side-channels are limited
+//     to the HMAC primitive, which is generally constant-time in .NET.
+//
+// TESTING:
+//   RFC 5869 Appendix A test vectors verified in CryptoTests.cs.
+// ============================================================================
 
 using System;
 using System.Security.Cryptography;

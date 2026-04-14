@@ -6,11 +6,10 @@
 // Architecture notes:
 //   • SpawnManager is the CENTRAL hub for object lifecycle. It owns the
 //     NetworkObjectRegistry and OwnershipManager (exposed as properties).
-//   • Spawn() / Despawn() currently operate locally only.
-//     Network transmission (relay to other clients) requires server-side
-//     spawn handling, which is not yet implemented. When it is, Spawn()
-//     will send a SpawnRequest to the server, and CreateLocal() will be
-//     called upon receiving the server's Spawn packet.
+//   • Spawn() / Despawn() create/destroy locally AND send a packet to
+//     the server for relay to other clients in the room. When the server
+//     relays a Spawn/Despawn to a receiving client, the NetworkManager
+//     packet handler calls CreateLocal() / DestroyLocal() directly.
 //   • CreateLocal() / DestroyLocal() are internal so only the SDK itself
 //     (or tests via InternalsVisibleTo) can call them. These are the
 //     primitives that the server-driven spawn path will invoke.
@@ -106,8 +105,8 @@ namespace RTMPE.Core
         /// <summary>
         /// Spawn a networked object from a registered prefab.
         ///
-        /// Currently creates the object locally only. Network relay to other
-        /// clients requires server-side spawn handling (future week).
+        /// Creates the object locally and sends a SpawnRequest to the server
+        /// for relay to other clients in the room.
         /// </summary>
         /// <param name="prefabId">Registered prefab identifier.</param>
         /// <param name="position">World-space spawn position.</param>
@@ -134,9 +133,8 @@ namespace RTMPE.Core
                 ?? _networkManager.LocalPlayerStringId
                 ?? string.Empty;
 
-            // TODO: When server-side spawn relay is implemented, send a SpawnRequest
-            // packet here and wait for the server to confirm. CreateLocal will then
-            // be called by the inbound Spawn packet handler instead.
+            // Send SpawnRequest to server for relay to other clients.
+            SendSpawnPacket(prefabId, objectId, owner, position, rotation);
 
             return CreateLocal(prefabId, objectId, owner, position, rotation);
         }
@@ -144,15 +142,14 @@ namespace RTMPE.Core
         /// <summary>
         /// Despawn (destroy) a networked object.
         ///
-        /// Currently destroys locally only. Network relay to other clients
-        /// requires server-side despawn handling (future week).
+        /// Destroys the object locally and sends a DespawnRequest to the server
+        /// for relay to other clients in the room.
         /// </summary>
         /// <param name="objectId">The network object ID to despawn.</param>
         public void Despawn(ulong objectId)
         {
-            // TODO: When server-side despawn relay is implemented, send a DespawnRequest
-            // packet here. DestroyLocal will then be called by the inbound Despawn
-            // packet handler instead.
+            // Send DespawnRequest to server for relay to other clients.
+            SendDespawnPacket(objectId);
 
             DestroyLocal(objectId);
         }
@@ -286,6 +283,40 @@ namespace RTMPE.Core
         {
             var playerId = _networkManager.LocalPlayerId;
             return ((playerId & 0xFFFFFFFF) << 32) | (_nextLocalId++);
+        }
+
+        /// <summary>
+        /// Build and send a Spawn packet through the NetworkManager.
+        /// Silently skips if not connected (local-only spawn still succeeds).
+        /// </summary>
+        private void SendSpawnPacket(
+            uint prefabId,
+            ulong objectId,
+            string ownerPlayerId,
+            Vector3 position,
+            Quaternion rotation)
+        {
+            if (!_networkManager.IsConnected) return;
+
+            var payload = SpawnPacketBuilder.BuildSpawnRequest(
+                prefabId, objectId, ownerPlayerId, position, rotation);
+            _networkManager.Send(
+                _networkManager.BuildPacket(PacketType.Spawn, PacketFlags.Reliable, payload),
+                reliable: true);
+        }
+
+        /// <summary>
+        /// Build and send a Despawn packet through the NetworkManager.
+        /// Silently skips if not connected (local-only despawn still succeeds).
+        /// </summary>
+        private void SendDespawnPacket(ulong objectId)
+        {
+            if (!_networkManager.IsConnected) return;
+
+            var payload = SpawnPacketBuilder.BuildDespawnRequest(objectId);
+            _networkManager.Send(
+                _networkManager.BuildPacket(PacketType.Despawn, PacketFlags.Reliable, payload),
+                reliable: true);
         }
     }
 }

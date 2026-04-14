@@ -81,7 +81,7 @@ namespace RTMPE.Tests
         // ── PacketType coverage ───────────────────────────────────────────────
 
         [Test]
-        [Description("All 18 PacketType values are defined and match gateway enum")]
+        [Description("All 20 PacketType values are defined and match gateway enum")]
         public void PacketType_AllValues_Defined()
         {
             // Check by explicit byte value — mirrors header.rs exhaustively.
@@ -102,16 +102,18 @@ namespace RTMPE.Tests
             Assert.AreEqual(0x30, (byte)PacketType.Spawn);
             Assert.AreEqual(0x31, (byte)PacketType.Despawn);
             Assert.AreEqual(0x40, (byte)PacketType.StateSync);
+            Assert.AreEqual(0x50, (byte)PacketType.Rpc);
+            Assert.AreEqual(0x51, (byte)PacketType.RpcResponse);
             Assert.AreEqual(0xFF, (byte)PacketType.Disconnect);
         }
 
         [Test]
-        [Description("Exactly 18 PacketType values are defined — guard against accidental drift")]
+        [Description("Exactly 20 PacketType values are defined — guard against accidental drift")]
         public void PacketType_Count_IsEighteen()
         {
             var values = Enum.GetValues(typeof(PacketType));
-            Assert.AreEqual(18, values.Length,
-                "Exactly 18 PacketType members must exist (Rust gateway defines 18)");
+            Assert.AreEqual(20, values.Length,
+                "Exactly 20 PacketType members must exist (Rust gateway defines 20; Rpc+RpcResponse added Week 17)");
         }
 
         // ── Header field offset consistency ───────────────────────────────────

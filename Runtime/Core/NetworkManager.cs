@@ -27,6 +27,7 @@ using RTMPE.Transport;
 using RTMPE.Crypto;
 using RTMPE.Protocol;
 using RTMPE.Rooms;
+using RTMPE.Rpc;
 
 namespace RTMPE.Core
 {
@@ -531,6 +532,14 @@ namespace RTMPE.Core
                 case PacketType.Data:
                 case PacketType.StateSync:        OnDataReceived?.Invoke(data); break;
 
+                // ── Networked object lifecycle (Week 16) ─────────────────────
+                case PacketType.Spawn:            OnSpawnPacket(data);   break;
+                case PacketType.Despawn:          OnDespawnPacket(data); break;
+
+                // ── RPC system (Week 17) ─────────────────────────────────────
+                case PacketType.Rpc:              OnRpcRequest(data);    break;
+                case PacketType.RpcResponse:      OnRpcResponse(data);   break;
+
                 default:
                     LogDebug($"No handler for packet type 0x{(byte)packetType:X2}.");
                     break;
@@ -681,6 +690,138 @@ namespace RTMPE.Core
             if (_roomManager == null) return;
             var payload = PacketParser.ExtractPayload(data);
             _roomManager.HandleRoomPacket(type, payload);
+        }
+
+        // ── Spawn / Despawn inbound handlers (Week 16) ─────────────────────────
+
+        /// <summary>
+        /// Handle an inbound <c>Spawn</c> (0x30) packet from the server.
+        /// Parses the payload and calls <see cref="SpawnManager.CreateLocal"/>
+        /// to instantiate the object on the receiving client.
+        /// </summary>
+        private void OnSpawnPacket(byte[] data)
+        {
+            if (_spawnManager == null) return;
+            var payload = PacketParser.ExtractPayload(data);
+            if (!SpawnPacketParser.TryParseSpawn(payload, out var spawnData))
+            {
+                LogDebug("Spawn packet: malformed payload, dropped.");
+                return;
+            }
+
+            // Dedup: if this object was already spawned locally (e.g. server echoed
+            // our own Spawn back), skip to avoid creating a duplicate GameObject.
+            if (_spawnManager.Registry.Get(spawnData.ObjectId) != null)
+            {
+                LogDebug($"Spawn packet: objectId {spawnData.ObjectId} already exists, skipped (dedup).");
+                return;
+            }
+
+            _spawnManager.CreateLocal(
+                spawnData.PrefabId, spawnData.ObjectId,
+                spawnData.OwnerPlayerId, spawnData.Position, spawnData.Rotation);
+        }
+
+        /// <summary>
+        /// Handle an inbound <c>Despawn</c> (0x31) packet from the server.
+        /// Parses the object ID and calls <see cref="SpawnManager.DestroyLocal"/>.
+        /// </summary>
+        private void OnDespawnPacket(byte[] data)
+        {
+            if (_spawnManager == null) return;
+            var payload = PacketParser.ExtractPayload(data);
+            if (!SpawnPacketParser.TryParseDespawn(payload, out var objectId))
+            {
+                LogDebug("Despawn packet: malformed payload, dropped.");
+                return;
+            }
+            _spawnManager.DestroyLocal(objectId);
+        }
+
+        // ── RPC inbound handlers (Week 17) ─────────────────────────────────────
+
+        /// <summary>
+        /// Handle an inbound <c>Rpc</c> (0x50) request from the server.
+        /// Currently dispatches ownership-related RPCs (method_id 200).
+        /// </summary>
+        private void OnRpcRequest(byte[] data)
+        {
+            var payload = PacketParser.ExtractPayload(data);
+            if (!RpcPacketParser.TryParseRequest(payload, out var request))
+            {
+                LogDebug("RPC request: malformed payload, dropped.");
+                return;
+            }
+
+            switch (request.MethodId)
+            {
+                case RpcMethodId.TransferOwnership:
+                    HandleOwnershipTransferRpc(request);
+                    break;
+                default:
+                    LogDebug($"RPC request: unhandled method_id {request.MethodId}.");
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Handle an inbound <c>RpcResponse</c> (0x51) from the server.
+        /// Routes ownership grant responses to the OwnershipManager.
+        /// </summary>
+        private void OnRpcResponse(byte[] data)
+        {
+            var payload = PacketParser.ExtractPayload(data);
+            if (!RpcPacketParser.TryParseResponse(payload, out var response))
+            {
+                LogDebug("RPC response: malformed payload, dropped.");
+                return;
+            }
+
+            switch (response.MethodId)
+            {
+                case RpcMethodId.TransferOwnership:
+                    HandleOwnershipTransferResponse(response);
+                    break;
+                default:
+                    LogDebug($"RPC response: unhandled method_id {response.MethodId}.");
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Process a server-broadcast TransferOwnership RPC that tells this client
+        /// to apply an ownership change (server-authoritative grant).
+        /// Payload: [object_id:8 LE u64][new_owner_len:2 LE u16][new_owner:N UTF-8].
+        /// </summary>
+        private void HandleOwnershipTransferRpc(RpcRequest request)
+        {
+            if (_spawnManager == null) return;
+            if (request.Payload.Length < 10) return;   // 8 + 2 minimum
+
+            ulong objectId = BitConverter.ToUInt64(request.Payload, 0);
+            ushort ownerLen = BitConverter.ToUInt16(request.Payload, 8);
+            if (request.Payload.Length < 10 + ownerLen) return;
+
+            string newOwner = ownerLen > 0
+                ? System.Text.Encoding.UTF8.GetString(request.Payload, 10, ownerLen)
+                : string.Empty;
+
+            _spawnManager.Ownership.ApplyOwnershipGrant(objectId, newOwner);
+        }
+
+        /// <summary>
+        /// Process the server's response to a client-initiated TransferOwnership RPC.
+        /// On success, the server has already broadcast the grant to all clients via
+        /// <see cref="HandleOwnershipTransferRpc"/>. On failure, log the error.
+        /// </summary>
+        private void HandleOwnershipTransferResponse(RpcResponse response)
+        {
+            if (!response.Success)
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] Ownership transfer request {response.RequestId} " +
+                    $"rejected by server (error code: {response.ErrorCode}).");
+            }
         }
 
         /// <summary>Week 14: RoomManager fires OnRoomCreated → transition to InRoom.</summary>
@@ -924,6 +1065,23 @@ namespace RTMPE.Core
                 payload);
 
             _networkThread.Send(packet);
+        }
+
+        /// <summary>
+        /// Build a complete wire packet (13-byte header + payload) using the
+        /// connection's shared <see cref="PacketBuilder"/>. Sequence numbers are
+        /// atomically assigned so the gateway sees a monotonic counter regardless
+        /// of which SDK component originates the packet.
+        ///
+        /// Called by SpawnManager, OwnershipManager, and any other SDK component
+        /// that needs to build a typed packet for transmission via <see cref="Send"/>.
+        /// </summary>
+        internal byte[] BuildPacket(PacketType type, PacketFlags flags, byte[] payload)
+        {
+            if (_packetBuilder == null)
+                throw new InvalidOperationException(
+                    "NetworkManager.BuildPacket: no active PacketBuilder (not connected).");
+            return _packetBuilder.Build(type, flags, payload);
         }
 
         /// <summary>

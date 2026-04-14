@@ -9,15 +9,15 @@
 //     the packet handler after the server confirms.
 //
 // Week 15 / Week 17 notes:
-//   • RequestOwnershipTransfer() is a STUB. Actual transmission is deferred
-//     to Week 17 when the RPC system (Method ID 200) is available.
-//     See Plan/week-17-rpc.md for the wire format and IPC routing convention.
-//   • The _networkManager field is RESERVED for the Week 17 implementation;
-//     it is stored but not yet used for sending.
+//   • RequestOwnershipTransfer() sends TransferOwnership RPC (Method ID 200)
+//     to the server. The server validates and broadcasts OwnershipGrant to all
+//     clients. Local state ONLY changes via ApplyOwnershipGrant() (server-authoritative).
 
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using UnityEngine;
+using RTMPE.Rpc;
 
 namespace RTMPE.Core
 {
@@ -29,13 +29,10 @@ namespace RTMPE.Core
     public sealed class OwnershipManager
     {
         private readonly NetworkObjectRegistry _registry;
-
-        // Reserved for Week 17 RPC dispatch. Not read until RequestOwnershipTransfer
-        // is fully implemented. Stored now so the constructor signature is stable
-        // across weeks and callers don't need to change when Week 17 lands.
-#pragma warning disable IDE0052  // private field assigned but never read (by design — Week 17)
         private readonly NetworkManager _networkManager;
-#pragma warning restore IDE0052
+
+        // Monotonic counter for RPC request correlation IDs.
+        private int _nextRequestId;
 
         /// <summary>
         /// Create an OwnershipManager.
@@ -76,12 +73,10 @@ namespace RTMPE.Core
         /// <summary>
         /// Request an ownership transfer to <paramref name="newOwnerPlayerId"/>.
         ///
-        /// <b>STUB — not yet implemented.</b>
-        /// Full implementation requires the Week 17 RPC system (Method ID 200).
-        /// See <c>Plan/week-17-rpc.md</c> for the wire format.
-        ///
-        /// Current behaviour: validates guards and logs a warning. No packet is sent.
-        /// Local state is NOT mutated (server-authoritative ownership is preserved).
+        /// Sends a TransferOwnership RPC (method_id = 200) to the server.
+        /// The server validates and, if approved, broadcasts an OwnershipGrant
+        /// to all clients. Local state is NOT mutated — only the server can grant
+        /// ownership via <see cref="ApplyOwnershipGrant"/>.
         /// </summary>
         /// <param name="objectId">Network object ID to transfer.</param>
         /// <param name="newOwnerPlayerId">Target player's room UUID.</param>
@@ -108,15 +103,22 @@ namespace RTMPE.Core
                 return;
             }
 
-            // TODO Week 17: Transmit via RPC system.
-            //   method_id = 200 (TransferOwnership), RequiresOwner = true.
-            //   See Plan/week-17-rpc.md — IPC Message Routing Convention.
-            //   var packet = RpcPacketBuilder.BuildServerRpc(
-            //       methodId: 200, payload: TransferOwnershipPayload(objectId, newOwnerPlayerId));
-            //   _networkManager.Send(packet, reliable: true);
-            Debug.LogWarning(
-                $"[OwnershipManager] RequestOwnershipTransfer for object {objectId} is not yet " +
-                $"transmitted. Ownership transfer requires the Week 17 RPC system (method_id=200).");
+            if (!_networkManager.IsConnected)
+            {
+                Debug.LogWarning("[OwnershipManager] Cannot send ownership transfer: not connected.");
+                return;
+            }
+
+            uint requestId = (uint)Interlocked.Increment(ref _nextRequestId);
+            var rpcPayload = RpcPacketBuilder.BuildTransferOwnership(
+                _networkManager.LocalPlayerId,
+                requestId,
+                objectId,
+                newOwnerPlayerId);
+
+            var packet = _networkManager.BuildPacket(
+                PacketType.Rpc, PacketFlags.Reliable, rpcPayload);
+            _networkManager.Send(packet, reliable: true);
         }
 
         /// <summary>

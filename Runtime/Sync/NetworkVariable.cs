@@ -105,14 +105,22 @@ namespace RTMPE.Sync
         /// <summary>
         /// Write the current value to <paramref name="writer"/> in a format
         /// that can be recovered by <see cref="Deserialize"/>.
-        /// Value bytes only — the variable ID is NOT included here; callers
-        /// are responsible for framing (see Week 25 'variable update' packet).
+        /// Value bytes only — the variable ID is NOT included.
+        /// Use <see cref="SerializeWithId"/> for the framed wire format.
         /// </summary>
-        // TODO(W25+): framing — prefix with VariableId (ushort, 2 bytes LE) before
-        // writing value bytes so the receiver can identify which variable to update.
-        // This matches the 'variable update' packet spec; add a WriteVariableId()
-        // helper here or let the packet builder do the framing.
         public abstract void Serialize(BinaryWriter writer);
+
+        /// <summary>
+        /// Write the <see cref="VariableId"/> (2 bytes LE) followed by the
+        /// value bytes.  This is the framed wire format used in 'variable
+        /// update' packets so the receiver can identify which variable to
+        /// update.
+        /// </summary>
+        public void SerializeWithId(BinaryWriter writer)
+        {
+            writer.Write(VariableId);  // BinaryWriter.Write(ushort) → 2 bytes LE
+            Serialize(writer);
+        }
 
         /// <summary>
         /// Read a value from <paramref name="reader"/> and apply it without
@@ -120,6 +128,16 @@ namespace RTMPE.Sync
         /// Use on the receiving side when applying an incoming server update.
         /// </summary>
         public abstract void Deserialize(BinaryReader reader);
+
+        /// <summary>
+        /// Read the <see cref="VariableId"/> prefix (2 bytes LE) from the
+        /// reader and return it.  The caller uses the returned ID to look up
+        /// the correct variable, then calls <see cref="Deserialize"/> on it.
+        /// </summary>
+        public static ushort ReadVariableId(BinaryReader reader)
+        {
+            return reader.ReadUInt16();
+        }
     }
 
     // ── Generic typed variable ─────────────────────────────────────────────────

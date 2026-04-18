@@ -1,8 +1,20 @@
 # RTMPE SDK — Changelog
 
+> 🔗 **Repositories:**
+> - **Full Project:** https://github.com/Faisalzz1/RTMPE
+> - **SDK Only:** https://github.com/Faisalzz1/unity-rtmpe-sdk
+
 All notable changes to this Unity package are documented here.
 Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## Table of Contents
+
+- [1.0.0 Production Release](#100--2026-04-17) — MVP complete
+- [0.2.0-preview](#020-preview--2026-03-09) — Core systems
+- [0.1.0-preview](#010-preview--2026-03-07) — Initial scaffold
 
 ---
 

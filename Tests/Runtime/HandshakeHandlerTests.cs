@@ -1,6 +1,6 @@
 // RTMPE SDK — Tests/Runtime/HandshakeHandlerTests.cs
 //
-// NUnit tests for the W6 ECDH handshake crypto layer:
+// NUnit tests for the ECDH handshake crypto layer:
 //   - Curve25519 (X25519) key generation and Diffie-Hellman
 //   - HkdfSha256 key derivation
 //   - ChaCha20Poly1305Impl AEAD seal / open
@@ -82,8 +82,9 @@ namespace RTMPE.Tests
         [Category("Curve25519")]
         public void Curve25519_SharedSecret_MatchesRfc7748_Vector()
         {
-            // RFC 7748 §6.1
-            var alicePriv  = H("77076d0a7318a57d3c16c17251b26645df1fb2c87db2fa01fba62de5e38e78c7");
+            // RFC 7748 §6.1 — exact hex strings from the RFC.
+            // RFC 7748 §6.1 test vector verification:
+            var alicePriv  = H("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
             var alicePub   = H("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
             var bobPriv    = H("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
             var bobPub     = H("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");

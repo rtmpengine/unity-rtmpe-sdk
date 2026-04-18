@@ -7,10 +7,9 @@
 //     the main thread). The lock is retained for defensive safety in case of
 //     future async operations, but callers should treat this as single-threaded.
 //   • Get() performs a Unity null check (op_Equality override) to detect
-//     destroyed GameObjects and auto-evicts them, preventing stale reference
-//     bugs (M-2 fix).
+//     destroyed GameObjects and auto-evicts them, preventing stale references.
 //   • Clear() despawns all objects before clearing so that OnNetworkDespawn()
-//     fires and _isSpawned is set to false for every registered object (M-1 fix).
+//     fires and _isSpawned is set to false for every registered object.
 //     Despawning happens OUTSIDE the lock to prevent re-entrance deadlocks if
 //     an OnNetworkDespawn callback calls registry methods.
 //   • GetAll() returns a defensive snapshot (IReadOnlyList) so callers
@@ -143,8 +142,8 @@ namespace RTMPE.Core
                 // Unity null check: skip already-destroyed GameObjects.
                 if (obj == null) continue;
 
-                // H-4 fix: isolate per-object despawn so a throwing OnNetworkDespawn
-                // callback does not silently skip all subsequent objects.
+                // Isolate per-object despawn: an exception in one object's
+                // OnNetworkDespawn callback must not prevent others from being despawned.
                 try   { obj.SetSpawned(false); }
                 catch (Exception ex) { Debug.LogException(ex); }
             }

@@ -1,6 +1,6 @@
 // RTMPE SDK — Tests/Runtime/BandwidthTests.cs
 //
-// Week 25: Bandwidth Budget Validation Tests
+// RTMPE SDK — Bandwidth Budget Validation Tests
 //
 // These tests are pure arithmetic — no GameObjects, no MonoBehaviours,
 // no network connection required.  They verify that the wire-format sizes

@@ -5,14 +5,14 @@
 // This implements verification only (not signing — the server signs, the client verifies).
 // All arithmetic is in GF(2^255-19) or on the Edwards25519 group.
 //
-// Used in the W6 handshake: verify sign(server_static_privkey, server_ephemeral_pub)
-// before proceeding with ECDH, to prevent man-in-the-middle key substitution (H4 fix).
+// Used during the ECDH handshake: verify sign(server_static_privkey, server_ephemeral_pub)
+// before proceeding with ECDH, to prevent man-in-the-middle key substitution.
 //
 // Pure C# — no native dependencies. System.Security.Cryptography.SHA512 is used
 // for the SHA-512 hash, which is available in .NET Standard 2.1.
 //
 // ============================================================================
-// SECURITY / THREAT MODEL (M-5)
+// SECURITY / THREAT MODEL
 // ============================================================================
 // This is a PURE-MANAGED C# cryptographic implementation.
 //
@@ -30,11 +30,11 @@
 //   Signature verification (client role) only — no private key is held by
 //   this code; timing leakage cannot expose a client secret. LOW risk.
 //
-//   Key edge cases fixed: ScalarMult(n=0) would call BigInteger.Log(0,2)
-//   → throws. Fixed: if (n == Zero) return Identity.
+//   Edge case: ScalarMult(n=0) returns the identity point.
+//   When n is zero, BigInteger.Log(0,2) would throw; this case is guarded explicitly.
 //
 // TESTING:
-//   RFC 8032 test vectors plus n=0 crash guard and signature mutation tests.
+//   RFC 8032 test vectors, n=0 edge case, and signature mutation tests.
 // ============================================================================
 
 using System;

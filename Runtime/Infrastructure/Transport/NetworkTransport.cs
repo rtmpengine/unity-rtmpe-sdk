@@ -1,7 +1,7 @@
 // RTMPE SDK — Runtime/Infrastructure/Transport/NetworkTransport.cs
 //
 // Abstract base for all network transports.
-// Current implementations: UdpTransport (Week 8), KcpTransport (Week 10+).
+// Current implementations: UdpTransport, KcpTransport.
 //
 // All methods are invoked from the RTMPE background network thread and must
 // be internally thread-safe. Do NOT call Unity APIs from implementations.
@@ -12,7 +12,7 @@ namespace RTMPE.Transport
 {
     /// <summary>
     /// Abstract base class for RTMPE network transports.
-    /// Provides a unified socket interface across UDP (Week 8) and KCP (Week 10+).
+    /// Provides a unified socket interface across UDP and KCP transports.
     /// </summary>
     public abstract class NetworkTransport : IDisposable
     {
@@ -22,7 +22,7 @@ namespace RTMPE.Transport
         /// The local endpoint (source IP and port) that the OS assigned to this socket
         /// after <see cref="Connect"/> binds it.
         /// Returns <see langword="null"/> before <see cref="Connect"/> is called.
-        /// Used by <see cref="Crypto.ApiKeyCipher"/> to build the M-12 AAD.
+        /// Used by <see cref="Crypto.ApiKeyCipher"/> to build the HandshakeInit AAD.
         /// </summary>
         public virtual System.Net.IPEndPoint LocalEndPoint => null;
         /// <summary>

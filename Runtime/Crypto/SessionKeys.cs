@@ -2,16 +2,16 @@
 //
 // Two directional symmetric keys derived from X25519 ECDH + HKDF-SHA256.
 //
-// G-H1 fix (mirrored from the gateway): each session uses two independent
+// Each session uses two independent
 // ChaCha20-Poly1305 keys so that client→server and server→client traffic
 // cannot be XOR-combined by a passive observer to reveal plaintext.
 //
 // The "initiator" is the side with the lexicographically smaller X25519
 // public key. Both sides determine this autonomously—no extra signalling.
 //
-// W9-2 fix: SessionKeys implements IDisposable.  Calling Dispose() immediately
-// zeroes both key arrays in-place, reducing the window in which key material
-// can be recovered from a managed-heap dump or a cold-boot attack.
+// SessionKeys implements IDisposable.  Calling Dispose() immediately zeroes
+// both key arrays in-place, reducing the window in which key material can be
+// recovered from a managed-heap dump or a cold-boot attack.
 // Dispose() is called automatically by the using-statement in NetworkManager.
 
 using System;

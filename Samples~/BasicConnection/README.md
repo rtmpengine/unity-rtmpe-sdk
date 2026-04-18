@@ -7,7 +7,7 @@ Demonstrates the minimal connect / disconnect lifecycle using the RTMPE SDK.
 - RTMPE gateway running (local or remote)
 - Valid API key configured in `RTMPE Project Settings`
 
-## Contents (Week 10+)
+## Contents
 
 | File                          | Purpose                            |
 | ----------------------------- | ---------------------------------- |
@@ -21,5 +21,5 @@ Demonstrates the minimal connect / disconnect lifecycle using the RTMPE SDK.
 3. Enter your server address in the `NetworkManager` Inspector.
 4. Press **Play**.
 
-> This sample will be fully populated in **Week 10** (Transport Layer milestone).
+> This sample demonstrates a basic RTMPE connection flow.
 > The directory is scaffolded now so the UPM `samples` manifest entry resolves correctly.

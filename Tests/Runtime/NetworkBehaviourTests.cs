@@ -247,7 +247,7 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        [Description("SetOwner with the same value does NOT fire OnOwnershipChanged (H-2 fix).")]
+        [Description("SetOwner with the same value does NOT fire OnOwnershipChanged when value is unchanged.")]
         public void SetOwner_SameValue_DoesNotFireCallback()
         {
             _testObject = new GameObject("obj");
@@ -261,7 +261,7 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        [Description("Initialize called twice logs a warning (M-3 guard); second call overwrites.")]
+        [Description("Initialize called twice logs a warning; second call overwrites.")]
         public void Initialize_CalledTwice_OverwritesIdWithWarning()
         {
             _testObject = new GameObject("obj");

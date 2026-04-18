@@ -7,35 +7,27 @@
 //   • Owner-only suppression: AddState() and Update() are both valid on any
 //     client, but by convention only non-owner clients call AddState().  The
 //     owning client uses NetworkTransform.Update() to SEND; the interpolator
-//     is wired to RECEIVE via NetworkManager.OnDataReceived (Week 24+).
+//     is wired to RECEIVE via NetworkManager.OnDataReceived.
 //   • Timestamping uses Time.timeAsDouble (local monotonic clock) at the moment
 //     of receipt — no network time-synchronisation required at this stage.
 //     The render cursor is Time.timeAsDouble - _interpolationDelay, giving a
 //     stable 100 ms window in which to always find a from/to state pair.
-//   • P-1 fix: NetworkManager.Instance.ServerTime does not exist.  Time.timeAsDouble
-//     is the correct Unity API for high-resolution monotonic timekeeping.
-//   • P-2 fix: _networkTransform field removed — it was assigned but never read,
-//     which produces a CS0414 compiler warning.
-//   • P-3 fix: AddState accepts TransformState (not raw Vector3/Quaternion).
-//     Using the W22 type ensures scale is captured and available for
-//     interpolation without a breaking API change later.
-//   • P-4 fix: Division-by-zero guard when from.Timestamp == to.Timestamp.
-//     Two states received in the same frame would produce NaN for t.  When
-//     timestamps are equal, TryInterpolate returns the "from" state unchanged.
-//   • P-5 fix: SmoothRotation helper removed.  Unity's Quaternion.Slerp already
-//     handles shortest-arc interpolation internally; manual quaternion negation
-//     is unnecessary and can produce incorrect results with Unity's coordinate
-//     system conventions.
-//   • P-6 fix: No per-frame heap allocation.  Internal storage uses List<T> for
-//     O(1) index access; Update() reads by index rather than calling ToArray().
-//   • P-7 fix: InterpolationConfig dangling class removed; settings live as
-//     [SerializeField] fields directly on the component (Unity convention).
-//   • P-8 fix: Default buffer size raised from 3 to 10.  At 30 Hz + 100 ms
-//     interpolation delay the window holds ~3 states; 10 provides margin for
-//     network jitter without meaningful memory cost (10 × ~72 bytes ≈ 720 B).
-//   • P-9 fix: All tests carry NUnit assertions (see NetworkTransformInterpolatorTests).
-//   • P-10 fix: _interpolateScale axis added, defaulting to false to match
-//     NetworkTransform._syncScale = false.  When true, scale is Vector3.Lerp'd.
+//   • Timestamping uses Time.timeAsDouble (local monotonic clock) for
+//     high-resolution, non-rewinding time values suitable for sub-frame math.
+//   • AddState() accepts a typed TransformState snapshot so that position,
+//     rotation, and scale are always transported together without extra copies.
+//   • Division-by-zero is guarded when two states share the same timestamp
+//     (packets decoded in the same frame): the from-state is returned as-is.
+//   • Quaternion.Slerp is used directly for rotation; Unity already selects
+//     the shortest arc internally.
+//   • No per-frame heap allocations: internal storage is a pre-allocated List<T>
+//     used as a ring buffer; Update() accesses elements by index.
+//   • Settings are [SerializeField] fields on the component (Unity convention),
+//     keeping Inspector integration straightforward.
+//   • Default buffer size of 10 provides ~7 states of margin over the minimum
+//     2-state requirement at 30 Hz + 100 ms delay (~720 B total).
+//   • Scale interpolation is opt-in (_interpolateScale = false by default)
+//     matching the NetworkTransform default of not syncing scale.
 //
 // Threading: all public methods and Update() run on the Unity main thread.
 // TryInterpolate(double) is pure logic and testable without a Unity scene.
@@ -84,14 +76,16 @@ namespace RTMPE.Sync
             public TransformState State;
         }
 
-        // L-2 fix: O(1) ring-buffer approach — track a _head index instead of
-        // calling List.RemoveAt(0) which shifts all remaining elements (O(n)).
-        // At the default size of 10 this is negligible, but if _bufferSize is
-        // increased for high-jitter scenarios (e.g. 64) the saving becomes
-        // meaningful. The List is pre-allocated to _bufferSize capacity; entries
-        // are overwritten in-place once full.
+        // Ring-buffer storage: _head is the logical index of the oldest valid entry.
+        // Entries are overwritten in-place once the buffer is full, giving O(1)
+        // insertions regardless of buffer size.
         private readonly List<TimestampedState> _buffer = new List<TimestampedState>();
         private int _head; // index of the oldest valid entry (logical index 0)
+
+        // Tracks the largest timestamp ever accepted. States with an equal or
+        // smaller timestamp are discarded to maintain chronological buffer order
+        // despite out-of-order UDP delivery or duplicate packets.
+        private double _latestTimestamp = double.MinValue;
 
         // ── Properties (test-visible) ──────────────────────────────────────────
 
@@ -126,9 +120,13 @@ namespace RTMPE.Sync
         /// </param>
         public void AddState(TransformState state, double timestamp)
         {
-            // L-2 fix: fill the backing list up to capacity, then overwrite the
-            // oldest slot (pointed to by _head) — O(1) amortised regardless of
-            // _bufferSize.
+            // Discard out-of-order and duplicate states — only strictly newer
+            // timestamps advance the ring buffer.
+            if (timestamp <= _latestTimestamp) return;
+            _latestTimestamp = timestamp;
+
+            // Fill the backing list to capacity on initial population, then
+            // overwrite the oldest slot in-place — O(1) regardless of buffer size.
             if (_buffer.Count < _bufferSize)
             {
                 _buffer.Add(new TimestampedState { Timestamp = timestamp, State = state });
@@ -199,7 +197,7 @@ namespace RTMPE.Sync
             TimestampedState from = _buffer[physFrom];
             TimestampedState to   = _buffer[physTo];
 
-            // P-4 fix: guard division by zero when both states share the same
+            // Guard against division by zero when two states share the same
             // timestamp (e.g. two packets decoded in the same frame).
             double span = to.Timestamp - from.Timestamp;
             float t;
@@ -212,13 +210,11 @@ namespace RTMPE.Sync
             {
                 Position = Vector3.Lerp(from.State.Position, to.State.Position, t),
 
-                // P-5 fix: Unity's Quaternion.Slerp already picks the shortest
-                // arc; manual dot-product negation is NOT needed here.
+                // Quaternion.Slerp selects the shortest arc automatically.
                 Rotation = Quaternion.Slerp(from.State.Rotation, to.State.Rotation, t),
 
-                // P-10 fix: scale axis is respected just like _syncScale in
-                // NetworkTransform.  When disabled, the "to" value is returned so
-                // callers that DO apply scale see a stable (snapped) value.
+                // When scale interpolation is disabled, snap to the destination
+                // value so callers that apply scale receive a stable result.
                 Scale    = _interpolateScale
                     ? Vector3.Lerp(from.State.Scale, to.State.Scale, t)
                     : to.State.Scale,
@@ -235,8 +231,9 @@ namespace RTMPE.Sync
         /// </summary>
         private void Update()
         {
-            // P-1 fix: Time.timeAsDouble is the correct Unity API.
-            // NetworkManager.Instance.ServerTime does not exist.
+            // Render cursor: local monotonic time minus the configured delay.
+            // Using Time.timeAsDouble gives sub-millisecond precision without
+            // the drift risk of float accumulation.
             double renderTime = Time.timeAsDouble - _interpolationDelay;
 
             if (TryInterpolate(renderTime, out TransformState state))
@@ -274,8 +271,7 @@ namespace RTMPE.Sync
             _bufferSize          = bufferSize;
             _interpolationDelay  = interpolationDelay;
             _interpolateScale    = interpolateScale;
-            // L-2 fix: reset ring-buffer state so tests with different buffer
-            // sizes start from a consistent empty-buffer condition.
+            // Reset ring-buffer state for a consistent starting condition.
             _buffer.Clear();
             _head = 0;
         }

@@ -45,7 +45,6 @@ namespace RTMPE.Core
         public const int HEADER_SIZE = 13;
 
         // ── Header field byte offsets ──────────────────────────────────────────
-        // Offsets are useful for zero-copy parsing with Span<byte> (Week 11+).
         internal const int OFFSET_MAGIC       = 0;   // 2 bytes LE
         internal const int OFFSET_VERSION     = 2;   // 1 byte
         internal const int OFFSET_TYPE        = 3;   // 1 byte
@@ -60,14 +59,14 @@ namespace RTMPE.Core
     /// </summary>
     public enum PacketType : byte
     {
-        // ── Legacy handshake (Week 3 / backward compatibility) ───────────────
+        // ── Legacy handshake (backward compatibility) ───────────────────────────
         Handshake         = 0x01,   // Client → Server: initial connection request
         HandshakeAck      = 0x02,   // Server → Client: handshake accepted
 
-        // ── ECDH 4-step mutual authentication (Week 6+, production) ──────────
+        // ── ECDH 4-step mutual authentication (production) ───────────────────────
         // Flow: HandshakeInit → Challenge → HandshakeResponse → SessionAck
         HandshakeInit     = 0x05,   // Client → Server: [api_key_len:2 LE][api_key:N]
-        Challenge         = 0x06,   // Server → Client: [ephemeral_pub:32][static_pub:32][ed25519_sig:64] = 128 B (H4 security fix)
+        Challenge         = 0x06,   // Server → Client: [ephemeral_pub:32][static_pub:32][ed25519_sig:64] = 128 B
         HandshakeResponse = 0x07,   // Client → Server: [client_pub_key:32]
         SessionAck        = 0x08,   // Server → Client: [crypto_id:4 LE][jwt_len:2 LE][jwt:N][reconnect_len:2 LE][reconnect:N]
 
@@ -91,8 +90,10 @@ namespace RTMPE.Core
 
         // ── State synchronisation ─────────────────────────────────────────────
         StateSync         = 0x40,   // Server → Client: authoritative full snapshot
-
-        // ── RPC system (Week 17) ─────────────────────────────────────────────
+        // ── Network variable delta synchronisation ───────────────────────
+        // Payload: [object_id:8 LE][var_count:1][for each: [var_id:2 LE][value bytes...]]
+        VariableUpdate    = 0x41,   // Client → Server → all room clients: dirty variable delta
+        // ── RPC system ────────────────────────────────────────────────────────
         Rpc               = 0x50,   // Client → Server: RPC request (method_id dispatch)
         RpcResponse       = 0x51,   // Server → Client: RPC response (or broadcast)
 

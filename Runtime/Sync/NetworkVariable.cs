@@ -23,12 +23,12 @@
 //     callbacks can safely read Value without re-entrancy issues.
 //   • VariableId (ushort) is assigned by the caller to identify this variable
 //     within its owning NetworkBehaviour.  Used by the packet serialiser
-//     (Week 25) to route incoming updates to the correct variable.
-//   • Owner (NetworkBehaviour) is stored for future use by the send path
-//     (Week 25: dirty variables are flushed on each tick for owning clients).
+//     to route incoming updates to the correct variable.
+//   • Owner (NetworkBehaviour) is stored for the send path — dirty variables
+//     are flushed at 30 Hz for owning clients.
 //     Not null-checked here — callers must pass a valid instance.
 //
-// P-6 fix: NetworkVariableString.Value setter normalises null → "" on write.
+// NetworkVariableString.Value setter normalises null to "" on write.
 //   A null value assigned via Value = null is stored as "" preventing
 //   get→Serialize→Deserialize state divergence.
 //
@@ -37,6 +37,7 @@
 
 using System;
 using System.IO;
+using System.Text;
 using UnityEngine;
 
 namespace RTMPE.Sync
@@ -62,7 +63,7 @@ namespace RTMPE.Sync
 
         /// <summary>
         /// The <see cref="NetworkBehaviour"/> that owns this variable.
-        /// Used by the send path (Week 25) to flush dirty variables on each tick.
+        /// Used by the send path to flush dirty variables on each tick.
         /// </summary>
         protected NetworkBehaviour Owner { get; }
 
@@ -70,7 +71,7 @@ namespace RTMPE.Sync
 
         /// <summary>
         /// True when the local value has changed since the last
-        /// <see cref="MarkClean"/> call.  The send path (Week 25) reads this
+        /// <see cref="MarkClean"/> call.  The send path reads this
         /// to decide whether to include this variable in the next update packet.
         /// </summary>
         public bool IsDirty { get; protected set; }
@@ -92,6 +93,10 @@ namespace RTMPE.Sync
         {
             Owner      = owner;
             VariableId = variableId;
+            // Register with the owning NetworkBehaviour so the 30 Hz flush loop
+            // can discover and serialize dirty values. Create variables inside
+            // OnNetworkSpawn() where the object is guaranteed to be fully initialized.
+            owner?.TrackVariable(this);
         }
 
         // ── API ─────────────────────────────────────────────────────────────────
@@ -111,15 +116,45 @@ namespace RTMPE.Sync
         public abstract void Serialize(BinaryWriter writer);
 
         /// <summary>
-        /// Write the <see cref="VariableId"/> (2 bytes LE) followed by the
-        /// value bytes.  This is the framed wire format used in 'variable
-        /// update' packets so the receiver can identify which variable to
-        /// update.
+        /// Write the <see cref="VariableId"/> (2 bytes LE) followed by a
+        /// 2-byte LE value length, then the value bytes.
+        /// This is the framed wire format used in 'variable update' packets
+        /// so the receiver can identify which variable to update AND skip
+        /// unknown variable IDs without corrupting the stream.
+        ///
+        /// Wire layout: [var_id:2 LE][value_len:2 LE][value_bytes:N]
         /// </summary>
         public void SerializeWithId(BinaryWriter writer)
         {
-            writer.Write(VariableId);  // BinaryWriter.Write(ushort) → 2 bytes LE
-            Serialize(writer);
+            // Write var_id first.
+            writer.Write(VariableId);
+
+            // Write a 2-byte LE length prefix for the value payload.
+            // This lets the receiver skip entries with unknown variable IDs
+            // instead of stopping mid-packet and losing all subsequent variables.
+            //
+            // A growable MemoryStream is required here — a fixed-size buffer backed
+            // by ArrayPool is NOT safe.  NetworkVariableString.Serialize() emits
+            // up to 65,537 bytes (2-byte LE prefix + up to 65,535 UTF-8 content
+            // bytes).  Passing that to a non-resizable MemoryStream backed by a
+            // 64-byte slice throws NotSupportedException: Memory stream is not
+            // expandable.  The growable form starts at InitialCapacity (covering all
+            // struct types without reallocation) and grows lazily only when needed.
+            const int InitialCapacity = 64; // sufficient for all struct types (Quaternion = 16 B)
+            using var ms = new MemoryStream(InitialCapacity);
+            using (var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
+            {
+                Serialize(bw);
+                bw.Flush();
+            }
+
+            int valueLen = (int)ms.Length;
+
+            // [value_len:2 LE] — BinaryWriter.Write(ushort) is little-endian per spec.
+            writer.Write((ushort)valueLen);
+            // [value_bytes:N] — GetBuffer() is zero-copy (returns the raw internal array).
+            // Passing explicit 0..valueLen avoids writing trailing uninitialised bytes.
+            writer.Write(ms.GetBuffer(), 0, valueLen);
         }
 
         /// <summary>
@@ -279,7 +314,8 @@ namespace RTMPE.Sync
             get => _value;
             set
             {
-                // P-6 fix: normalise null → "" before comparison and storage.
+                // Normalise null to "" before comparison and storage to ensure
+                // consistent behaviour when null is assigned as a value.
                 string normalized = value ?? string.Empty;
                 if (_value == normalized) return;
 
@@ -321,16 +357,34 @@ namespace RTMPE.Sync
         /// <inheritdoc/>
         public override void Serialize(BinaryWriter writer)
         {
-            // BinaryWriter.Write(string) uses a 7-bit-encoded length prefix
-            // followed by UTF-8 bytes.  This is the standard .NET encoding and
-            // is matched symmetrically by BinaryReader.ReadString().
-            writer.Write(_value);
+            // Encode as a 2-byte LE uint16 length prefix followed by raw UTF-8
+            // bytes. This is wire-compatible with the Go server (binary.LittleEndian.Uint16).
+            // BinaryWriter.Write(string) emits a .NET 7-bit variable-length integer
+            // prefix which is not compatible with the Go wire format.
+            // Strings longer than 65535 UTF-8 bytes are clamped with a warning.
+            byte[] bytes = Encoding.UTF8.GetBytes(_value ?? string.Empty);
+            if (bytes.Length > ushort.MaxValue)
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] NetworkVariableString: value exceeds {ushort.MaxValue} UTF-8 bytes " +
+                    "and will be truncated. Shorten the string.");
+                bytes = bytes[..ushort.MaxValue];
+            }
+
+            // 2-byte LE length prefix (compatible with Go binary.LittleEndian.Uint16).
+            // BinaryWriter.Write(ushort) is little-endian per .NET Standard 2.1 spec.
+            writer.Write((ushort)bytes.Length);
+            writer.Write(bytes);
         }
 
         /// <inheritdoc/>
         public override void Deserialize(BinaryReader reader)
         {
-            SetValueWithoutNotify(reader.ReadString());
+            // Read the 2-byte LE length prefix, then read exactly that many
+            // UTF-8 bytes — matches the Serialize path above and the Go server format.
+            ushort len   = reader.ReadUInt16();
+            byte[] bytes = reader.ReadBytes(len);
+            SetValueWithoutNotify(Encoding.UTF8.GetString(bytes));
         }
     }
 }

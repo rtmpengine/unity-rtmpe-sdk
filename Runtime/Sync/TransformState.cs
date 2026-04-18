@@ -1,7 +1,7 @@
 // RTMPE SDK — Runtime/Sync/TransformState.cs
 //
 // Plain value struct holding the transform fields that are synchronised over
-// the network by NetworkTransform (Week 22).
+// the network by NetworkTransform.
 //
 // Design decisions:
 //   • Uses UnityEngine.Vector3 and UnityEngine.Quaternion directly so that

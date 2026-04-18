@@ -30,7 +30,7 @@ namespace RTMPE.Protocol
         // The sequence counter wraps naturally at uint.MaxValue (2^32-1).
         // To avoid the Unsafe.As IL2CPP issue, we store as int and cast to uint on write.
         // Initialised to -1 so the first Interlocked.Increment returns 0, matching the
-        // gateway's expectation that the first packet carries sequence 0 (L-SDK4 fix).
+        // gateway's expectation that the first packet carries sequence 0.
         private int _sequenceCounter = -1;
 
         // ── Public factory methods ────────────────────────────────────────────

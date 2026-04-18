@@ -635,5 +635,86 @@ namespace RTMPE.Tests
 
             Assert.AreEqual(16L, ms.Length, "Quaternion must occupy exactly 16 bytes.");
         }
+
+        // ── 14: SerializeWithId — wire layout for int ─────────────────────────
+
+        [Test]
+        [Description("SerializeWithId for NetworkVariableInt emits exactly 8 bytes: " +
+                     "[var_id:2][value_len:2][int_bytes:4], and the var_id and value_len fields " +
+                     "have the correct little-endian values.")]
+        public void SerializeWithId_Int_WireLayout()
+        {
+            var v = new NetworkVariableInt(_owner, 5, 0x01020304);
+
+            using var ms     = new MemoryStream();
+            using var writer = new BinaryWriter(ms);
+            v.SerializeWithId(writer);
+            writer.Flush();
+
+            Assert.AreEqual(8L, ms.Length,
+                "Wire frame: 2 (var_id) + 2 (value_len) + 4 (int) = 8 bytes");
+
+            ms.Position = 0;
+            using var reader = new BinaryReader(ms);
+            Assert.AreEqual((ushort)5, reader.ReadUInt16(), "var_id must be 5");
+            Assert.AreEqual((ushort)4, reader.ReadUInt16(), "value_len must be 4");
+        }
+
+        // ── 15: SerializeWithId — long string does not throw ──────────────────
+
+        [Test]
+        [Description("SerializeWithId must not throw NotSupportedException for a 300-character " +
+                     "string. Regression: a fixed-size 64-byte MemoryStream was overflowed.")]
+        public void SerializeWithId_LongString_DoesNotThrow()
+        {
+            var longValue = new string('A', 300);
+            var v = new NetworkVariableString(_owner, 0, longValue);
+
+            using var ms     = new MemoryStream();
+            using var writer = new BinaryWriter(ms);
+
+            Assert.DoesNotThrow(
+                () => v.SerializeWithId(writer),
+                "SerializeWithId must not throw for a 300-character string.");
+        }
+
+        // ── 16: SerializeWithId — long string round-trip ──────────────────────
+
+        [Test]
+        [Description("A 300-character string serialised with SerializeWithId round-trips " +
+                     "correctly: wire format is [var_id:2][value_len:2][utf8_prefix:2][utf8_bytes:300] " +
+                     "= 306 bytes total; Deserialize recovers the original string.")]
+        public void SerializeWithId_LongString_RoundTrip()
+        {
+            var longValue = new string('Z', 300);
+            var src = new NetworkVariableString(_owner, 3, longValue);
+            var dst = new NetworkVariableString(_owner, 3, "");
+
+            // --- Serialise ---
+            using var ms     = new MemoryStream();
+            using var writer = new BinaryWriter(ms);
+            src.SerializeWithId(writer);
+            writer.Flush();
+
+            // Total expected: 2 (var_id) + 2 (value_len) + 2 (ushort prefix in Serialize) + 300 (ASCII) = 306
+            Assert.AreEqual(306L, ms.Length, "Total wire size must be 306 bytes.");
+
+            // --- Deserialise ---
+            ms.Position = 0;
+            using var reader = new BinaryReader(ms);
+
+            ushort varId    = reader.ReadUInt16();
+            ushort valueLen = reader.ReadUInt16();
+            Assert.AreEqual((ushort)3,   varId,    "var_id must be 3");
+            Assert.AreEqual((ushort)302, valueLen, "value_len = 2 (ushort prefix) + 300 (content)");
+
+            // Deserialize reads the inner format: [ushort len][utf8 bytes]
+            byte[] valueBytes = reader.ReadBytes(valueLen);
+            using var valueMs     = new MemoryStream(valueBytes);
+            using var valueReader = new BinaryReader(valueMs);
+            dst.Deserialize(valueReader);
+
+            Assert.AreEqual(longValue, dst.Value, "Round-tripped value must match the original.");
+        }
     }
 }

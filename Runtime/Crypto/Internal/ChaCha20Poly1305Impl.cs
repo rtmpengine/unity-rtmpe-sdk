@@ -4,7 +4,7 @@
 //
 // Used in two places:
 //   1. ApiKeyCipher: encrypt the API key in HandshakeInit using the project PSK.
-//   2. Session packet encryption/decryption (Week 10+).
+//   2. Session packet encryption/decryption.
 //
 // This implementation targets .NET Standard 2.1 / Unity 6 with no native
 // dependencies and without unsafe code. BigInteger is used for Poly1305
@@ -12,7 +12,7 @@
 // (once per connection).
 //
 // ============================================================================
-// SECURITY / THREAT MODEL (M-5)
+// SECURITY / THREAT MODEL
 // ============================================================================
 // This is a PURE-MANAGED C# cryptographic implementation.
 //

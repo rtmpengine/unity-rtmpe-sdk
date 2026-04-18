@@ -4,7 +4,7 @@
 // Run from the Unity Test Runner: Window > General > Test Runner > EditMode.
 //
 // TODO (Day 4-5): Add NetworkThread construction / teardown tests.
-// TODO (Week 11+): Add KCP send/receive round-trip tests against a loopback server.
+// TODO: Add KCP send/receive round-trip tests against a loopback server.
 
 using System;
 using NUnit.Framework;
@@ -113,7 +113,7 @@ namespace RTMPE.Tests
         {
             var values = Enum.GetValues(typeof(PacketType));
             Assert.AreEqual(20, values.Length,
-                "Exactly 20 PacketType members must exist (Rust gateway defines 20; Rpc+RpcResponse added Week 17)");
+                "Exactly 20 PacketType members must exist (Rust gateway defines 20)"));
         }
 
         // ── Header field offset consistency ───────────────────────────────────

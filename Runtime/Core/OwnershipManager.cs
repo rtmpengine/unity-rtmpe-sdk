@@ -8,7 +8,7 @@
 //   • Local state ONLY changes via ApplyOwnershipGrant(), called from
 //     the packet handler after the server confirms.
 //
-// Week 15 / Week 17 notes:
+// Design notes:
 //   • RequestOwnershipTransfer() sends TransferOwnership RPC (Method ID 200)
 //     to the server. The server validates and broadcasts OwnershipGrant to all
 //     clients. Local state ONLY changes via ApplyOwnershipGrant() (server-authoritative).
@@ -23,7 +23,7 @@ namespace RTMPE.Core
 {
     /// <summary>
     /// Manages ownership of <see cref="NetworkBehaviour"/> objects.
-    /// Access via <c>SpawnManager.Ownership</c> (Week 16).
+    /// Access via <c>SpawnManager.Ownership</c>.
     /// All methods must be called from the Unity main thread.
     /// </summary>
     public sealed class OwnershipManager
@@ -39,7 +39,7 @@ namespace RTMPE.Core
         /// </summary>
         /// <param name="registry">The shared object registry.</param>
         /// <param name="networkManager">
-        /// The active NetworkManager; used in Week 17 to send RPC packets.
+        /// The active NetworkManager; used to send RPC packets.
         /// </param>
         public OwnershipManager(NetworkObjectRegistry registry, NetworkManager networkManager)
         {
@@ -125,7 +125,7 @@ namespace RTMPE.Core
         /// Apply a server-confirmed ownership grant.
         ///
         /// Called by the packet handler when the server broadcasts an
-        /// OwnershipGrant (or OwnershipTransfer RPC response in Week 17).
+        /// OwnershipGrant (or OwnershipTransfer RPC response).
         /// This is the ONLY place where local ownership state changes.
         /// </summary>
         /// <param name="objectId">Network object whose ownership changed.</param>

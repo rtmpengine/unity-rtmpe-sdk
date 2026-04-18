@@ -111,7 +111,7 @@ namespace RTMPE.Tests
             Assert.DoesNotThrow(() => _ownership.ApplyOwnershipGrant(999UL, "new-owner"));
         }
 
-        // ── RequestOwnershipTransfer (stub — Week 17) ──────────────────────────
+        // ── RequestOwnershipTransfer (stub) ─────────────────────────────────────
 
         [Test]
         [Description("RequestOwnershipTransfer when not the owner logs error and does not transfer.")]
@@ -130,7 +130,7 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        [Description("RequestOwnershipTransfer when local IS the owner logs stub-warning and does not mutate (Week 17 pending).")]
+        [Description("RequestOwnershipTransfer when local IS the owner logs a stub-warning and does not mutate local state.")]
         public void RequestOwnershipTransfer_IsOwner_LogsWarningAndDoesNotMutate()
         {
             _manager.SetLocalPlayerStringId("p-local");
@@ -138,7 +138,7 @@ namespace RTMPE.Tests
 
             Assert.DoesNotThrow(() => _ownership.RequestOwnershipTransfer(21UL, "p-new"));
 
-            // C-2 fix: stub must NOT mutate ownership — Week 17 will do that.
+            // Stub must not mutate ownership; only ApplyOwnershipGrant (server response) changes local state.
             Assert.AreEqual("p-local", nb.OwnerPlayerId);
         }
 
@@ -220,7 +220,7 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        [Description("ApplyOwnershipGrant with same owner does NOT fire OnOwnershipChanged (H-2 fix via OwnershipManager path).")]
+        [Description("ApplyOwnershipGrant with same owner does NOT fire OnOwnershipChanged.")]
         public void ApplyOwnershipGrant_SameOwner_NoCallbackFired()
         {
             var nb = RegisterObject(30UL, "alice");

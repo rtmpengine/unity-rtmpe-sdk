@@ -2,7 +2,7 @@
 //
 // HKDF-SHA256 per RFC 5869.
 //
-// Used during the W6 handshake to derive two directional session keys
+// Used during the ECDH handshake to derive two directional session keys
 // from the X25519 ECDH shared secret.
 //
 // Salt used by the gateway: b"RTMPE-v3-hkdf-salt-2026"
@@ -10,7 +10,7 @@
 // Then appended with b"\x00" for the initiator key and b"\x01" for the responder key.
 //
 // ============================================================================
-// SECURITY / THREAT MODEL (M-5)
+// SECURITY / THREAT MODEL
 // ============================================================================
 // This is a PURE-MANAGED C# cryptographic implementation.
 //

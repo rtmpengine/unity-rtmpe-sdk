@@ -1,6 +1,6 @@
 // RTMPE SDK — Runtime/Crypto/HandshakeHandler.cs
 //
-// Client-side orchestrator for the W6 four-step ECDH handshake:
+// Client-side orchestrator for the four-step ECDH handshake:
 //
 //   Round 1 (client → server):
 //     HandshakeInit: [nonce:12][ChaCha20-Poly1305([key_len:2][key:N])] encrypted with PSK
@@ -19,9 +19,9 @@
 //   2. Performs X25519: SharedSecret(client_private, server_ephemeral_pub)
 //   3. Derives directional SessionKeys via HKDF-SHA256
 //
-// W9-2 fix: HandshakeHandler implements IDisposable.  Dispose() zeros the
-// ephemeral private key and the server ephemeral public key in-place, reducing
-// the window in which sensitive key material can be recovered from a heap dump.
+// HandshakeHandler implements IDisposable.  Dispose() zeros the ephemeral
+// private key and the server ephemeral public key in-place, reducing the
+// window in which sensitive key material can be recovered from a heap dump.
 // The caller (NetworkManager) disposes this handler on disconnect.
 
 using System;
@@ -69,7 +69,7 @@ namespace RTMPE.Crypto
         /// <summary>
         /// Validate the 128-byte <c>Challenge</c> payload received from the server.
         ///
-        /// Parses the three fields, verifies the Ed25519 signature (H4 fix),
+        /// Parses the three fields, verifies the Ed25519 signature,
         /// and stores the server ephemeral public key for <see cref="DeriveSessionKeys"/>.
         ///
         /// If an optional pinned server public key is provided, it is also
@@ -115,7 +115,7 @@ namespace RTMPE.Crypto
                     if (pinnedServerStaticPub[i] != staticPub[i]) return false;
             }
 
-            // H4 fix: verify Ed25519 signature of the ephemeral key.
+            // Verify the Ed25519 signature of the ephemeral key.
             // The server signs: sign(server_static_priv, server_ephemeral_pub)
             if (!Ed25519Verify.Verify(staticPub, ephemeral, sig))
                 return false;
@@ -144,13 +144,13 @@ namespace RTMPE.Crypto
             if (sharedSecret == null) return null; // degenerate key — reject
 
             SessionKeys result;
-            // M-17 fix: declare prk OUTSIDE the try block so the finally clause can
+            // Declare prk outside the try block so the finally clause can
             // zero it.  prk is derived from the ECDH shared secret and must not
             // linger in the managed heap after the session keys are produced.
             byte[] prk = null;
             try
             {
-                // G-H1: determine which side is the "initiator" (smaller public key).
+                // Determine which side is the "initiator" (smaller public key).
                 bool iAmInitiator = ComparePublicKeys(_clientPublicKey, _serverEphemeralPub) <= 0;
 
                 // Build the HKDF info: base || min(clientPub, serverPub) || max(clientPub, serverPub)
@@ -185,11 +185,11 @@ namespace RTMPE.Crypto
             }
             finally
             {
-                // W9-2 fix: zero the ECDH shared secret immediately after key derivation.
+                // Zero the ECDH shared secret immediately after key derivation.
                 // The secret is no longer needed once PRK is derived; clearing it in-place
                 // limits the lifetime of raw DH output in the managed heap.
                 Array.Clear(sharedSecret, 0, sharedSecret.Length);
-                // M-17 fix: also zero the PRK (HKDF pseudo-random key derived from the
+                // Zero the PRK (HKDF pseudo-random key derived from the
                 // shared secret).  prk may be null if Extract threw before assignment.
                 if (prk != null) Array.Clear(prk, 0, prk.Length);
             }
@@ -222,8 +222,8 @@ namespace RTMPE.Crypto
         {
             if (_disposed) return;
             _disposed = true;
-            // W9-2 fix: zeroize sensitive key material to minimise the window
-            // in which a managed-heap dump or cold-boot attack can recover keys.
+            // Zeroize sensitive key material to minimise the window in which
+            // a managed-heap dump or cold-boot attack can recover keys.
             if (_clientPrivateKey != null) Array.Clear(_clientPrivateKey, 0, _clientPrivateKey.Length);
             if (_serverEphemeralPub != null) Array.Clear(_serverEphemeralPub, 0, _serverEphemeralPub.Length);
         }

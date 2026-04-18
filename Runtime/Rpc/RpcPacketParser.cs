@@ -14,8 +14,6 @@
 //   [payload     : N bytes]    — optional method-specific response data
 //
 // Total header: 21 bytes + N.
-//
-// See Plan/week-17-rpc.md for the full architecture specification.
 
 using System;
 

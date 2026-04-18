@@ -24,6 +24,7 @@
 
 using System;
 using System.Text;
+using UnityEngine;
 
 namespace RTMPE.Rooms
 {
@@ -126,13 +127,18 @@ namespace RTMPE.Rooms
             byte[] raw = Encoding.UTF8.GetBytes(value);
             if (raw.Length <= maxBytes) return raw;
 
-            // M-5 fix: walk backwards to find a valid UTF-8 character boundary.
+            // Walk backwards to find a valid UTF-8 character boundary.
             // UTF-8 continuation bytes have the pattern 10xxxxxx (0x80..0xBF).
             int end = maxBytes;
             while (end > 0 && (raw[end] & 0xC0) == 0x80)
                 end--;
 
             if (end == 0) return Array.Empty<byte>();
+
+            if (end < raw.Length)
+                Debug.LogWarning(
+                    $"[RTMPE] String value exceeds {maxBytes} bytes and was truncated " +
+                    $"to {end} bytes. Shorten the value before passing it to the SDK.");
 
             var truncated = new byte[end];
             Buffer.BlockCopy(raw, 0, truncated, 0, end);

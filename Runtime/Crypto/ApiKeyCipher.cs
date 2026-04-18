@@ -1,12 +1,12 @@
 // RTMPE SDK — Runtime/Crypto/ApiKeyCipher.cs
 //
-// PSK encryption of the API key for the HandshakeInit packet (C1 / M-12 fixes).
+// PSK encryption of the API key included in HandshakeInit packets.
 //
 // Wire format for the HandshakeInit payload:
 //   [nonce:12][ChaCha20-Poly1305([api_key_len:2 LE][api_key:N]) + tag:16]
 //   = 12 + 2 + N + 16 bytes total
 //
-// AAD (M-12 fix): canonical serialisation of the client's source IP:port.
+// AAD: canonical serialisation of the client's source IP:port.
 //   IPv4: [0x04][ip:4 octets LE][port:2 LE]  = 7 bytes
 //   IPv6: [0x06][ip:16 octets][port:2 LE]    = 19 bytes
 //
@@ -46,7 +46,7 @@ namespace RTMPE.Crypto
         /// <param name="psk">32-byte pre-shared key (from developer dashboard).</param>
         /// <param name="apiKey">UTF-8 API key string.</param>
         /// <param name="sourceAddress">
-        /// The client's local socket endpoint used as AAD (M-12 fix).
+        /// The client's local socket endpoint used as AAD.
         /// Must match the source address the gateway will see in the UDP header.
         /// </param>
         public static byte[] Encrypt(byte[] psk, string apiKey, IPEndPoint sourceAddress)
@@ -69,7 +69,7 @@ namespace RTMPE.Crypto
             using var rng = RandomNumberGenerator.Create();
             rng.GetBytes(nonce);
 
-            // Compute AAD from the source address (M-12).
+            // Compute AAD from the source address.
             var aad = AddrAad(sourceAddress);
 
             // Encrypt (returns ciphertext + 16-byte tag).
@@ -101,7 +101,7 @@ namespace RTMPE.Crypto
             return key;
         }
 
-        // ── AAD serialisation (M-12) ──────────────────────────────────────────
+        // ── AAD serialisation ──────────────────────────────────────────
 
         /// <summary>
         /// Serialise the client source address to the canonical AAD byte sequence.

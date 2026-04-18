@@ -176,7 +176,7 @@ namespace RTMPE.Tests
         [Description("Disconnect() from the initial Disconnected state must be a silent no-op: " +
                      "OnDisconnected must NOT fire and state must remain Disconnected. " +
                      "(Full ClientRequest reason test requires reaching Connected state; " +
-                     "added in Week 9 with MockTransport test seam.)")]
+                     "added with MockTransport test seam."))]
         public void Disconnect_WhenAlreadyDisconnected_DoesNotFireOnDisconnected()
         {
             int firedCount = 0;

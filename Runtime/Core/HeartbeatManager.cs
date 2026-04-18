@@ -65,7 +65,7 @@ namespace RTMPE.Core
         /// Pass the NetworkManager's <c>_packetBuilder</c> field in production so that
         /// heartbeat packets and data packets draw from the same monotone counter,
         /// preventing sequence-number collisions that could cause nonce reuse once AEAD
-        /// is integrated (H-1 fix).
+        /// is integrated.
         /// </param>
         public HeartbeatManager(int intervalMs = 5_000, PacketBuilder sharedBuilder = null)
         {
@@ -73,7 +73,7 @@ namespace RTMPE.Core
                 throw new ArgumentOutOfRangeException(nameof(intervalMs), "Heartbeat interval must be >= 100 ms.");
 
             _intervalMs = intervalMs;
-            _builder    = sharedBuilder ?? new PacketBuilder();  // H-1 fix: use shared counter when provided
+            _builder    = sharedBuilder ?? new PacketBuilder();  // Use the shared counter when provided
             _clock      = new Stopwatch();
         }
 

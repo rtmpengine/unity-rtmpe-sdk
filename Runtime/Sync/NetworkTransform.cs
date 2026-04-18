@@ -4,12 +4,12 @@
 // and optionally scale over the RTMPE network.
 //
 // Design decisions:
-//   • Extends NetworkBehaviour (Week 15) — inherits NetworkObjectId, IsOwner,
+//   • Extends NetworkBehaviour — inherits NetworkObjectId, IsOwner,
 //     IsSpawned, and the OnNetworkSpawn / OnNetworkDespawn callbacks.
 //   • Owner-only sending: only the authoritative owner sends transform updates.
 //     All other clients receive server-broadcast StateDelta payloads via
 //     the OnDataReceived event on NetworkManager (handled externally by the
-//     state-sync subsystem — Week 23+).
+//     state-sync subsystem).
 //   • Two thresholds guard against send spam:
 //     - _positionThreshold (0.01 world units): Vector3.Distance check
 //     - _rotationThreshold (0.1 degrees):      Quaternion.Angle check
@@ -57,6 +57,10 @@ namespace RTMPE.Sync
         [Tooltip("Minimum rotation change in degrees before an update is sent.")]
         [SerializeField] private float _rotationThreshold = 0.1f;
 
+        [Tooltip("Minimum local-scale change per axis before an update is sent. " +
+                 "Only evaluated when _syncScale is enabled.")]
+        [SerializeField] private float _scaleThreshold = 0.001f;
+
         // ── Last-sent baseline ─────────────────────────────────────────────────
 
         private Vector3    _lastPosition;
@@ -78,6 +82,14 @@ namespace RTMPE.Sync
         /// </summary>
         public bool HasRotationChanged
             => Quaternion.Angle(transform.rotation, _lastRotation) > _rotationThreshold;
+
+        /// <summary>
+        /// True when <c>_syncScale</c> is enabled and the object's local scale
+        /// has changed by more than <c>_scaleThreshold</c> per axis since the
+        /// last <see cref="MarkClean"/> call.
+        /// </summary>
+        public bool HasScaleChanged
+            => _syncScale && Vector3.Distance(transform.localScale, _lastScale) > _scaleThreshold;
 
         // ── Public API ─────────────────────────────────────────────────────────
 
@@ -136,7 +148,9 @@ namespace RTMPE.Sync
         {
             if (!IsOwner || !IsSpawned) return;
 
-            if (HasPositionChanged || HasRotationChanged)
+            // Include scale in the dirty check so scale-only changes
+            // (e.g. a power-up growing in place) are transmitted correctly.
+            if (HasPositionChanged || HasRotationChanged || HasScaleChanged)
             {
                 SendTransformUpdate();
                 MarkClean();

@@ -30,8 +30,9 @@ namespace RTMPE.Transport
         private readonly int    _receiveBufferBytes;
 
         // ── Runtime state ──────────────────────────────────────────────────────
-        private Socket   _socket;
-        private EndPoint _remoteEndPoint;
+        private Socket        _socket;
+        private EndPoint      _remoteEndPoint;
+        private AddressFamily _socketFamily = AddressFamily.InterNetwork; // reflects the active socket
         private volatile bool _disposed;
         // Populated by Connect() after the socket is bound.
         // Reflects the actual outgoing source IP (discovered via a routing probe),
@@ -83,64 +84,81 @@ namespace RTMPE.Transport
 
             var addresses = Dns.GetHostAddresses(_host);
 
-            // Filter for IPv4: the socket is AddressFamily.InterNetwork (IPv4-only).
-            // addresses[0] may be an IPv6 address on dual-stack systems when _host is a
-            // hostname like "localhost" that resolves to ::1 first. Using an IPv6 endpoint
-            // with an IPv4 socket causes an AddressFamilyNotSupported SocketException.
-            IPAddress ipv4 = null;
+            // Prefer IPv4, but fall back to IPv6 if no IPv4 address is available.
+            // Previous code threw InvalidOperationException on IPv6-only hosts.
+            IPAddress resolved = null;
+            AddressFamily family = AddressFamily.InterNetwork;
             foreach (var addr in addresses)
             {
                 if (addr.AddressFamily == AddressFamily.InterNetwork)
                 {
-                    ipv4 = addr;
+                    resolved = addr;
                     break;
                 }
             }
 
-            if (ipv4 == null)
+            if (resolved == null)
+            {
+                // No IPv4 — try IPv6.
+                foreach (var addr in addresses)
+                {
+                    if (addr.AddressFamily == AddressFamily.InterNetworkV6)
+                    {
+                        resolved = addr;
+                        family   = AddressFamily.InterNetworkV6;
+                        break;
+                    }
+                }
+            }
+
+            if (resolved == null)
                 throw new InvalidOperationException(
-                    $"No IPv4 address found for host '{_host}'. " +
-                    $"Resolved {addresses.Length} address(es), none with AddressFamily.InterNetwork.");
+                    $"No usable address found for host '{_host}'. " +
+                    $"Resolved {addresses.Length} address(es), none IPv4 or IPv6.");
 
-            _remoteEndPoint = new IPEndPoint(ipv4, _port);
+            _remoteEndPoint = new IPEndPoint(resolved, _port);
 
-            _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp)
+            _socket = new Socket(family, SocketType.Dgram, ProtocolType.Udp)
             {
                 SendBufferSize    = _sendBufferBytes,
                 ReceiveBufferSize = _receiveBufferBytes,
                 Blocking          = false
             };
 
+            // Record the address family so Receive() can construct a matching EndPoint.
+            _socketFamily = family;
+
             // Bind to any local address/port — the OS assigns an ephemeral source port.
-            _socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+            var anyAddr = family == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any;
+            _socket.Bind(new IPEndPoint(anyAddr, 0));
 
             // Discover the actual outgoing source IP via a temporary routing probe.
             // Socket.Connect for UDP just records the destination and triggers the
             // kernel routing table lookup without sending any data. Reading
             // LocalEndPoint after connect gives the real outgoing interface IP
-            // (not 0.0.0.0 that Bind(Any) would produce).
+            // (not 0.0.0.0/[::] that Bind(Any) would produce).
             int boundPort = ((IPEndPoint)_socket.LocalEndPoint).Port;
+            var loopback  = family == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
             try
             {
-                using var probe = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                using var probe = new Socket(family, SocketType.Dgram, ProtocolType.Udp);
                 probe.Connect(_remoteEndPoint);
                 var probeLocal = probe.LocalEndPoint as IPEndPoint;
                 _localEndPoint = probeLocal != null
                     ? new IPEndPoint(probeLocal.Address, boundPort)
-                    : new IPEndPoint(IPAddress.Loopback, boundPort);
+                    : new IPEndPoint(loopback, boundPort);
             }
             catch
             {
                 // Fallback: use loopback IP (works for localhost dev/test).
-                _localEndPoint = new IPEndPoint(IPAddress.Loopback, boundPort);
+                _localEndPoint = new IPEndPoint(loopback, boundPort);
             }
         }
 
         /// <inheritdoc/>
         public override void Disconnect()
         {
-            // Dispose() internally calls Close(); calling both is redundant
-            // and may throw on some runtimes (L-SDK5 fix).
+            // Dispose() calls Close() internally; calling both is redundant and may throw.
             _socket?.Dispose();
             _socket = null;
         }
@@ -161,7 +179,12 @@ namespace RTMPE.Transport
 
             try
             {
-                EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
+                // The EndPoint type passed to ReceiveFrom must match the
+                // socket's address family.  Using IPAddress.Any (IPv4) on an IPv6
+                // socket throws ArgumentException and crashes the receive loop.
+                EndPoint ep = _socketFamily == AddressFamily.InterNetworkV6
+                    ? new IPEndPoint(IPAddress.IPv6Any, 0)
+                    : new IPEndPoint(IPAddress.Any,     0);
                 return _socket.ReceiveFrom(buffer, ref ep);
             }
             catch (SocketException ex)

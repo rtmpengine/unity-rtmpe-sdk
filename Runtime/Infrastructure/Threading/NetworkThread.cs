@@ -8,7 +8,7 @@
 //    when the pool is busy with other work.
 //  • Thread.Sleep(1) — yields the OS scheduler each iteration (~1 kHz poll rate).
 //    At a 30 Hz server tick rate (33 ms budget) this is more than sufficient. Replace
-//    with Thread.SpinWait in Week 10 if sub-millisecond latency is required.
+//    with Thread.SpinWait if sub-millisecond latency is required.
 //  • Received bytes are immediately copied to an exclusive byte[] before raising
 //    OnPacketReceived, so the shared _receiveBuffer is free for the next read.
 //  • Outbound data is also copied in Send() so the caller can reuse its buffer.
@@ -31,7 +31,7 @@ namespace RTMPE.Threading
     /// </summary>
     public sealed class NetworkThread : IDisposable
     {
-        // ── Windows timer resolution (M-12 fix) ───────────────────────────────
+        // ── Windows timer resolution ───────────────────────────────
         // On Windows, Thread.Sleep(1) uses the system timer interrupt (~15.6 ms
         // default) giving ~64 Hz poll rate instead of the intended ~1 kHz.
         // timeBeginPeriod(1) requests 1 ms resolution for the process lifetime.
@@ -50,6 +50,11 @@ namespace RTMPE.Threading
         // ── Thread control ─────────────────────────────────────────────────────
         private Thread        _thread;
         private volatile bool _running;
+        // Atomic guard for Start() — prevents two concurrent callers from
+        // both passing the `if (_running) return` check and spawning duplicate threads.
+        // 0 = stopped, 1 = running.  Interlocked.CompareExchange returns the old value;
+        // if it was already 1 the caller lost the race and returns immediately.
+        private int _startFlag;  // 0 = stopped, 1 = started
 
         // ── Outbound queue ─────────────────────────────────────────────────────
         private readonly ThreadSafeQueue<byte[]> _sendQueue = new ThreadSafeQueue<byte[]>();
@@ -90,13 +95,20 @@ namespace RTMPE.Threading
 
         /// <summary>
         /// Start the dedicated I/O thread. No-op if already running.
+        /// Thread-safe: concurrent calls are correctly serialised by an atomic guard.
         /// </summary>
         public void Start()
         {
-            if (_running) return;
+            // Use Interlocked.CompareExchange as a lock-free atomic guard.
+            // The volatile `if (_running) return` check-then-set was not atomic:
+            // two threads could both read false and both spawn a thread on the same
+            // socket.  CAS atomically sets _startFlag from 0→1; only the thread that
+            // observes the old value as 0 proceeds.
+            if (System.Threading.Interlocked.CompareExchange(ref _startFlag, 1, 0) != 0)
+                return; // already started by this or another caller
 
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-            // M-12 fix: raise Windows timer resolution to 1 ms so Thread.Sleep(1)
+            // Raise Windows timer resolution to 1 ms so Thread.Sleep(1)
             // actually sleeps ~1 ms instead of the default ~15.6 ms.
             if (!_timerResSet) { timeBeginPeriod(1); _timerResSet = true; }
 #endif
@@ -120,12 +132,14 @@ namespace RTMPE.Threading
             if (!_running) return;
 
             _running = false;
+            // Reset the atomic flag so Start() can be called again after Stop().
+            System.Threading.Interlocked.Exchange(ref _startFlag, 0);
 
             if (_thread != null && _thread.IsAlive)
             {
                 if (!_thread.Join(2_000))
                 {
-                    // L-SDK3 fix: Thread.Interrupt() only works when the thread
+                    // Thread.Interrupt() only works when the thread
                     // is in a managed blocking state (WaitSleepJoin). When blocked
                     // in a native ReceiveFrom, it has no effect. Closing the socket
                     // forces ReceiveFrom to throw a SocketException, which the
@@ -162,7 +176,7 @@ namespace RTMPE.Threading
         /// was freshly allocated (e.g. the return value of
         /// <see cref="RTMPE.Protocol.PacketBuilder.Build"/>) and will not be
         /// reused.  Eliminates the redundant copy that <see cref="Send"/> makes,
-        /// halving per-packet GC pressure on the hot data path (M-13 fix).
+        /// halving per-packet GC pressure on the hot data path.
         /// </summary>
         public void SendOwned(byte[] ownedData)
         {
@@ -176,7 +190,7 @@ namespace RTMPE.Threading
             Stop();
             _transport.Dispose();
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-            // M-12 fix: restore the OS default timer resolution.
+            // Restore the OS default timer resolution.
             if (_timerResSet) { timeEndPeriod(1); _timerResSet = false; }
 #endif
         }
@@ -208,6 +222,8 @@ namespace RTMPE.Threading
                 // Without this reset, _running stays true and the next Start()
                 // is a no-op — permanently locking out reconnection.
                 _running = false;
+                // Also reset the atomic flag so Start() allows re-entry.
+                System.Threading.Interlocked.Exchange(ref _startFlag, 0);
                 OnError?.Invoke(ex);
             }
             finally
@@ -236,18 +252,28 @@ namespace RTMPE.Threading
 
         private void TryReceive()
         {
+            // Drain all available datagrams each iteration instead of
+            // consuming only one.  At 30 Hz with 16 players up to 16 packets can
+            // arrive within a single 33 ms window.  Reading only one per 1 ms cycle
+            // added up to 15 ms of queuing latency for late-arriving packets.
+            //
+            // The loop is capped at MaxSendPerIteration (100) to avoid consuming
+            // every CPU cycle on receive when under a burst — leaving time for sends.
             try
             {
-                if (!_transport.Poll(0)) return;
+                for (int i = 0; i < MaxSendPerIteration; i++)
+                {
+                    if (!_transport.Poll(0)) break; // no more data
 
-                int n = _transport.Receive(_receiveBuffer);
-                if (n <= 0) return;
+                    int n = _transport.Receive(_receiveBuffer);
+                    if (n <= 0) break;
 
-                // Copy to an exclusive array before raising the event — the shared
-                // _receiveBuffer is immediately recycled for the next read.
-                var packet = new byte[n];
-                Buffer.BlockCopy(_receiveBuffer, 0, packet, 0, n);
-                OnPacketReceived?.Invoke(packet);
+                    // Copy to an exclusive array before raising the event — the shared
+                    // _receiveBuffer is immediately recycled for the next read.
+                    var packet = new byte[n];
+                    Buffer.BlockCopy(_receiveBuffer, 0, packet, 0, n);
+                    OnPacketReceived?.Invoke(packet);
+                }
             }
             catch (Exception ex)
             {

@@ -71,12 +71,12 @@ namespace RTMPE.Core
         [Tooltip("Log verbose NetworkManager state transitions to the Unity Console.")]
         public bool enableDebugLogs;
 
-        // ── Crypto (Week 9+) ─────────────────────────────────────────────────────
+        // ── Crypto ─────────────────────────────────────────────────────────────
 
         [Header("Crypto")]
         [Tooltip(
             "64-character lowercase hex string encoding the 32-byte pre-shared key used to " +
-            "encrypt the API key in HandshakeInit packets (C1 / M-12 fix).\n\n" +
+            "encrypt the API key in HandshakeInit packets.\n\n" +
             "Copy this value from the RTMPE developer dashboard. " +
             "It must match GATEWAY_API_KEY_ENCRYPTION_KEY_HEX on the server.\n\n" +
             "Leave blank to disable API-key encryption (insecure — dev/local only).")]

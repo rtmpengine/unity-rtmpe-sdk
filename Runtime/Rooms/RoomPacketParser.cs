@@ -9,6 +9,7 @@
 // ── RoomCreate Response (0x20) Server → Client ─────────────────────────────
 //   [ok:1]
 //   if ok=1: [room_id_len:2 LE][room_id:N][room_code_len:2 LE][room_code:N][max_players:1]
+//            [local_player_id_len:2 LE][local_player_id:N]   ← appended (v3.1+)
 //   if ok=0: [error_len:2 LE][error:N]
 //
 // ── RoomJoin Response (0x21, msg_kind=0x00) Server → Client ────────────────
@@ -18,6 +19,7 @@
 //            for each player:
 //              [player_id_len:2][player_id:N][display_name_len:2][display_name:N]
 //              [is_host:1][is_ready:1]
+//            [local_player_id_len:2][local_player_id:N]       ← appended (v3.1+)
 //   if ok=0: [error_len:2][error:N]
 //
 // ── PlayerJoined Notification (0x21, msg_kind=0x01) Server → Client ────────
@@ -72,11 +74,32 @@ namespace RTMPE.Rooms
             out int       maxPlayers,
             out string    error)
         {
-            ok         = false;
-            roomId     = null;
-            roomCode   = null;
-            maxPlayers = 0;
-            error      = null;
+            return ParseCreateRoomResponse(
+                payload, out ok, out roomId, out roomCode,
+                out maxPlayers, out _, out error);
+        }
+
+        /// <summary>
+        /// Parse a <c>RoomCreate</c> (0x20) response payload, also extracting the
+        /// local player's room UUID appended by the server (v3.1+ protocol).
+        /// <paramref name="localPlayerId"/> is empty string when the server is pre-v3.1
+        /// and did not include the field.
+        /// </summary>
+        internal static bool ParseCreateRoomResponse(
+            byte[] payload,
+            out bool      ok,
+            out string    roomId,
+            out string    roomCode,
+            out int       maxPlayers,
+            out string    localPlayerId,
+            out string    error)
+        {
+            ok            = false;
+            roomId        = null;
+            roomCode      = null;
+            maxPlayers    = 0;
+            localPlayerId = string.Empty;
+            error         = null;
 
             if (payload == null || payload.Length < 1) return false;
 
@@ -88,8 +111,14 @@ namespace RTMPE.Rooms
                 // [room_id_len:2][room_id:N][room_code_len:2][room_code:N][max_players:1]
                 if (!TryReadString(payload, ref offset, out roomId))   return false;
                 if (!TryReadString(payload, ref offset, out roomCode)) return false;
-                if (offset >= payload.Length)                           return false;
+                if (offset >= payload.Length)                          return false;
                 maxPlayers = payload[offset++];
+
+                // [local_player_id_len:2][local_player_id:N]  — v3.1+ optional field
+                // Gracefully omit when server doesn't send it (old gateway).
+                if (offset < payload.Length)
+                    TryReadString(payload, ref offset, out localPlayerId);
+
                 return true;
             }
             else
@@ -123,9 +152,26 @@ namespace RTMPE.Rooms
             out RoomInfo   room,
             out string     error)
         {
-            ok    = false;
-            room  = null;
-            error = null;
+            return ParseJoinRoomResponse(
+                payload, out ok, out room, out _, out error);
+        }
+
+        /// <summary>
+        /// Parse a <c>RoomJoin</c> (0x21) <b>response</b> payload, also extracting the
+        /// local player's room UUID appended by the server (v3.1+ protocol).
+        /// <paramref name="localPlayerId"/> is empty string when the server is pre-v3.1.
+        /// </summary>
+        internal static bool ParseJoinRoomResponse(
+            byte[] payload,
+            out bool       ok,
+            out RoomInfo   room,
+            out string     localPlayerId,
+            out string     error)
+        {
+            ok            = false;
+            room          = null;
+            localPlayerId = string.Empty;
+            error         = null;
 
             if (payload == null || payload.Length < 2) return false;
 
@@ -155,6 +201,11 @@ namespace RTMPE.Rooms
                 }
 
                 room = new RoomInfo(roomId, roomCode, name, "waiting", playerCount, maxPlayers, isPublic, players);
+
+                // [local_player_id_len:2][local_player_id:N]  — v3.1+ optional field
+                if (offset < payload.Length)
+                    TryReadString(payload, ref offset, out localPlayerId);
+
                 return true;
             }
             else
@@ -235,7 +286,7 @@ namespace RTMPE.Rooms
             int offset = 0;
             int roomCount = ReadU16LE(payload, ref offset);
 
-            // H-1 fix: cap room count to prevent oversized allocation from
+            // Cap room count to prevent oversized allocation from
             // malicious/buggy server claiming 65535 rooms. A valid RTMPE server
             // supports at most 256 rooms per project; this also matches the
             // upstream 1 MiB payload cap (~50 bytes per room summary minimum).
@@ -273,7 +324,7 @@ namespace RTMPE.Rooms
 
             int len = ReadU16LE(buf, ref offset);
 
-            // L-9 fix: cap individual string length for defense-in-depth.
+            // Cap individual string length for defense-in-depth.
             const int MaxStringBytes = 4096;
             if (len > MaxStringBytes) return false;
 

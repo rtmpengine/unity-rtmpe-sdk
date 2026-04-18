@@ -1,12 +1,10 @@
 // RTMPE SDK — Runtime/Rpc/RpcDefinitions.cs
 //
-// Constants for the RPC subsystem (Week 17).
+// Wire-protocol constants for the RPC subsystem.
 //
 // Wire-protocol constants for RPC messages are defined here so both
 // RpcPacketBuilder and RpcPacketParser share a single source of truth.
 // Method IDs are permanent — never reuse a retired ID.
-//
-// See Plan/week-17-rpc.md for the full architecture specification.
 
 namespace RTMPE.Rpc
 {

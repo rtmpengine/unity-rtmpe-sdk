@@ -1,12 +1,12 @@
 {
     "name": "com.rtmpe.sdk",
-    "version": "0.2.0-preview",
+    "version": "1.0.0",
     "displayName": "RTMPE SDK",
     "description": "Real-Time Multiplayer Engine — Unity client SDK for converting single-player games to multiplayer in under 15 minutes.",
     "unity": "6000.0",
-    "documentationUrl": "https://github.com/rtmpe/rtmpe/tree/main/docs",
-    "changelogUrl": "https://github.com/rtmpe/rtmpe/blob/main/clients/unity-sdk/Packages/com.rtmpe.sdk/CHANGELOG.md",
-    "licensesUrl": "https://github.com/rtmpe/rtmpe/blob/main/LICENSE",
+    "documentationUrl": "https://github.com/Faisalzz1/RTMPE/tree/main/docs",
+    "changelogUrl": "https://github.com/Faisalzz1/RTMPE/blob/main/clients/unity-sdk/Packages/com.rtmpe.sdk/CHANGELOG.md",
+    "licensesUrl": "https://github.com/Faisalzz1/RTMPE/blob/main/LICENSE",
     "keywords": [
         "multiplayer",
         "networking",
@@ -17,7 +17,7 @@
     ],
     "author": {
         "name": "RTMPE",
-        "url": "https://github.com/rtmpe"
+        "url": "https://github.com/Faisalzz1"
     },
     "dependencies": {},
     "samples": [

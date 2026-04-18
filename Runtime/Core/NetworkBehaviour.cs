@@ -2,7 +2,7 @@
 //
 // Base class for all networked GameObjects in RTMPE.
 //
-// Design decisions (Week 15):
+// Design decisions:
 //   • _ownerPlayerId is a string (UUID) to match PlayerInfo.PlayerId and the
 //     room service player identifiers.  The gateway session ID (u64) is a
 //     DIFFERENT concept stored in NetworkManager.LocalPlayerId.
@@ -10,21 +10,26 @@
 //     uninitialized objects never falsely claim ownership (unlike a ulong==0
 //     comparison which would return true for every uninitialized object).
 //   • Initialize / SetSpawned / SetOwner are internal so only the RTMPE SDK
-//     itself (SpawnManager, Week 16) can mutate network object state.
+//     itself (SpawnManager) can mutate network object state.
 //     RTMPE.SDK.Tests can also call them via InternalsVisibleTo (AssemblyInfo.cs).
 //   • DestroyWithOwner is declared here; enforcement is implemented by
-//     SpawnManager in Week 16 when it handles PlayerLeft events.
+//     SpawnManager when it handles PlayerLeft events.
 //   • IsOwner accesses NetworkManager.Instance — safe for main-thread MonoBehaviour
 //     code (OnNetworkSpawn, OnOwnershipChanged, etc. all run on main thread).
 
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
 using UnityEngine;
+using RTMPE.Sync;
 
 namespace RTMPE.Core
 {
     /// <summary>
     /// Base class for all RTMPE-networked components.
     /// Attach to a <c>GameObject</c> that will be spawned across the network via
-    /// <c>SpawnManager</c> (Week 16).
+    /// <c>SpawnManager</c>.
     /// </summary>
     public abstract class NetworkBehaviour : MonoBehaviour
     {
@@ -33,6 +38,12 @@ namespace RTMPE.Core
         private ulong  _networkObjectId;
         private string _ownerPlayerId = string.Empty;
         private bool   _isSpawned;
+
+        // List of all NetworkVariables registered during OnNetworkSpawn.
+        // Populated by NetworkVariableBase constructors via TrackVariable().
+        // Flushed at 30 Hz by NetworkManager for owner clients.
+        private readonly List<NetworkVariableBase> _trackedVariables =
+            new List<NetworkVariableBase>();
 
         // ── Properties ─────────────────────────────────────────────────────────
 
@@ -78,7 +89,7 @@ namespace RTMPE.Core
         /// <summary>
         /// When <see langword="true"/>, this object is automatically despawned
         /// when its owner leaves the room.
-        /// Enforcement is performed by <c>SpawnManager</c> (Week 16).
+        /// Enforcement is performed by <c>SpawnManager</c>.
         /// </summary>
         public bool DestroyWithOwner { get; set; } = true;
 
@@ -106,7 +117,7 @@ namespace RTMPE.Core
         /// <param name="newOwner">Player UUID of the new owner.</param>
         protected virtual void OnOwnershipChanged(string previousOwner, string newOwner) { }
 
-        // ── Internal SDK API (called by SpawnManager in Week 16) ──────────────
+        // ── Internal SDK API (called by SpawnManager) ──────────────────────────
 
         /// <summary>
         /// Initialise the network identity of this object.
@@ -116,12 +127,13 @@ namespace RTMPE.Core
         /// <param name="ownerId">Room player UUID of the object's owner.</param>
         internal void Initialize(ulong objectId, string ownerId)
         {
-            // M-3 guard: warn on double-initialisation (e.g. duplicate Spawn packet via KCP retransmit).
+            // Guard against double-initialisation — warn if the object is already
+            // spawned, which can occur via duplicate Spawn packets on reliable transport.
             if (_networkObjectId != 0)
                 Debug.LogWarning(
                     $"[RTMPE] NetworkBehaviour.Initialize called twice on object " +
                     $"{_networkObjectId} → overwriting with {objectId}. " +
-                    "Possible duplicate Spawn packet or SpawnManager bug.");
+                    "Possible duplicate Spawn packet received via reliable transport retransmit.");
 
             _networkObjectId = objectId;
             _ownerPlayerId   = ownerId ?? string.Empty;
@@ -153,13 +165,117 @@ namespace RTMPE.Core
         /// <param name="newOwner">Room player UUID of the new owner.</param>
         internal void SetOwner(string newOwner)
         {
-            // H-2 fix: suppress no-change callbacks (server retransmit safety).
+            // Suppress no-change callbacks to avoid redundant notifications on
+            // retransmitted ownership updates.
             var normalized = newOwner ?? string.Empty;
             if (_ownerPlayerId == normalized) return;
 
             var previous   = _ownerPlayerId;
             _ownerPlayerId = normalized;
             OnOwnershipChanged(previous, _ownerPlayerId);
+        }
+
+        // ── NetworkVariable registration and flush ─────────────────────────────
+
+        /// <summary>
+        /// Register a <see cref="NetworkVariableBase"/> with this behaviour so it
+        /// participates in the 30 Hz dirty-flush loop.
+        /// Called automatically by the <c>NetworkVariableBase</c> constructor —
+        /// user code should never call this directly.
+        /// </summary>
+        internal void TrackVariable(NetworkVariableBase variable)
+        {
+            if (variable == null) throw new ArgumentNullException(nameof(variable));
+            _trackedVariables.Add(variable);
+        }
+
+        /// <summary>
+        /// Serialize all dirty tracked variables into a single <c>VariableUpdate</c>
+        /// payload and call <paramref name="sendPayload"/> with it.
+        /// No-op when not spawned, not owner, or all variables are clean.
+        /// Called by <c>NetworkManager.FlushDirtyNetworkVariables</c> at 30 Hz.
+        /// </summary>
+        /// <param name="sendPayload">
+        /// Delegate that transmits the built payload bytes, e.g.
+        /// <c>NetworkManager.SendVariableUpdate</c>.
+        /// </param>
+        internal void FlushDirtyVariables(Action<byte[]> sendPayload)
+        {
+            if (!IsOwner || !IsSpawned || _trackedVariables.Count == 0) return;
+
+            // Fast path: skip allocation when nothing is dirty.
+            bool hasDirty = false;
+            foreach (var v in _trackedVariables)
+            {
+                if (v.IsDirty) { hasDirty = true; break; }
+            }
+            if (!hasDirty) return;
+
+            // Use a growable MemoryStream so that long NetworkVariableString values
+            // (or many simultaneously dirty variables) never throw the
+            // NotSupportedException that a fixed-capacity backing buffer raises.
+            // InitialCapacity covers the common case without reallocation:
+            // object_id(8) + count(1) + ~15 variables at ~16 bytes each ≈ 249 bytes.
+            const int InitialCapacity = 256;
+            using var ms     = new MemoryStream(InitialCapacity);
+            using var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+
+            // [object_id:8 LE]
+            writer.Write(NetworkObjectId);
+
+            // Reserve space for var_count; written at the end with the real count.
+            long countOffset = ms.Position;
+            writer.Write((byte)0);
+
+            byte count = 0;
+            foreach (var v in _trackedVariables)
+            {
+                if (!v.IsDirty) continue;
+                v.SerializeWithId(writer);
+                v.MarkClean();
+                count++;
+            }
+
+            // Flush the BinaryWriter so its internal buffer is fully committed to ms
+            // BEFORE seeking back. BinaryWriter does not buffer in .NET Standard but
+            // the Flush() guards against any future implementation change.
+            writer.Flush();
+
+            // Write back the actual variable count.
+            // ms.ToArray() uses the stream's internal _length (= high-water mark),
+            // which was set when we wrote the variable data, so seeking back here
+            // to overwrite the placeholder does not truncate the payload.
+            ms.Position = countOffset;
+            writer.Write(count);
+            writer.Flush();
+
+            // ms.ToArray() returns all bytes from 0 to _length (the high-water mark),
+            // regardless of the current Position — exactly the bytes we wrote above.
+            sendPayload(ms.ToArray());
+        }
+
+        /// <summary>
+        /// Apply a single variable update received from the server.
+        /// Called by <c>NetworkManager.HandleVariableUpdatePacket</c> for each
+        /// [var_id:2 LE][value_len:2 LE][value_bytes:N] entry in the payload.
+        ///
+        /// <paramref name="valueLen"/> is used by the caller to advance the
+        /// stream past the value bytes regardless of what this method reads,
+        /// guaranteeing subsequent variables in the same packet are parsed from
+        /// correct offsets even on unknown-ID or schema-mismatch scenarios.
+        /// </summary>
+        internal void ApplyVariableUpdate(ushort variableId, BinaryReader reader, ushort valueLen = 0)
+        {
+            foreach (var v in _trackedVariables)
+            {
+                if (v.VariableId != variableId) continue;
+                v.Deserialize(reader);
+                return;
+            }
+            // Unknown ID: warn but do NOT read — the caller will skip valueLen bytes.
+            Debug.LogWarning(
+                $"[RTMPE] NetworkBehaviour: unknown variableId {variableId} in VariableUpdate — " +
+                "skipping value bytes. Verify variable IDs are consistent across all clients.");
         }
     }
 }

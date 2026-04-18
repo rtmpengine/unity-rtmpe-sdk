@@ -58,11 +58,11 @@ namespace RTMPE.Editor
                     nm.IsInRoom);
 
                 EditorGUILayout.LabelField(
-                    new GUIContent("Local Player ID", "Assigned after SessionAck (Week 9+)."),
+                    new GUIContent("Local Player ID", "Assigned after the session handshake completes."),
                     nm.LocalPlayerId == 0 ? "—" : nm.LocalPlayerId.ToString());
 
                 EditorGUILayout.LabelField(
-                    new GUIContent("Room ID", "Assigned after RoomJoin (Week 9+)."),
+                    new GUIContent("Room ID", "Assigned after the player joins a room."),
                     nm.CurrentRoomId == 0 ? "—" : nm.CurrentRoomId.ToString());
             }
 

@@ -8,7 +8,7 @@ Real-Time Multiplayer Engine — Unity 6 / .NET Standard 2.1 client SDK.
 | ---------------- | -------------- |
 | Unity            | 6000.0 LTS+    |
 | .NET Standard    | 2.1            |
-| RTMPE Gateway    | ≥ 0.2.0        |
+| RTMPE Gateway    | ≥ 3.0.0        |
 | Backend protocol | v3 (MAGIC 0x5254) |
 
 ## Installation (UPM)
@@ -17,13 +17,13 @@ Real-Time Multiplayer Engine — Unity 6 / .NET Standard 2.1 client SDK.
 2. Click **+** → **Add package from git URL…**
 3. Paste:
    ```
-   https://github.com/rtmpe/rtmpe.git?path=clients/unity-sdk/Packages/com.rtmpe.sdk
+   https://github.com/Faisalzz1/RTMPE.git?path=clients/unity-sdk/Packages/com.rtmpe.sdk
    ```
 
 Or add manually to your project's `Packages/manifest.json`:
 
 ```json
-"com.rtmpe.sdk": "https://github.com/rtmpe/rtmpe.git?path=clients/unity-sdk/Packages/com.rtmpe.sdk"
+"com.rtmpe.sdk": "https://github.com/Faisalzz1/RTMPE.git?path=clients/unity-sdk/Packages/com.rtmpe.sdk"
 ```
 
 ## Quick Start
@@ -51,4 +51,4 @@ Full documentation lives in `Documentation~/index.md` and at `/docs` in the repo
 
 ## License
 
-MIT — see [LICENSE](https://github.com/rtmpe/rtmpe/blob/main/LICENSE).
+MIT — see [LICENSE](https://github.com/Faisalzz1/RTMPE/blob/main/LICENSE).

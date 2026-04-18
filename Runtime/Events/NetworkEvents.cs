@@ -44,7 +44,7 @@ namespace RTMPE.Events
             public Core.DisconnectReason Reason;
         }
 
-        // ── Room (Week 14) ─────────────────────────────────────────────────────
+        // ── Room ─────────────────────────────────────────────────────
 
         /// <summary>Raised when the local player successfully joins a room.</summary>
         public struct JoinedRoomArgs

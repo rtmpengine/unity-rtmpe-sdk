@@ -11,7 +11,7 @@
 //   SharedSecret(myPrivate, peerPublic) → sharedSecret[32]
 //
 // ============================================================================
-// SECURITY / THREAT MODEL (M-5)
+// SECURITY / THREAT MODEL
 // ============================================================================
 // This is a PURE-MANAGED C# cryptographic implementation.
 //
@@ -19,7 +19,7 @@
 //   • Passive key agreement eavesdroppers: the Montgomery ladder DH prevents
 //     a network observer from deriving the shared secret.
 //   • Key substitution attacks: Ed25519 signature on the server ephemeral key
-//     (H4 fix) prevents MITM key replacement before ECDH proceeds.
+//     prevents man-in-the-middle key replacement before ECDH proceeds.
 //
 // WHAT IT DOES NOT PROTECT AGAINST (out of scope):
 //   • Side-channel timing attacks: System.Numerics.BigInteger uses
@@ -112,11 +112,9 @@ namespace RTMPE.Crypto.Internal
         {
             var k = ClampScalar(k_bytes);
 
-            // M-14 fix: RFC 7748 §5 requires implementations to "mask off the most
-            // significant bit in the final byte" of the u-coordinate before decoding.
-            // Using `FromLE(u_bytes) % P` is not equivalent — for values in the range
-            // [P, 2^255-1] the two operations differ by up to 18.  We copy u_bytes
-            // and clear bit 255 (byte[31] & 0x7F) before converting to BigInteger.
+            // RFC 7748 §5 requires implementations to mask the most-significant
+            // bit in the final byte of the u-coordinate before decoding.
+            // We copy u_bytes and clear bit 255 (byte[31] & 0x7F) before converting.
             var uBuf = new byte[32];
             Buffer.BlockCopy(u_bytes, 0, uBuf, 0, 32);
             uBuf[31] &= 0x7F; // mask high bit per RFC 7748 §5
@@ -132,31 +130,29 @@ namespace RTMPE.Crypto.Internal
             {
                 int k_t = (k[t >> 3] >> (t & 7)) & 1;
                 swap ^= k_t;
-                if (swap == 1)
-                {
-                    // M-15 mitigation: replace the C#-level branch with an
-                    // arithmetic conditional selection to eliminate the branch-
-                    // prediction timing signal.  BigInteger field operations are
-                    // still variable-time internally, but this at least prevents
-                    // a CPU branch predictor from leaking the scalar bit via the
-                    // timing of the swap itself.
-                    //
-                    // Formula: new_a = a*(1-bit) + b*bit
-                    //          new_b = b*(1-bit) + a*bit
-                    // This always evaluates both operands, masking the branch.
-                    //
-                    // Residual risk: BigInteger.Multiply is not constant-time.
-                    // Mitigating factor: the private key is EPHEMERAL (generated
-                    // fresh for each handshake), so an attacker cannot accumulate
-                    // timing observations across multiple uses of the same key.
-                    BigInteger notBit = BigInteger.One - k_t; // 1 if k_t==0, 0 if k_t==1
-                    BigInteger newX2 = x2 * notBit + x3 * k_t;
-                    BigInteger newX3 = x3 * notBit + x2 * k_t;
-                    BigInteger newZ2 = z2 * notBit + z3 * k_t;
-                    BigInteger newZ3 = z3 * notBit + z2 * k_t;
-                    x2 = newX2; x3 = newX3;
-                    z2 = newZ2; z3 = newZ3;
-                }
+
+                // Arithmetic conditional swap (cswap) — RFC 7748 §5.
+                //
+                // The selector is `swap` (not k_t): RFC 7748 uses the XOR-accumulated
+                // swap flag to decide whether to exchange the two projective points
+                // before each ladder step.
+                //
+                // Correct formula: new_a = a*(1−swap) + b*swap
+                //                  new_b = b*(1−swap) + a*swap
+                // Both branches are always evaluated (no C# control-flow branch),
+                // which prevents branch-predictor timing leakage on the swap decision.
+                //
+                // Residual note: BigInteger.Multiply is still variable-time internally.
+                // The private key is EPHEMERAL (fresh per handshake), so an attacker
+                // cannot accumulate timing samples across reuses of the same key.
+                BigInteger notSwap = BigInteger.One - swap;  // 1 if no-swap, 0 if swap
+                BigInteger newX2 = x2 * notSwap + x3 * swap;
+                BigInteger newX3 = x3 * notSwap + x2 * swap;
+                BigInteger newZ2 = z2 * notSwap + z3 * swap;
+                BigInteger newZ3 = z3 * notSwap + z2 * swap;
+                x2 = newX2; x3 = newX3;
+                z2 = newZ2; z3 = newZ3;
+
                 swap = k_t;
 
                 var A  = FAdd(x2, z2);
@@ -177,7 +173,7 @@ namespace RTMPE.Crypto.Internal
                 z2 = FMul(E, FAdd(AA, FMul(A24, E)));
             }
 
-            // M-15: arithmetic final swap (same constant-time pattern as the loop body).
+            // Arithmetic final swap (same constant-time pattern as the loop body).
             BigInteger finalNotSwap = BigInteger.One - swap;
             BigInteger finalX2 = x2 * finalNotSwap + x3 * swap;
             BigInteger finalZ2 = z2 * finalNotSwap + z3 * swap;

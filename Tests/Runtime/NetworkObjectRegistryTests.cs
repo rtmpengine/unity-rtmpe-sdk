@@ -158,7 +158,7 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        [Description("Clear calls OnNetworkDespawn on each spawned object (M-1 fix).")]
+        [Description("Clear calls OnNetworkDespawn on each spawned object.")]
         public void Clear_CallsDespawnOnSpawnedObjects()
         {
             var nb = MakeObject(1UL);
@@ -190,10 +190,10 @@ namespace RTMPE.Tests
             Assert.AreEqual(0, _registry.GetAll().Count);
         }
 
-        // ── Stale (destroyed) object auto-eviction (M-2 fix) ──────────────────
+        // ── Stale (destroyed) object auto-eviction ──────────────────────────────
 
         [Test]
-        [Description("Get auto-evicts a destroyed GameObject and returns null (M-2 fix).")]
+        [Description("Get auto-evicts a destroyed GameObject and returns null.")]
         public void Get_DestroyedObject_ReturnsNullAndEvicts()
         {
             var nb = MakeObject(30UL);
@@ -210,10 +210,10 @@ namespace RTMPE.Tests
             Assert.IsNull(_registry.Get(30UL));
         }
 
-        // ── Register ID-collision despawn (H-3 fix) ───────────────────────────
+        // ── Register ID-collision despawn ────────────────────────────────────────
 
         [Test]
-        [Description("Register with a duplicate ID despawns the previous spawned object (H-3 fix).")]
+        [Description("Register with a duplicate ID despawns the previously registered object.")]
         public void Register_SameId_DespawnsPreviousSpawnedObject()
         {
             var nb1 = MakeObject(50UL);
@@ -241,10 +241,10 @@ namespace RTMPE.Tests
             Assert.IsTrue(nb.IsSpawned);
         }
 
-        // ── Clear exception isolation (H-4 fix) ───────────────────────────────
+        // ── Clear exception isolation ───────────────────────────────────────────
 
         [Test]
-        [Description("Clear continues despawning remaining objects when one callback throws (H-4 fix).")]
+        [Description("Clear continues despawning remaining objects when one callback throws.")]
         public void Clear_ExceptionInCallback_ContinuesRemainingDespawns()
         {
             var throwing = new GameObject("throwing");
@@ -270,10 +270,10 @@ namespace RTMPE.Tests
             Assert.AreEqual(0, _registry.GetAll().Count);
         }
 
-        // ── GetAll null filter (M-1 fix) ───────────────────────────────────────
+        // ── GetAll null filter ───────────────────────────────────────────────────
 
         [Test]
-        [Description("GetAll excludes destroyed GameObjects from the snapshot (M-1 fix).")]
+        [Description("GetAll excludes destroyed GameObjects from the snapshot.")]
         public void GetAll_ExcludesDestroyedObjects()
         {
             var nb1 = MakeObject(70UL);

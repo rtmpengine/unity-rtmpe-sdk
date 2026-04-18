@@ -28,6 +28,7 @@ using RTMPE.Crypto;
 using RTMPE.Protocol;
 using RTMPE.Rooms;
 using RTMPE.Rpc;
+using RTMPE.Sync;
 
 namespace RTMPE.Core
 {
@@ -129,23 +130,33 @@ namespace RTMPE.Core
         // Used by NetworkBehaviour.IsOwner for object ownership checks.
         private string _localPlayerStringId;
 
-        // Session crypto state (Week 9)
+        // Monotonic counter for RPC request correlation IDs.
+        // Incremented atomically by SendRpc(); max-value wrap is safe (uint loops).
+        private int _rpcRequestCounter;
+
+        // Session crypto state
         private HandshakeHandler _handshakeHandler;
         private SessionKeys      _sessionKeys;
         private PacketBuilder    _packetBuilder;
         private HeartbeatManager _heartbeatManager;
 
-        // Room management (Week 14)
+        // Room management
         private RoomManager _roomManager;
 
-        // Spawn management (Week 16)
+        // Spawn management
         private SpawnManager _spawnManager;
 
-        // M-19 fix: cache the heartbeat send callback to avoid per-frame lambda
-        // allocation. The lambda `packet => _networkThread?.Send(packet)` creates
-        // a new closure object every Update() call (60+ Hz). Caching it once in
-        // Start() eliminates the allocation entirely.
+        // Cached heartbeat send callback — avoids per-frame closure allocation
+        // at the call site in Update().
         private System.Action<byte[]> _sendPacketCallback;
+
+        // Cached delegate for SendVariableUpdate — method-group-to-delegate
+        // conversion allocates on every call unless stored in a field.
+        private System.Action<byte[]> _sendVariableUpdateDelegate;
+
+        // 30 Hz accumulator for the NetworkVariable flush loop.
+        private float _variableFlushAccum;
+        private const float VariableFlushInterval = 1f / 30f;
 
         // ── Properties ─────────────────────────────────────────────────────────
 
@@ -218,6 +229,12 @@ namespace RTMPE.Core
         /// <summary>Fired on each successful heartbeat with the measured RTT in ms.</summary>
         public event Action<float> OnRttUpdated;
 
+        /// <summary>
+        /// Fired when the server acknowledges a reliable Data packet.
+        /// Reserved for future reliable-delivery retransmit suppression.
+        /// </summary>
+        public event Action OnDataAcknowledged;
+
         // ── Unity lifecycle ────────────────────────────────────────────────────
 
         private void Awake()
@@ -247,16 +264,42 @@ namespace RTMPE.Core
             // of the one-time GameObject allocation cost.
             _dispatcher = MainThreadDispatcher.Instance;
 
-            // M-19 fix: cache the heartbeat send callback once so Update() does
+            // Cache the heartbeat send callback once so Update() does
             // not allocate a new closure object every frame.
             _sendPacketCallback = packet => _networkThread?.Send(packet);
+
+            // Cache the SendVariableUpdate delegate once to eliminate
+            // per-tick allocation on the 30 Hz flush path.
+            _sendVariableUpdateDelegate = SendVariableUpdate;
         }
 
         private void Update()
         {
-            // Drive the heartbeat tick each frame. Reuse the cached callback to
-            // avoid per-frame heap allocation (M-19 fix).
+            // Drive the heartbeat tick each frame using the pre-cached callback.
             _heartbeatManager?.Tick(_sendPacketCallback);
+
+            // Flush dirty NetworkVariables at 30 Hz for all owned objects.
+            _variableFlushAccum += Time.deltaTime;
+            if (_variableFlushAccum >= VariableFlushInterval)
+            {
+                _variableFlushAccum -= VariableFlushInterval;
+                FlushDirtyNetworkVariables();
+            }
+        }
+
+        /// <summary>
+        /// Flush dirty NetworkVariables for all objects owned by the local player.
+        /// Called at 30 Hz from Update().
+        /// </summary>
+        private void FlushDirtyNetworkVariables()
+        {
+            if (_spawnManager == null || !IsInRoom) return;
+            foreach (var nb in _spawnManager.Registry.GetAll())
+            {
+                if (nb == null || !nb.IsOwner || !nb.IsSpawned) continue;
+                // Use the pre-cached delegate to avoid per-call allocation.
+                nb.FlushDirtyVariables(_sendVariableUpdateDelegate);
+            }
         }
 
         private void OnDestroy()
@@ -292,34 +335,39 @@ namespace RTMPE.Core
 
             _packetBuilder = new PacketBuilder();
 
-            // Week 14: Room API manager. Receives the shared PacketBuilder for
+            // Room API manager. Receives the shared PacketBuilder for
             // sequence numbering and a delegate to send fully-built packets.
             _roomManager = new RoomManager(
                 _packetBuilder,
                 packet => _networkThread?.SendOwned(packet),
-                () => _state);
+                () => _state,
+                id => SetLocalRoomPlayerId(id));   // wire local player UUID
 
             // Wire room events to update NetworkManager state.
             _roomManager.OnRoomJoined += OnRoomManagerJoined;
             _roomManager.OnRoomLeft   += OnRoomManagerLeft;
             _roomManager.OnRoomCreated += OnRoomManagerCreated;
 
-            // Week 16: Spawn manager (owns registry + ownership manager).
+            // Spawn manager (owns registry + ownership manager).
             var registry  = new NetworkObjectRegistry();
             var ownership = new OwnershipManager(registry, this);
             _spawnManager = new SpawnManager(registry, ownership, this);
 
             // Wire player-left events so SpawnManager can handle DestroyWithOwner.
             _roomManager.OnPlayerLeft += playerId => _spawnManager?.OnPlayerLeftRoom(playerId);
+
+            // Subscribe the state-sync packet handler so incoming StateDelta
+            // broadcasts are routed to NetworkTransformInterpolators.
+            OnDataReceived += HandleStateSyncPacket;
         }
 
         private void Cleanup()
         {
             _heartbeatManager?.Stop();
             _heartbeatManager = null;
-            _handshakeHandler?.Dispose();  // C-1 fix: zero key material before GC can observe it
+            _handshakeHandler?.Dispose();  // Zero key material before GC can observe it
             _handshakeHandler = null;
-            _sessionKeys?.Dispose();       // C-1 fix: zero session keys before GC can observe it
+            _sessionKeys?.Dispose();       // Zero session keys before GC can observe it
             _sessionKeys      = null;
             // Unsubscribe before dispose to break delegate references.
             if (_networkThread != null)
@@ -358,19 +406,20 @@ namespace RTMPE.Core
             // Reset the packet builder so sequence numbers start fresh on reconnect.
             _packetBuilder = new PacketBuilder();
 
-            // CR-1 fix (Week 14): Recreate RoomManager with the new PacketBuilder so
-            // room operations share the same sequence counter as handshake/heartbeat.
-            // Without this, reconnections cause two independent counters on the wire
-            // — a protocol violation that may trigger gateway replay protection.
+            // Recreate RoomManager with the new PacketBuilder so room operations
+            // share the same sequence counter as handshake and heartbeat packets.
+            // Using an independent counter would be a protocol violation and may
+            // trigger gateway replay protection.
             _roomManager = new RoomManager(
                 _packetBuilder,
                 packet => _networkThread?.SendOwned(packet),
-                () => _state);
+                () => _state,
+                id => SetLocalRoomPlayerId(id));  // wire local player UUID
             _roomManager.OnRoomJoined  += OnRoomManagerJoined;
             _roomManager.OnRoomLeft    += OnRoomManagerLeft;
             _roomManager.OnRoomCreated += OnRoomManagerCreated;
 
-            // Week 16: Recreate SpawnManager with fresh registry/ownership on reconnect.
+            // Recreate SpawnManager with fresh registry/ownership on reconnect.
             var registry  = new NetworkObjectRegistry();
             var ownership = new OwnershipManager(registry, this);
             _spawnManager = new SpawnManager(registry, ownership, this);
@@ -510,17 +559,17 @@ namespace RTMPE.Core
 
             switch (packetType)
             {
-                // ── W6 ECDH 4-step handshake ────────────────────────────────
+                // ── ECDH 4-step handshake ────────────────────────────────
                 case PacketType.Challenge:    OnChallenge(data);    break;
                 case PacketType.SessionAck:   OnSessionAck(data);   break;
 
-                // ── Legacy W3 handshake (backward compatibility) ─────────────
+                // ── Legacy handshake (backward compatibility) ────────────────
                 case PacketType.HandshakeAck: OnHandshakeAck(data); break;
 
                 // ── Keep-alive ───────────────────────────────────────────────
                 case PacketType.HeartbeatAck: OnHeartbeatAck(data); break;
 
-                // ── Room / session (Week 14) ─────────────────────────────────
+                // ── Room / session ─────────────────────────────────
                 case PacketType.RoomCreate:
                 case PacketType.RoomJoin:
                 case PacketType.RoomLeave:
@@ -532,13 +581,22 @@ namespace RTMPE.Core
                 case PacketType.Data:
                 case PacketType.StateSync:        OnDataReceived?.Invoke(data); break;
 
-                // ── Networked object lifecycle (Week 16) ─────────────────────
+                // DataAck is a legitimate server acknowledgement; expose it as an event.
+                case PacketType.DataAck:
+                    OnDataAcknowledged?.Invoke();
+                    LogDebug("DataAck received.");
+                    break;
+
+                // ── Networked object lifecycle ─────────────────────
                 case PacketType.Spawn:            OnSpawnPacket(data);   break;
                 case PacketType.Despawn:          OnDespawnPacket(data); break;
 
-                // ── RPC system (Week 17) ─────────────────────────────────────
+                // ── RPC system ─────────────────────────────────────
                 case PacketType.Rpc:              OnRpcRequest(data);    break;
                 case PacketType.RpcResponse:      OnRpcResponse(data);   break;
+
+                // Receive inbound variable update packets.
+                case PacketType.VariableUpdate:   HandleVariableUpdatePacket(data); break;
 
                 default:
                     LogDebug($"No handler for packet type 0x{(byte)packetType:X2}.");
@@ -546,14 +604,14 @@ namespace RTMPE.Core
             }
         }
 
-        // ── W6 Handshake packet handlers ───────────────────────────────────────
+        // ── Handshake packet handlers ───────────────────────────────────────
 
         /// <summary>
         /// Handle an incoming <c>Challenge</c> (0x06) from the server.
         ///
         /// 1. Parse 128-byte payload: [ephemeral:32][static:32][sig:64].
-        /// 2. Verify Ed25519 signature (H4 fix) — reject on failure.
-        /// 3. Derive session keys via X25519 ECDH + HKDF-SHA256 (G-H1).
+        /// 2. Verify Ed25519 signature — reject on failure.
+        /// 3. Derive session keys via X25519 ECDH + HKDF-SHA256.
         /// 4. Send <c>HandshakeResponse</c> containing the client public key.
         /// </summary>
         private void OnChallenge(byte[] data)
@@ -584,7 +642,9 @@ namespace RTMPE.Core
                 return;
             }
 
-            // Derive directional session keys (G-H1 fix: two independent keys).
+            // Derive two directional session keys via HKDF-Expand with distinct
+            // context labels, so the client-to-server and server-to-client keys
+            // are cryptographically independent.
             _sessionKeys = _handshakeHandler.DeriveSessionKeys();
             if (_sessionKeys == null)
             {
@@ -593,8 +653,8 @@ namespace RTMPE.Core
             }
 
             // Send the client's X25519 ephemeral public key to the server.
-            // M-13 fix: use SendOwned — response is a freshly allocated array that
-            // we will not reuse, so the copy inside Send() is unnecessary here.
+            // Use SendOwned — response is a freshly allocated array that
+            // will not be reused, so the extra copy inside Send() is unnecessary.
             var response = _packetBuilder.BuildHandshakeResponse(_handshakeHandler.ClientPublicKey);
             _networkThread.SendOwned(response);
             LogDebug("Sent HandshakeResponse — awaiting SessionAck.");
@@ -641,7 +701,7 @@ namespace RTMPE.Core
             TransitionTo(NetworkState.Connected);
 
             // Start keep-alive heartbeat.
-            // H-1 fix: pass _packetBuilder so heartbeat packets share the same sequence
+            // Pass _packetBuilder so heartbeat packets share the same sequence
             // counter as all other outbound packets (prevents nonce reuse under AEAD).
             _heartbeatManager = new HeartbeatManager(_settings.heartbeatIntervalMs, _packetBuilder);
             _heartbeatManager.OnRttUpdated     += rtt => { LastRttMs = rtt; OnRttUpdated?.Invoke(rtt); };
@@ -671,10 +731,9 @@ namespace RTMPE.Core
         private void OnHeartbeatTimeout()
         {
             Debug.LogWarning("[RTMPE] Heartbeat timeout — 3 consecutive misses. Disconnecting.");
-            // L-SDK7 fix: transition through Disconnecting first so that
-            // listeners observing state changes see the full lifecycle
-            // (Connected → Disconnecting → Disconnected), consistent with
-            // the explicit Disconnect() path.
+            // Transition through Disconnecting first so listeners observing state
+            // changes see the full lifecycle (Connected → Disconnecting → Disconnected),
+            // consistent with the explicit Disconnect() path.
             TransitionTo(NetworkState.Disconnecting);
             _heartbeatManager?.Stop();
             _networkThread?.Stop();
@@ -692,7 +751,7 @@ namespace RTMPE.Core
             _roomManager.HandleRoomPacket(type, payload);
         }
 
-        // ── Spawn / Despawn inbound handlers (Week 16) ─────────────────────────
+        // ── Spawn / Despawn inbound handlers ─────────────────────────
 
         /// <summary>
         /// Handle an inbound <c>Spawn</c> (0x30) packet from the server.
@@ -738,11 +797,11 @@ namespace RTMPE.Core
             _spawnManager.DestroyLocal(objectId);
         }
 
-        // ── RPC inbound handlers (Week 17) ─────────────────────────────────────
+        // ── RPC inbound handlers ─────────────────────────────────────
 
         /// <summary>
         /// Handle an inbound <c>Rpc</c> (0x50) request from the server.
-        /// Currently dispatches ownership-related RPCs (method_id 200).
+        /// Dispatches ownership-related RPCs (200) and damage RPCs (301).
         /// </summary>
         private void OnRpcRequest(byte[] data)
         {
@@ -757,6 +816,10 @@ namespace RTMPE.Core
             {
                 case RpcMethodId.TransferOwnership:
                     HandleOwnershipTransferRpc(request);
+                    break;
+                // Server-broadcast ApplyDamage (301) → route to target HealthController.
+                case RpcMethodId.ApplyDamage:
+                    HandleApplyDamageRpc(request);
                     break;
                 default:
                     LogDebug($"RPC request: unhandled method_id {request.MethodId}.");
@@ -824,7 +887,7 @@ namespace RTMPE.Core
             }
         }
 
-        /// <summary>Week 14: RoomManager fires OnRoomCreated → transition to InRoom.</summary>
+        /// <summary>RoomManager fires OnRoomCreated → transition to InRoom.</summary>
         private void OnRoomManagerCreated(RoomInfo room)
         {
             if (_state == NetworkState.Connected)
@@ -836,7 +899,7 @@ namespace RTMPE.Core
             }
         }
 
-        /// <summary>Week 14: RoomManager fires OnRoomJoined → transition to InRoom.</summary>
+        /// <summary>RoomManager fires OnRoomJoined → transition to InRoom.</summary>
         private void OnRoomManagerJoined(RoomInfo room)
         {
             if (_state == NetworkState.Connected)
@@ -848,12 +911,12 @@ namespace RTMPE.Core
             }
         }
 
-        /// <summary>Week 14: RoomManager fires OnRoomLeft → transition back to Connected.</summary>
+        /// <summary>RoomManager fires OnRoomLeft → transition back to Connected.</summary>
         private void OnRoomManagerLeft()
         {
             if (_state == NetworkState.InRoom)
             {
-                _spawnManager?.ClearAll();  // Week 16: destroy all spawned objects on room leave
+                _spawnManager?.ClearAll();  // Destroy all spawned objects on room leave
                 TransitionTo(NetworkState.Connected);
 #pragma warning disable CS0618
                 OnLeftRoom?.Invoke(0);
@@ -951,9 +1014,8 @@ namespace RTMPE.Core
             else
             {
                 // No PSK configured — build unencrypted payload for local dev only.
-                // M-18 fix: abort the connection in release builds rather than
-                // transmitting the API key in plaintext.  The plaintext path is a
-                // developer convenience that MUST NOT ship to production.
+                // Abort in release builds — the plaintext path is a developer
+                // convenience and must not be used in production.
 #if !UNITY_EDITOR && !DEVELOPMENT_BUILD
                 Debug.LogError("[RTMPE] SendHandshakeInit: apiKeyPskHex MUST be configured in " +
                                "release builds. Sending the API key unencrypted exposes it to " +
@@ -972,9 +1034,8 @@ namespace RTMPE.Core
 #endif
             }
 
-            // M-13 fix: use SendOwned — packet is a freshly built array we do not
-            // reuse after the send call (LogDebug only reads packet.Length, which
-            // is safe since the array is still referenced by the send queue).
+            // Use SendOwned — packet is a freshly built array; the caller
+            // does not retain a reference after this call.
             var packet = _packetBuilder.BuildHandshakeInit(encryptedPayload);
             _networkThread.SendOwned(packet);
             LogDebug($"HandshakeInit sent ({packet.Length} B).");
@@ -983,7 +1044,7 @@ namespace RTMPE.Core
         private void SendDisconnect()
         {
             if (_packetBuilder == null) return;
-            // M-13 fix: BuildDisconnect returns a fresh array; use SendOwned.
+            // Use SendOwned — BuildDisconnect returns a fresh array.
             var packet = _packetBuilder.BuildDisconnect();
             _networkThread?.SendOwned(packet);
             LogDebug("Sent Disconnect packet.");
@@ -1016,19 +1077,207 @@ namespace RTMPE.Core
             _localPlayerStringId   = null;
             _currentRoomId         = 0;
             _roomManager?.ClearState();
-            _spawnManager?.ClearAll();     // Week 16: destroy all spawned objects
-            _handshakeHandler?.Dispose();  // C-1 fix: zero key material before GC can observe it
+            _spawnManager?.ClearAll();     // Destroy all spawned objects
+            _handshakeHandler?.Dispose();  // Zero key material before GC can observe it
             _handshakeHandler = null;
-            _sessionKeys?.Dispose();       // C-1 fix: zero session keys before GC can observe it
+            _sessionKeys?.Dispose();       // Zero session keys before GC can observe it
             _sessionKeys      = null;
             LastRttMs         = -1f;
         }
+
+        // ── State-sync inbound handler ────────────────────────────────
+
+        /// <summary>
+        /// Route incoming <c>StateSync</c>/<c>Data</c> server broadcasts to
+        /// the <see cref="NetworkTransformInterpolator"/> on the matching spawned object.
+        /// Subscribed to <see cref="OnDataReceived"/> in <see cref="InitialiseNetwork"/>.
+        /// </summary>
+        private void HandleStateSyncPacket(byte[] data)
+        {
+            if (_spawnManager == null) return;
+
+            var payload = PacketParser.ExtractPayload(data);
+            if (!TransformPacketParser.TryParseStateDelta(
+                    payload, out ulong objectId, out byte changedMask, out TransformState state))
+                return;
+
+            var nb = _spawnManager.Registry.Get(objectId);
+            if (nb == null) return;
+
+            // Owning client: we are the sender; do not apply our own updates.
+            if (nb.IsOwner) return;
+
+            // Find the interpolator on the same GameObject.
+            var interp = nb.GetComponent<NetworkTransformInterpolator>();
+            if (interp == null) return;
+
+            // Build a blended state: merge only the fields present in the delta.
+            // Fields absent from the delta keep zero-initialised values in `state`
+            // which would clobber the current transform — use the live transform instead.
+            var current = nb.GetComponent<NetworkTransform>()?.GetState()
+                          ?? new TransformState { Position = nb.transform.position,
+                                                  Rotation = nb.transform.rotation,
+                                                  Scale    = nb.transform.localScale };
+            var blended = new TransformState
+            {
+                Position = (changedMask & TransformPacketParser.ChangedPosition) != 0
+                               ? state.Position : current.Position,
+                Rotation = (changedMask & TransformPacketParser.ChangedRotation) != 0
+                               ? state.Rotation : current.Rotation,
+                Scale    = (changedMask & TransformPacketParser.ChangedScale) != 0
+                               ? state.Scale : current.Scale,
+            };
+
+            interp.AddState(blended, UnityEngine.Time.timeAsDouble);
+        }
+
+        // ── Variable update inbound handler ────────────────────────────
+
+        /// <summary>
+        /// Apply an inbound <c>VariableUpdate</c> (0x41) packet from the server
+        /// to the matching spawned object's NetworkVariables.
+        /// Payload: [object_id:8 LE][var_count:1][for each: [var_id:2 LE][value_len:2 LE][value_bytes:N]]
+        /// </summary>
+        private void HandleVariableUpdatePacket(byte[] data)
+        {
+            if (_spawnManager == null) return;
+
+            var payload = PacketParser.ExtractPayload(data);
+            // Minimum: object_id(8) + var_count(1) = 9 bytes.
+            if (payload == null || payload.Length < 9) return;
+
+            ulong objectId = System.BitConverter.ToUInt64(payload, 0);
+            int varCount   = payload[8];
+            if (varCount == 0) return;
+
+            var nb = _spawnManager.Registry.Get(objectId);
+            if (nb == null) return;
+
+            try
+            {
+                using var ms     = new System.IO.MemoryStream(payload, 9, payload.Length - 9);
+                using var reader = new System.IO.BinaryReader(ms);
+
+                for (int i = 0; i < varCount; i++)
+                {
+                    // Wire format: [var_id:2 LE][value_len:2 LE][value_bytes:N]
+                    // Read value_len before dispatching to ApplyVariableUpdate.
+                    // If the var_id is unknown, advance the reader by value_len bytes
+                    // so subsequent variables in this packet are parsed correctly.
+                    if (ms.Length - ms.Position < 4) break; // need var_id(2) + value_len(2)
+                    ushort varId    = reader.ReadUInt16();
+                    ushort valueLen = reader.ReadUInt16();
+
+                    if (ms.Length - ms.Position < valueLen) break; // truncated packet
+
+                    long valueStart = ms.Position;
+                    nb.ApplyVariableUpdate(varId, reader, valueLen);
+
+                    // Ensure the reader is positioned exactly after value_bytes,
+                    // even if ApplyVariableUpdate consumed fewer or more bytes.
+                    ms.Position = valueStart + valueLen;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"VariableUpdate: parse error for objectId {objectId}: {ex.Message}");
+            }
+        }
+
+        // ── Variable update send path ─────────────────────────────────
+
+        /// <summary>
+        /// Build and enqueue a <c>VariableUpdate</c> (0x41) packet.
+        /// Called by <see cref="NetworkBehaviour.FlushDirtyVariables"/> for each
+        /// owned object that has dirty NetworkVariables.
+        /// </summary>
+        internal void SendVariableUpdate(byte[] payload)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+            if (payload == null || payload.Length == 0) return;
+
+            var packet = _packetBuilder.Build(
+                PacketType.VariableUpdate,
+                PacketFlags.Reliable,  // variable updates need guaranteed delivery
+                payload);
+
+            _networkThread.SendOwned(packet);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
         /// Called by RoomManager when JoinRoom/CreateRoom succeeds and the server
         /// confirms the local player's room UUID. This is the identifier used by
         /// <see cref="NetworkBehaviour.IsOwner"/> for object ownership comparisons.
         /// </summary>
+        /// <summary>
+        /// Build and enqueue an RPC request packet for transmission.
+        /// Convenience wrapper for game code that does not need
+        /// the raw <see cref="BuildPacket"/> / <see cref="Send"/> split.
+        /// The packet is built with <see cref="PacketFlags.Reliable"/> so the
+        /// KCP layer will retransmit on loss.
+        /// </summary>
+        /// <param name="methodId">RPC method ID (see <see cref="RpcMethodId"/>).</param>
+        /// <param name="rpcPayload">Method-specific payload bytes (max 4096 bytes).</param>
+        public void SendRpc(uint methodId, byte[] rpcPayload)
+        {
+            if (!IsConnected)
+            {
+                Debug.LogWarning("[RTMPE] NetworkManager.SendRpc: cannot send while not connected.");
+                return;
+            }
+
+            uint requestId = (uint)System.Threading.Interlocked.Increment(ref _rpcRequestCounter);
+            byte[] rpcMessage = RpcPacketBuilder.BuildRequest(methodId, LocalPlayerId, requestId, rpcPayload);
+            byte[] packet     = BuildPacket(PacketType.Rpc, PacketFlags.Reliable, rpcMessage);
+            Send(packet, reliable: true);
+        }
+
+        /// <summary>
+        /// Handle a server-broadcast <c>ApplyDamage</c> (301) RPC.
+        /// Payload: [object_id:8 LE u64][damage:4 LE i32].
+        /// Looks up the target <see cref="NetworkBehaviour"/> by object ID, retrieves
+        /// its <c>HealthController</c> component (if any), and calls
+        /// <c>ReceiveApplyDamage</c> to apply validated server-authorised damage.
+        /// </summary>
+        private void HandleApplyDamageRpc(RpcRequest request)
+        {
+            var p = request.Payload;
+            if (p == null || p.Length < 12)
+            {
+                LogDebug("ApplyDamage RPC: payload too short, dropped.");
+                return;
+            }
+
+            ulong objectId = (ulong)p[0]       | ((ulong)p[1] << 8)  | ((ulong)p[2] << 16) |
+                             ((ulong)p[3] << 24)| ((ulong)p[4] << 32) | ((ulong)p[5] << 40) |
+                             ((ulong)p[6] << 48)| ((ulong)p[7] << 56);
+            int damage = p[8] | (p[9] << 8) | (p[10] << 16) | (p[11] << 24);
+
+            if (damage <= 0)
+            {
+                LogDebug("ApplyDamage RPC: non-positive damage, dropped.");
+                return;
+            }
+
+            var nb = Spawner?.Registry?.Get(objectId);
+            if (nb == null)
+            {
+                LogDebug($"ApplyDamage RPC: no object with id {objectId}.");
+                return;
+            }
+
+            // Look up the IDamageable interface on the target object.
+            // IDamageable lives in the SDK Runtime assembly; game code (e.g. HealthController)
+            // implements it. This avoids a compile-time dependency on Samples.
+            var damageable = nb.GetComponentInParent<IDamageable>();
+            if (damageable != null)
+                damageable.ReceiveApplyDamage(damage);
+            else
+                LogDebug($"ApplyDamage RPC: object {objectId} has no IDamageable component.");
+        }
+
         internal void SetLocalRoomPlayerId(string playerId)
         {
             _localPlayerStringId = playerId;
@@ -1046,7 +1295,7 @@ namespace RTMPE.Core
         /// Wrap <paramref name="payload"/> in a <see cref="PacketType.Data"/> header
         /// and enqueue it on the network thread for transmission.
         ///
-        /// Called by <c>NetworkTransform</c> (Week 22) and any other SDK component
+        /// Called by <c>NetworkTransform</c> and any other SDK component
         /// that needs to send a raw data payload without managing the PacketBuilder
         /// directly.  Must be called from the Unity main thread.
         /// </summary>

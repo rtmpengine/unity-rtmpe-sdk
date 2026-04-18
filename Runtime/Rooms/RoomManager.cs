@@ -14,6 +14,7 @@
 //   3. On cleanup, NetworkManager nulls its reference — no explicit Dispose needed.
 
 using System;
+using System.Collections.Generic;
 using RTMPE.Core;
 using RTMPE.Protocol;
 using UnityEngine;
@@ -29,14 +30,30 @@ namespace RTMPE.Rooms
         private readonly PacketBuilder _packetBuilder;
         private readonly Action<byte[]> _sendOwned;
         private readonly Func<NetworkState> _getState;
+        // Called with the local player's room UUID after CreateRoom/JoinRoom succeeds.
+        // Wired by NetworkManager so NetworkBehaviour.IsOwner comparisons have a valid ID.
+        private readonly Action<string> _onLocalPlayerIdResolved;
 
         // Current room state (null when not in a room).
         private RoomInfo _currentRoom;
 
-        // M-4 fix: stash the pending CreateRoom options so we can use the
-        // correct name/isPublic values in the response handler instead of
-        // hardcoding them.
-        private CreateRoomOptions _pendingCreateOptions;
+        // Replace the single _pendingCreateOptions field with a request-
+        // correlated FIFO queue. The old field was overwritten on rapid successive
+        // CreateRoom calls, causing early responses to be populated with the last
+        // call's options.
+        //
+        // A Queue is correct here because:
+        //   (a) RoomManager runs on the Unity main thread (no concurrency).
+        //   (b) The server responds to room-creation requests in FIFO order.
+        //   (c) No sequence-number echoing is required from the server.
+        // Entries are dequeued as responses arrive; any remainders are purged in
+        // ClearState() on disconnect.
+        //
+        // Capped at MaxPendingCreates to prevent unbounded memory growth if the
+        // server stops responding to CreateRoom requests.
+        private readonly Queue<CreateRoomOptions> _pendingCreateQueue =
+            new Queue<CreateRoomOptions>();
+        private const int MaxPendingCreates = 16;
 
         // ── Properties ─────────────────────────────────────────────────────────
 
@@ -80,11 +97,13 @@ namespace RTMPE.Rooms
         internal RoomManager(
             PacketBuilder packetBuilder,
             Action<byte[]> sendOwned,
-            Func<NetworkState> getState)
+            Func<NetworkState> getState,
+            Action<string> onLocalPlayerIdResolved = null)
         {
-            _packetBuilder = packetBuilder ?? throw new ArgumentNullException(nameof(packetBuilder));
-            _sendOwned     = sendOwned ?? throw new ArgumentNullException(nameof(sendOwned));
-            _getState      = getState ?? throw new ArgumentNullException(nameof(getState));
+            _packetBuilder             = packetBuilder ?? throw new ArgumentNullException(nameof(packetBuilder));
+            _sendOwned                 = sendOwned     ?? throw new ArgumentNullException(nameof(sendOwned));
+            _getState                  = getState      ?? throw new ArgumentNullException(nameof(getState));
+            _onLocalPlayerIdResolved   = onLocalPlayerIdResolved;
         }
 
         // ── Public API ─────────────────────────────────────────────────────────
@@ -98,9 +117,18 @@ namespace RTMPE.Rooms
         {
             if (!RequireConnected("CreateRoom")) return;
 
+            if (_pendingCreateQueue.Count >= MaxPendingCreates)
+            {
+                Debug.LogError("[RTMPE] RoomManager.CreateRoom: too many in-flight room creates. " +
+                               "Wait for the server to respond before calling CreateRoom again.");
+                return;
+            }
+
             var payload = RoomPacketBuilder.BuildCreateRoomPayload(options);
             var packet  = _packetBuilder.Build(PacketType.RoomCreate, PacketFlags.Reliable, payload);
-            _pendingCreateOptions = options ?? new CreateRoomOptions();
+            // Enqueue options in FIFO order so each response can dequeue
+            // the matching options regardless of how many requests are in-flight.
+            _pendingCreateQueue.Enqueue(options ?? new CreateRoomOptions());
             _sendOwned(packet);
         }
 
@@ -194,7 +222,7 @@ namespace RTMPE.Rooms
         internal void ClearState()
         {
             _currentRoom = null;
-            _pendingCreateOptions = null;
+            _pendingCreateQueue.Clear();
         }
 
         // ── Response handlers ──────────────────────────────────────────────────
@@ -203,7 +231,8 @@ namespace RTMPE.Rooms
         {
             if (!RoomPacketParser.ParseCreateRoomResponse(
                     payload, out bool ok, out string roomId,
-                    out string roomCode, out int maxPlayers, out string error))
+                    out string roomCode, out int maxPlayers,
+                    out string localPlayerId, out string error))
             {
                 Debug.LogWarning("[RTMPE] RoomManager: malformed RoomCreate response.");
                 return;
@@ -211,12 +240,19 @@ namespace RTMPE.Rooms
 
             if (ok)
             {
-                // M-4 fix: use the stashed options for fields the server doesn't echo back.
-                var opts = _pendingCreateOptions ?? new CreateRoomOptions();
-                _pendingCreateOptions = null;
+                // Dequeue the matching options in FIFO order.
+                // RoomManager is single-threaded and the server responds in request order.
+                var opts = _pendingCreateQueue.Count > 0
+                    ? _pendingCreateQueue.Dequeue()
+                    : new CreateRoomOptions();
                 _currentRoom = new RoomInfo(
                     roomId, roomCode, opts.Name ?? string.Empty, "waiting",
                     1, maxPlayers, opts.IsPublic);
+
+                // Populate LocalPlayerStringId so IsOwner checks work.
+                if (!string.IsNullOrEmpty(localPlayerId))
+                    _onLocalPlayerIdResolved?.Invoke(localPlayerId);
+
                 OnRoomCreated?.Invoke(_currentRoom);
             }
             else
@@ -243,7 +279,8 @@ namespace RTMPE.Rooms
         private void HandleJoinResponse(byte[] payload)
         {
             if (!RoomPacketParser.ParseJoinRoomResponse(
-                    payload, out bool ok, out RoomInfo room, out string error))
+                    payload, out bool ok, out RoomInfo room,
+                    out string localPlayerId, out string error))
             {
                 Debug.LogWarning("[RTMPE] RoomManager: malformed JoinRoom response.");
                 return;
@@ -252,6 +289,11 @@ namespace RTMPE.Rooms
             if (ok)
             {
                 _currentRoom = room;
+
+                // Populate LocalPlayerStringId so IsOwner checks work.
+                if (!string.IsNullOrEmpty(localPlayerId))
+                    _onLocalPlayerIdResolved?.Invoke(localPlayerId);
+
                 OnRoomJoined?.Invoke(room);
             }
             else

@@ -12,8 +12,6 @@
 //   [payload    : N bytes]    — method-specific data (max 4096 bytes)
 //
 // Total overhead: 18 bytes + N.
-//
-// See Plan/week-17-rpc.md for the full architecture specification.
 
 using System;
 

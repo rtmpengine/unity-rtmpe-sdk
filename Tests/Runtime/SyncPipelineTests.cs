@@ -1,6 +1,6 @@
 // RTMPE SDK — Tests/Runtime/SyncPipelineTests.cs
 //
-// Week 25: Synchronization Integration Tests
+// RTMPE SDK — Synchronization Integration Tests
 //
 // These tests exercise CHAINS of sync components, not individual units.
 // Every test crosses at least two classes, simulating the real data flow

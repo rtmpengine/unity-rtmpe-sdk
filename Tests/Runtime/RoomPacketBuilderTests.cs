@@ -161,6 +161,31 @@ namespace RTMPE.Tests
             Assert.AreEqual(0, payload[0]);
         }
 
+        [Test]
+        [Description("BuildCreateRoomPayload must not throw when the room name exceeds " +
+                     "MaxNameBytes (256). The encoded name must be silently truncated to a " +
+                     "valid UTF-8 boundary <= 256 bytes. " +
+                     "Regression: exercises the SafeEncodeUtf8 truncation path and " +
+                     "the Debug.LogWarning call that requires 'using UnityEngine'.")]
+        public void BuildCreateRoomPayload_VeryLongName_TruncatesGracefully()
+        {
+            // 300 ASCII chars = 300 UTF-8 bytes, which exceeds MaxNameBytes (256).
+            var options = new CreateRoomOptions { Name = new string('A', 300) };
+
+            byte[] payload = null;
+            Assert.DoesNotThrow(
+                () => payload = RoomPacketBuilder.BuildCreateRoomPayload(options),
+                "BuildCreateRoomPayload must not throw for a 300-character name.");
+
+            int nameLen = ReadU16LE(payload, 0);
+            Assert.LessOrEqual(nameLen, 256, "Encoded name must be clamped to MaxNameBytes (256).");
+            Assert.Greater(nameLen, 0, "Truncated name must still contain bytes.");
+
+            // The trailing max_players and is_public fields must still be correct.
+            Assert.AreEqual(0,  payload[2 + nameLen],     "max_players default is 0");
+            Assert.AreEqual(1,  payload[2 + nameLen + 1], "is_public default is true (1)");
+        }
+
         // ── Helpers ────────────────────────────────────────────────────────────
 
         private static int ReadU16LE(byte[] buf, int offset)

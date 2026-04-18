@@ -4,9 +4,9 @@
     "displayName": "RTMPE SDK",
     "description": "Real-Time Multiplayer Engine — Unity client SDK for converting single-player games to multiplayer in under 15 minutes.",
     "unity": "6000.0",
-    "documentationUrl": "https://github.com/Faisalzz1/RTMPE/tree/main/docs",
-    "changelogUrl": "https://github.com/Faisalzz1/RTMPE/blob/main/clients/unity-sdk/Packages/com.rtmpe.sdk/CHANGELOG.md",
-    "licensesUrl": "https://github.com/Faisalzz1/RTMPE/blob/main/LICENSE",
+    "documentationUrl": "https://github.com/Faisalzz1/unity-rtmpe-sdk/blob/main/Documentation~/index.md",
+    "changelogUrl": "https://github.com/Faisalzz1/unity-rtmpe-sdk/blob/main/CHANGELOG.md",
+    "licensesUrl": "https://github.com/Faisalzz1/unity-rtmpe-sdk/blob/main/LICENSE.md",
     "keywords": [
         "multiplayer",
         "networking",

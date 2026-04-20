@@ -689,4 +689,74 @@ namespace RTMPE.Tests
             transport.Disconnect();
         }
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SpawnPacketBuilder / SpawnPacketParser — round-trip
+    //
+    // Regression for the WriteF32LE/ReadF32LE endian fix: previously
+    // BitConverter.GetBytes(float) / BitConverter.ToSingle() were used, which
+    // are platform-endian. The fix uses SingleToInt32Bits + explicit byte
+    // extraction (writer) and manual byte assembly + Int32BitsToSingle (reader),
+    // which are always little-endian regardless of the host byte order.
+    // ════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("SpawnPacket")]
+    public class SpawnPacketRoundTripTests
+    {
+        [Test]
+        public void BuildSpawnRequest_RoundTrip_PreservesPositionAndRotation()
+        {
+            uint       prefabId  = 0xDEADBEEF;
+            ulong      objectId  = 0xCAFEBABEDEAD1234;
+            string     owner     = "player-uuid-abc";
+            var        position  = new Vector3(1.5f, -2.25f, 0.125f);
+            var        rotation  = new Quaternion(0.1f, 0.2f, 0.3f, 0.9274f);
+
+            byte[] payload = SpawnPacketBuilder.BuildSpawnRequest(
+                prefabId, objectId, owner, position, rotation);
+
+            bool ok = SpawnPacketParser.TryParseSpawn(payload, out var data);
+
+            Assert.IsTrue(ok, "TryParseSpawn must succeed on a valid BuildSpawnRequest payload");
+            Assert.AreEqual(prefabId, data.PrefabId,  "PrefabId must survive round-trip");
+            Assert.AreEqual(objectId, data.ObjectId,  "ObjectId must survive round-trip");
+            Assert.AreEqual(owner,    data.OwnerPlayerId, "OwnerPlayerId must survive round-trip");
+            Assert.AreEqual(position.x, data.Position.x, 1e-6f, "Position.x must survive round-trip");
+            Assert.AreEqual(position.y, data.Position.y, 1e-6f, "Position.y must survive round-trip");
+            Assert.AreEqual(position.z, data.Position.z, 1e-6f, "Position.z must survive round-trip");
+            Assert.AreEqual(rotation.x, data.Rotation.x, 1e-6f, "Rotation.x must survive round-trip");
+            Assert.AreEqual(rotation.y, data.Rotation.y, 1e-6f, "Rotation.y must survive round-trip");
+            Assert.AreEqual(rotation.z, data.Rotation.z, 1e-6f, "Rotation.z must survive round-trip");
+            Assert.AreEqual(rotation.w, data.Rotation.w, 1e-6f, "Rotation.w must survive round-trip");
+        }
+
+        [Test]
+        public void BuildDespawnRequest_RoundTrip_PreservesObjectId()
+        {
+            ulong objectId = 0xFEEDFACECAFE0001;
+
+            byte[] payload = SpawnPacketBuilder.BuildDespawnRequest(objectId);
+            bool ok = SpawnPacketParser.TryParseDespawn(payload, out var parsed);
+
+            Assert.IsTrue(ok, "TryParseDespawn must succeed on a valid BuildDespawnRequest payload");
+            Assert.AreEqual(objectId, parsed, "ObjectId must survive despawn round-trip");
+        }
+
+        [Test]
+        public void BuildSpawnRequest_NegativeCoordinates_RoundTripCorrect()
+        {
+            // Edge case: negative floats — important for big-endian safety check.
+            var position = new Vector3(-100.5f, -0.001f, float.MinValue / 2f);
+            var rotation = Quaternion.identity;
+
+            byte[] payload = SpawnPacketBuilder.BuildSpawnRequest(
+                1, 2, "owner", position, rotation);
+            bool ok = SpawnPacketParser.TryParseSpawn(payload, out var data);
+
+            Assert.IsTrue(ok);
+            Assert.AreEqual(position.x, data.Position.x, 1e-3f, "Negative position.x round-trip");
+            Assert.AreEqual(position.y, data.Position.y, 1e-5f, "Negative position.y round-trip");
+        }
+    }
 }

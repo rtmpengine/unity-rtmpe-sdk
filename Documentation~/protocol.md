@@ -278,15 +278,17 @@ Room packets are sent over KCP (reliable), encrypted with AEAD.
 
 ### RoomJoin (0x21) — client → server
 
-```
-// Join by room ID:
-[msg_kind:1 = 0x01][room_id_len:2 LE u16][room_id:N UTF-8]
-[display_name_len:2 LE u16][display_name:N UTF-8]
+A single layout is always sent. Supply either `room_id` or `room_code`; leave the
+other field empty (zero-length).
 
-// Join by room code:
-[msg_kind:1 = 0x02][room_code_len:2 LE u16][room_code:N UTF-8]
-[display_name_len:2 LE u16][display_name:N UTF-8]
 ```
+[room_id_len:2 LE u16][room_id:room_id_len UTF-8]
+[room_code_len:2 LE u16][room_code:room_code_len UTF-8]
+[display_name_len:2 LE u16][display_name:display_name_len UTF-8]
+```
+
+- **Join by room ID:** set `room_id` to the UUID; `room_code` is empty (`room_code_len = 0`).
+- **Join by room code:** set `room_code` to the 6-char code; `room_id` is empty (`room_id_len = 0`).
 
 ### RoomLeave (0x22) — client → server
 
@@ -462,11 +464,12 @@ variable without needing to know the type ahead of time.
 
 ## 13. Heartbeat Packets
 
-Heartbeat uses FlatBuffers encoding for cross-language compatibility with the gateway.
+Heartbeat packets carry **no payload** (empty body). The 13-byte standard header is
+sufficient for keep-alive purposes; the gateway identifies them by `packet_type = 0x03`.
 
 | Packet | Hex | Direction | Interval |
 |--------|-----|-----------|----------|
-| `Heartbeat`    | 0x03 | C→S | Every `HeartbeatIntervalMs` (default 5 000 ms) |
+| `Heartbeat`    | 0x03 | C→S | Every `HeartbeatIntervalMs` (default 5 000 ms) |
 | `HeartbeatAck` | 0x04 | S→C | Immediately on receipt of Heartbeat |
 
 Three consecutive missed `HeartbeatAck` responses trigger `DisconnectReason.Timeout`.
@@ -479,11 +482,12 @@ Three consecutive missed `HeartbeatAck` responses trigger `DisconnectReason.Time
 Hex:  0xFF
 Dir:  C↔S (either side may send)
 Enc:  Encrypted (FLAG_ENCRYPTED set if session is established)
-Body: FlatBuffers — contains a reason code string
+Body: empty (no payload)
 ```
 
 The SDK sends a `Disconnect` packet on `NetworkManager.Disconnect()` before closing
 the socket, giving the gateway a chance to clean up the session synchronously.
+The packet carries no payload; the reason is implicit (connection closure).
 
 ---
 

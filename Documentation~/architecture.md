@@ -111,7 +111,7 @@ from blocking socket I/O.
 | `NetworkVariable.Value` (write) | ✅ Main thread only | Never from background threads |
 | `NetworkVariable.Value` (read) | ✅ Any thread | Volatile read |
 | `ThreadSafeQueue<T>` | ✅ Any thread | Uses `ConcurrentQueue<T>` |
-| `NetworkObjectRegistry` | ✅ Any thread | `ConcurrentDictionary` + lock on mutations |
+| `NetworkObjectRegistry` | ✅ Any thread | `Dictionary<ulong,NetworkBehaviour>` protected by explicit `lock` |
 | `PacketBuilder` sequence counter | ✅ Any thread | `Interlocked.Increment` |
 
 ---
@@ -305,8 +305,9 @@ the server grant.
 
 ### NetworkObjectRegistry
 
-Thread-safe registry (`ConcurrentDictionary`) mapping `ulong objectId → NetworkBehaviour`.
-- `GetAll()` returns a defensive snapshot.
+Thread-safe registry (`Dictionary<ulong, NetworkBehaviour>` protected by an explicit `lock`)
+mapping `ulong objectId → NetworkBehaviour`.
+- `GetAll()` returns a defensive `IReadOnlyList<NetworkBehaviour>` snapshot taken under lock.
 - `Clear()` despawns all registered objects before clearing.
 - Null-checks against Unity's destroyed-object sentinel on every lookup.
 

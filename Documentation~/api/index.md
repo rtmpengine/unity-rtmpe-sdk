@@ -220,9 +220,10 @@ bool HasPrefab(uint prefabId)
 // Instantiate the prefab registered as prefabId, register it on the network,
 // send a SpawnRequest to the gateway, and broadcast to all room peers.
 // Returns the NetworkBehaviour component of the new GameObject,
-// or null if prefabId is not registered.
+// or null if prefabId is not registered or prefab has no NetworkBehaviour.
 // Call only after OnRoomCreated / OnRoomJoined fires.
-NetworkBehaviour Spawn(uint prefabId, Vector3 position, Quaternion rotation)
+// ownerPlayerId: optional override; defaults to NetworkManager.LocalPlayerStringId.
+NetworkBehaviour Spawn(uint prefabId, Vector3 position, Quaternion rotation, string ownerPlayerId = null)
 
 // Unregister, broadcast a despawn to all peers, and Destroy the GameObject.
 // objectId — the NetworkBehaviour.NetworkObjectId value, not the component itself.
@@ -307,7 +308,7 @@ protected virtual void OnNetworkDespawn() { }
 ## NetworkTransform
 
 **Namespace:** `RTMPE.Sync`  
-**Inherits:** `MonoBehaviour`  
+**Inherits:** `NetworkBehaviour`  
 **Attach to:** any prefab that should sync its position/rotation/scale.
 
 `NetworkTransform` reads the `Transform` of its `GameObject` each frame, compares
@@ -363,7 +364,7 @@ All `NetworkVariable<T>` types share the same contract:
 
 ```csharp
 // Constructor
-new NetworkVariableXxx(NetworkBehaviour owner, int variableId, T initialValue)
+new NetworkVariableXxx(NetworkBehaviour owner, ushort variableId, T initialValue)
 
 // Read (any client, any time after OnNetworkSpawn)
 T Value { get; }
@@ -384,14 +385,14 @@ event Action<T, T> OnValueChanged   // (previousValue, newValue)
 
 ### Available types
 
-| Class | T | Wire size |
-|-------|----|-----------|
-| `NetworkVariableInt` | `int` | 4 bytes (LE i32) |
-| `NetworkVariableFloat` | `float` | 4 bytes (LE f32) |
-| `NetworkVariableBool` | `bool` | 1 byte |
-| `NetworkVariableVector3` | `Vector3` | 12 bytes (3 × LE f32) |
-| `NetworkVariableQuaternion` | `Quaternion` | 16 bytes (4 × LE f32) |
-| `NetworkVariableString` | `string` | variable (UTF-8) |
+| Class | T | Wire size | Constructor `variableId` type |
+|-------|----|-----------|-------------------------------|
+| `NetworkVariableInt` | `int` | 4 bytes (LE i32) | `ushort` |
+| `NetworkVariableFloat` | `float` | 4 bytes (LE f32) | `ushort` |
+| `NetworkVariableBool` | `bool` | 1 byte | `ushort` |
+| `NetworkVariableVector3` | `Vector3` | 12 bytes (3 × LE f32) | `ushort` |
+| `NetworkVariableQuaternion` | `Quaternion` | 16 bytes (4 × LE f32) | `ushort` |
+| `NetworkVariableString` | `string` | variable (UTF-8) | `ushort` |
 
 ### Example — correct subscribe / unsubscribe pattern
 
@@ -403,7 +404,7 @@ public class Fighter : NetworkBehaviour
 
     protected override void OnNetworkSpawn()
     {
-        _health = new NetworkVariableInt(this, variableId: 0, initialValue: 100);
+        _health = new NetworkVariableInt(this, variableId: (ushort)0, initialValue: 100);
 
         _onHealthChanged = (prev, next) => UpdateHealthBar(next);
         _health.OnValueChanged += _onHealthChanged; // ← subscribe
@@ -430,12 +431,9 @@ Thread-safe map of `ulong objectId → NetworkBehaviour`. Managed internally by
 // Returns true and sets nb if objectId is registered and the GameObject is alive.
 bool TryGet(ulong objectId, out NetworkBehaviour nb)
 
-// Returns a snapshot array of all currently registered objects.
-// Safe to iterate — will not throw if objects are despawned mid-iteration.
-NetworkBehaviour[] GetAll()
-
-// Returns true if objectId is registered.
-bool Contains(ulong objectId)
+// Returns a read-only snapshot of all currently registered live objects.
+// Safe to iterate — the snapshot is taken under lock.
+IReadOnlyList<NetworkBehaviour> GetAll()
 ```
 
 ---
@@ -448,19 +446,22 @@ bool Contains(ulong objectId)
 Create via **right-click → Create → RTMPE → Settings** in the Project panel.
 Assign to `NetworkManager.Settings` in the Inspector.
 
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `ServerHost` | `string` | `"127.0.0.1"` | RTMPE Gateway hostname or IP |
-| `ServerPort` | `int` | `7777` | UDP port |
-| `HeartbeatIntervalMs` | `int` | `5000` | Milliseconds between Heartbeat packets |
-| `ConnectionTimeoutMs` | `int` | `10000` | Milliseconds before handshake times out |
-| `TickRate` | `int` | `30` | Must match the server room-service config |
-| `SendBufferBytes` | `int` | `4096` | UDP socket SO_SNDBUF |
-| `ReceiveBufferBytes` | `int` | `4096` | UDP socket SO_RCVBUF |
-| `NetworkThreadBufferBytes` | `int` | `8192` | Background thread read buffer |
-| `EnableDebugLogs` | `bool` | `true` | Unity Console tracing — set false in production |
-| `ApiKeyPskHex` | `string` | `""` | 64-char hex PSK — copy from the RTMPE dashboard |
-| `PinnedServerPublicKeyHex` | `string` | `""` | 64-char hex — optional server cert pinning |
+These are **serialized public fields** (not C# properties) on a `ScriptableObject`.
+Set them in the Unity Inspector or assign them in code by field name.
+
+| Field (camelCase) | Type | Default | Description |
+|-------------------|------|---------|-------------|
+| `serverHost` | `string` | `"127.0.0.1"` | RTMPE Gateway hostname or IP |
+| `serverPort` | `int` | `7777` | UDP port |
+| `heartbeatIntervalMs` | `int` | `5000` | Milliseconds between Heartbeat packets |
+| `connectionTimeoutMs` | `int` | `10000` | Milliseconds before handshake times out |
+| `tickRate` | `int` | `30` | Must match the server room-service config |
+| `sendBufferBytes` | `int` | `4096` | UDP socket SO_SNDBUF |
+| `receiveBufferBytes` | `int` | `4096` | UDP socket SO_RCVBUF |
+| `networkThreadBufferBytes` | `int` | `8192` | Background thread read buffer |
+| `enableDebugLogs` | `bool` | `true` | Unity Console tracing — set false in production |
+| `apiKeyPskHex` | `string` | `""` | 64-char hex PSK — copy from the RTMPE dashboard |
+| `pinnedServerPublicKeyHex` | `string` | `""` | 64-char hex — optional server cert pinning |
 
 ---
 
@@ -471,14 +472,14 @@ Assign to `NetworkManager.Settings` in the Inspector.
 ```csharp
 public sealed class CreateRoomOptions
 {
-    // Display name shown in room lists. Max 64 bytes UTF-8. Default: "Room".
-    public string Name { get; set; }
+    // Display name shown in room lists. Max 64 bytes UTF-8. Default: "" (server assigns a name).
+    public string Name { get; set; } = string.Empty;
 
     // Max players allowed. Range: 1–16. 0 = server default (16).
-    public int MaxPlayers { get; set; }
+    public int MaxPlayers { get; set; } = 0;
 
-    // Whether the room appears in public room listings.
-    public bool IsPublic { get; set; }
+    // Whether the room appears in public room listings. Default: true.
+    public bool IsPublic { get; set; } = true;
 }
 ```
 
@@ -507,12 +508,14 @@ Received in `OnRoomCreated`, `OnRoomJoined`, and `OnRoomListReceived`.
 ```csharp
 public sealed class RoomInfo
 {
-    public string RoomId      { get; }   // GUID — use for JoinRoom()
-    public string RoomCode    { get; }   // Short code, e.g. "XKQT" — use for JoinRoomByCode()
-    public string Name        { get; }   // Display name
-    public int    PlayerCount { get; }   // Current number of players
-    public int    MaxPlayers  { get; }   // Maximum capacity
-    public bool   IsPublic    { get; }   // Appears in public room lists
+    public string      RoomId      { get; }   // GUID — use for JoinRoom()
+    public string      RoomCode    { get; }   // 6-char join code, e.g. "XKCD42" — use for JoinRoomByCode()
+    public string      Name        { get; }   // Display name
+    public string      State       { get; }   // "waiting" | "playing" | "finished"
+    public int         PlayerCount { get; }   // Current number of players
+    public int         MaxPlayers  { get; }   // Maximum capacity
+    public bool        IsPublic    { get; }   // Appears in public room lists
+    public PlayerInfo[] Players    { get; }   // Player roster snapshot (may be empty for list responses)
 }
 ```
 
@@ -530,6 +533,7 @@ public sealed class PlayerInfo
     public string PlayerId    { get; }   // UUID string
     public string DisplayName { get; }   // Name set in JoinRoomOptions
     public bool   IsHost      { get; }   // True if this player created the room
+    public bool   IsReady     { get; }   // True if the player has signalled ready state
 }
 ```
 
@@ -583,7 +587,7 @@ via `GetComponentInParent<IDamageable>()`.
 ```csharp
 public interface IDamageable
 {
-    // Called on all clients when an ApplyDamage RPC is received.
+    // Called on all clients when an ApplyDamage RPC (method_id = 301) is received.
     // damage — always a positive integer (the gateway validates and discards damage ≤ 0).
     void ReceiveApplyDamage(int damage);
 }
@@ -621,7 +625,8 @@ Exposed for testing and custom transport implementations.
 
 ```csharp
 // Constructor
-UdpTransport(string host, int port)
+// sendBufferBytes and receiveBufferBytes are optional — defaults match NetworkSettings.
+UdpTransport(string host, int port, int sendBufferBytes = 4_096, int receiveBufferBytes = 4_096)
 
 // Open the UDP socket and connect to the remote endpoint.
 // Discovers the local outgoing IP via a routing probe.

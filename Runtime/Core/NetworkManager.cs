@@ -25,6 +25,7 @@ using UnityEngine;
 using RTMPE.Threading;
 using RTMPE.Transport;
 using RTMPE.Crypto;
+using RTMPE.Crypto.Internal;
 using RTMPE.Protocol;
 using RTMPE.Rooms;
 using RTMPE.Rpc;
@@ -1130,6 +1131,249 @@ namespace RTMPE.Core
             _sessionKeys?.Dispose();       // Zero session keys before GC can observe it
             _sessionKeys      = null;
             LastRttMs         = -1f;
+        }
+
+        // ── AEAD outbound / inbound pipeline ──────────────────────────────────
+
+        /// <summary>
+        /// Encrypts <paramref name="packet"/> with ChaCha20-Poly1305 AEAD and enqueues it
+        /// for transmission on the network thread.
+        ///
+        /// <para>If session keys are not yet established (pre-handshake, e.g.
+        /// <c>HandshakeInit</c>) the packet is sent as-is — the gateway expects those
+        /// to arrive in plaintext.</para>
+        ///
+        /// <para>When session keys are present the following transformations are applied,
+        /// mirroring Rust gateway <c>encrypt_outbound()</c> in
+        /// <c>modules/gateway/src/crypto/pipeline.rs</c>:</para>
+        /// <list type="number">
+        ///   <item>The original application <c>header.sequence</c> is saved and prepended
+        ///         as a 4-byte LE prefix to the plaintext before sealing.</item>
+        ///   <item>AAD = <c>[packet_type, flags]</c> where <c>flags</c> does <b>not</b>
+        ///         yet include <c>FLAG_ENCRYPTED</c>.</item>
+        ///   <item>A 12-byte nonce is built: <c>[counter:8 LE u64][_cryptoId:4 LE u32]</c>.
+        ///         The outbound counter is atomically incremented from
+        ///         <c>_outboundNonceCounter</c>.</item>
+        ///   <item><c>header.sequence</c> is overwritten with the nonce counter (lower
+        ///         32 bits), <c>FLAG_ENCRYPTED</c> is set, and <c>payload_len</c> is
+        ///         updated to reflect the enlarged ciphertext.</item>
+        /// </list>
+        /// </summary>
+        private void EncryptAndSend(byte[] packet)
+        {
+            if (packet == null || packet.Length < PacketProtocol.HEADER_SIZE)
+                return;
+
+            // Pre-session: HandshakeInit and HandshakeResponse travel in plaintext.
+            if (_sessionKeys == null)
+            {
+                _networkThread.SendOwned(packet);
+                return;
+            }
+
+            // ── 1. Claim next nonce counter ──────────────────────────────────────
+            // _outboundNonceCounter starts at -1; first call returns 0, matching
+            // the Rust NonceGenerator which also starts its counter at 0.
+            // Cast through uint to zero-extend the signed int into 8 nonce bytes.
+            uint nonceCounter = (uint)System.Threading.Interlocked.Increment(
+                ref _outboundNonceCounter);
+
+            // ── 2. Read original sequence and payload from header ────────────────
+            uint origSeq = (uint)(
+                  packet[PacketProtocol.OFFSET_SEQUENCE]
+                | (packet[PacketProtocol.OFFSET_SEQUENCE + 1] << 8)
+                | (packet[PacketProtocol.OFFSET_SEQUENCE + 2] << 16)
+                | (packet[PacketProtocol.OFFSET_SEQUENCE + 3] << 24));
+
+            uint payloadLen = (uint)(
+                  packet[PacketProtocol.OFFSET_PAYLOAD_LEN]
+                | (packet[PacketProtocol.OFFSET_PAYLOAD_LEN + 1] << 8)
+                | (packet[PacketProtocol.OFFSET_PAYLOAD_LEN + 2] << 16)
+                | (packet[PacketProtocol.OFFSET_PAYLOAD_LEN + 3] << 24));
+
+            byte packetType = packet[PacketProtocol.OFFSET_TYPE];
+            byte flags      = packet[PacketProtocol.OFFSET_FLAGS];
+
+            // ── 3. Build plaintext = [orig_seq:4 LE] || payload ─────────────────
+            int ptLen = 4 + (int)payloadLen;
+            var plaintext = new byte[ptLen];
+            plaintext[0] = (byte) origSeq;
+            plaintext[1] = (byte)(origSeq >>  8);
+            plaintext[2] = (byte)(origSeq >> 16);
+            plaintext[3] = (byte)(origSeq >> 24);
+            if (payloadLen > 0)
+                Buffer.BlockCopy(packet, PacketProtocol.HEADER_SIZE,
+                                 plaintext, 4, (int)payloadLen);
+
+            // ── 4. Build AAD = [packet_type, flags_without_encrypted] ────────────
+            // flags does NOT yet include FLAG_ENCRYPTED — this must match exactly
+            // what the gateway sees as AAD on its decrypt_inbound() path.
+            var aad = new byte[] { packetType, flags };
+
+            // ── 5. Build 12-byte nonce = [counter:8 LE][crypto_id:4 LE] ─────────
+            var nonce = BuildAeadNonce(nonceCounter, _cryptoId);
+
+            // ── 6. Seal (ChaCha20-Poly1305) ──────────────────────────────────────
+            var ciphertext = ChaCha20Poly1305Impl.Seal(
+                _sessionKeys.EncryptKey, nonce, plaintext, aad);
+            // ciphertext.Length == ptLen + 16  (Poly1305 tag appended)
+
+            // ── 7. Assemble the encrypted packet ────────────────────────────────
+            var result = new byte[PacketProtocol.HEADER_SIZE + ciphertext.Length];
+            // Copy header as-is first, then patch the three affected fields.
+            Buffer.BlockCopy(packet, 0, result, 0, PacketProtocol.HEADER_SIZE);
+
+            // header.sequence = nonce_counter  (gateway uses this to reconstruct nonce)
+            result[PacketProtocol.OFFSET_SEQUENCE]     = (byte) nonceCounter;
+            result[PacketProtocol.OFFSET_SEQUENCE + 1] = (byte)(nonceCounter >>  8);
+            result[PacketProtocol.OFFSET_SEQUENCE + 2] = (byte)(nonceCounter >> 16);
+            result[PacketProtocol.OFFSET_SEQUENCE + 3] = (byte)(nonceCounter >> 24);
+
+            // header.flags |= FLAG_ENCRYPTED
+            result[PacketProtocol.OFFSET_FLAGS] = (byte)(flags | (byte)PacketFlags.Encrypted);
+
+            // header.payload_len = len(ciphertext)
+            uint ctLen = (uint)ciphertext.Length;
+            result[PacketProtocol.OFFSET_PAYLOAD_LEN]     = (byte) ctLen;
+            result[PacketProtocol.OFFSET_PAYLOAD_LEN + 1] = (byte)(ctLen >>  8);
+            result[PacketProtocol.OFFSET_PAYLOAD_LEN + 2] = (byte)(ctLen >> 16);
+            result[PacketProtocol.OFFSET_PAYLOAD_LEN + 3] = (byte)(ctLen >> 24);
+
+            Buffer.BlockCopy(ciphertext, 0, result,
+                             PacketProtocol.HEADER_SIZE, ciphertext.Length);
+
+            _networkThread.SendOwned(result);
+        }
+
+        /// <summary>
+        /// Decrypts an inbound packet that has <c>FLAG_ENCRYPTED</c> set.
+        ///
+        /// <para>Reverses the transformations applied by the gateway's
+        /// <c>encrypt_outbound()</c>:</para>
+        /// <list type="number">
+        ///   <item>Reconstructs the 12-byte nonce from <c>header.sequence</c> (the nonce
+        ///         counter placed there by the gateway) and <c>_cryptoId</c>.</item>
+        ///   <item>AAD = <c>[packet_type, flags &amp; ~FLAG_ENCRYPTED]</c>.</item>
+        ///   <item>Opens (decrypts + verifies) the ciphertext with
+        ///         <c>_sessionKeys.DecryptKey</c>.</item>
+        ///   <item>Recovers the original application sequence from the first 4 bytes of
+        ///         the plaintext (the SEQ prefix) and writes it back to
+        ///         <c>header.sequence</c>.</item>
+        ///   <item>Returns a rebuilt packet: decrypted payload, cleared
+        ///         <c>FLAG_ENCRYPTED</c>, corrected <c>payload_len</c>.</item>
+        /// </list>
+        ///
+        /// <returns>
+        ///   The decrypted packet, or <see langword="null"/> on MAC failure, missing
+        ///   session keys, or a malformed input — the caller must drop the packet silently.
+        /// </returns>
+        /// </summary>
+        private byte[] DecryptInboundPacket(byte[] data)
+        {
+            if (_sessionKeys == null) return null;
+
+            // Minimum valid encrypted packet:
+            //   header(13) + SEQ_prefix(4) + Poly1305_tag(16) = 33 bytes.
+            if (data == null || data.Length < PacketProtocol.HEADER_SIZE + 4 + 16)
+                return null;
+
+            // ── 1. Read nonce counter from header.sequence ───────────────────────
+            // The gateway wrote nonce_counter here during encryption.
+            uint nonceCounter = (uint)(
+                  data[PacketProtocol.OFFSET_SEQUENCE]
+                | (data[PacketProtocol.OFFSET_SEQUENCE + 1] << 8)
+                | (data[PacketProtocol.OFFSET_SEQUENCE + 2] << 16)
+                | (data[PacketProtocol.OFFSET_SEQUENCE + 3] << 24));
+
+            byte packetType = data[PacketProtocol.OFFSET_TYPE];
+            byte flags      = data[PacketProtocol.OFFSET_FLAGS];
+
+            // ── 2. Build AAD = [packet_type, flags & ~FLAG_ENCRYPTED] ────────────
+            // Stripping FLAG_ENCRYPTED reproduces the AAD the gateway used when sealing.
+            var aad = new byte[] { packetType,
+                                   (byte)(flags & ~(byte)PacketFlags.Encrypted) };
+
+            // ── 3. Build 12-byte nonce ───────────────────────────────────────────
+            var nonce = BuildAeadNonce(nonceCounter, _cryptoId);
+
+            // ── 4. Extract ciphertext (everything after the header) ──────────────
+            int ctLen = data.Length - PacketProtocol.HEADER_SIZE;
+            var ciphertext = new byte[ctLen];
+            Buffer.BlockCopy(data, PacketProtocol.HEADER_SIZE, ciphertext, 0, ctLen);
+
+            // ── 5. Open: decrypt + verify Poly1305 tag ───────────────────────────
+            var plaintext = ChaCha20Poly1305Impl.Open(
+                _sessionKeys.DecryptKey, nonce, ciphertext, aad);
+            if (plaintext == null) return null; // MAC failure — drop
+
+            // plaintext = [orig_seq:4 LE] || actual_payload
+            if (plaintext.Length < 4) return null; // should never happen
+
+            // ── 6. Recover original application sequence from SEQ prefix ─────────
+            uint origSeq = (uint)(
+                  plaintext[0]
+                | (plaintext[1] << 8)
+                | (plaintext[2] << 16)
+                | (plaintext[3] << 24));
+            int actualPayloadLen = plaintext.Length - 4;
+
+            // ── 7. Rebuild packet with restored header ───────────────────────────
+            var result = new byte[PacketProtocol.HEADER_SIZE + actualPayloadLen];
+            Buffer.BlockCopy(data, 0, result, 0, PacketProtocol.HEADER_SIZE);
+
+            // Restore original application sequence number.
+            result[PacketProtocol.OFFSET_SEQUENCE]     = (byte) origSeq;
+            result[PacketProtocol.OFFSET_SEQUENCE + 1] = (byte)(origSeq >>  8);
+            result[PacketProtocol.OFFSET_SEQUENCE + 2] = (byte)(origSeq >> 16);
+            result[PacketProtocol.OFFSET_SEQUENCE + 3] = (byte)(origSeq >> 24);
+
+            // Clear FLAG_ENCRYPTED — downstream handlers receive plaintext packets.
+            result[PacketProtocol.OFFSET_FLAGS] = (byte)(flags & ~(byte)PacketFlags.Encrypted);
+
+            // Update payload_len: SEQ prefix and Poly1305 tag have been removed.
+            uint newPayloadLen = (uint)actualPayloadLen;
+            result[PacketProtocol.OFFSET_PAYLOAD_LEN]     = (byte) newPayloadLen;
+            result[PacketProtocol.OFFSET_PAYLOAD_LEN + 1] = (byte)(newPayloadLen >>  8);
+            result[PacketProtocol.OFFSET_PAYLOAD_LEN + 2] = (byte)(newPayloadLen >> 16);
+            result[PacketProtocol.OFFSET_PAYLOAD_LEN + 3] = (byte)(newPayloadLen >> 24);
+
+            if (actualPayloadLen > 0)
+                Buffer.BlockCopy(plaintext, 4, result,
+                                 PacketProtocol.HEADER_SIZE, actualPayloadLen);
+
+            return result;
+        }
+
+        /// <summary>
+        /// Build the 12-byte ChaCha20-Poly1305 nonce shared by both directions.
+        ///
+        /// <para>Layout mirrors
+        /// <c>NonceGenerator::build_nonce_raw(counter, session_id)</c> in the Rust
+        /// gateway (<c>modules/gateway/src/crypto/nonce.rs</c>):</para>
+        /// <code>
+        ///   [counter : 8 bytes LE u64] [session_id : 4 bytes LE u32]
+        /// </code>
+        ///
+        /// <para><paramref name="counter"/> is a <see cref="uint"/> (zero-extended to 8
+        /// bytes); the high 4 bytes are therefore always <c>0x00</c> for any session
+        /// within its practical lifetime.</para>
+        /// </summary>
+        private static byte[] BuildAeadNonce(uint counter, uint sessionId)
+        {
+            var nonce = new byte[12];
+            // counter — 8 bytes LE (high 32 bits are always 0)
+            nonce[0] = (byte) counter;
+            nonce[1] = (byte)(counter >>  8);
+            nonce[2] = (byte)(counter >> 16);
+            nonce[3] = (byte)(counter >> 24);
+            // nonce[4..7] remain 0x00 (C# zero-initialises arrays)
+
+            // session_id — 4 bytes LE
+            nonce[8]  = (byte) sessionId;
+            nonce[9]  = (byte)(sessionId >>  8);
+            nonce[10] = (byte)(sessionId >> 16);
+            nonce[11] = (byte)(sessionId >> 24);
+            return nonce;
         }
 
         // ── State-sync inbound handler ────────────────────────────────

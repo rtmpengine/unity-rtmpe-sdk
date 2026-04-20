@@ -4,10 +4,10 @@ Welcome to the RTMPE SDK documentation.
 
 ## Sections
 
-- [Quick Start](getting-started.md) — connect your first game in under 15 minutes
-- [Architecture](architecture.md) — SDK layers, threading model, transport options
-- [Protocol Reference](protocol.md) — wire format, PacketType values, flag bits
-- [API Reference](api/index.md) — C# class and method reference
+- [Quick Start](getting-started.md) — step-by-step guide: install, configure, connect, spawn, sync
+- [Architecture](architecture.md) — SDK layers, threading model, crypto flow, data flow diagrams
+- [Protocol Reference](protocol.md) — wire format, PacketType values, flag bits, payload layouts
+- [API Reference](api/index.md) — complete C# class and method reference
 - [Samples](../Samples~/BasicConnection/README.md) — runnable example projects
 - [Changelog](../CHANGELOG.md) — version history
 

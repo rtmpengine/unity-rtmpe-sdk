@@ -134,6 +134,13 @@ namespace RTMPE.Core
         // Incremented atomically by SendRpc(); max-value wrap is safe (uint loops).
         private int _rpcRequestCounter;
 
+        // Outbound AEAD nonce counter (separate from the application sequence number
+        // assigned by PacketBuilder).  Starts at -1 so the first Interlocked.Increment
+        // returns 0, matching the gateway NonceGenerator which also starts at 0.
+        // Reset to -1 in ClearSessionData() and in Connect() so every new session
+        // begins with counter = 0.
+        private int _outboundNonceCounter = -1;
+
         // Session crypto state
         private HandshakeHandler _handshakeHandler;
         private SessionKeys      _sessionKeys;
@@ -266,7 +273,9 @@ namespace RTMPE.Core
 
             // Cache the heartbeat send callback once so Update() does
             // not allocate a new closure object every frame.
-            _sendPacketCallback = packet => _networkThread?.Send(packet);
+            // Route through EncryptAndSend so heartbeat packets are AEAD-encrypted
+            // once the session is established (i.e. _sessionKeys != null).
+            _sendPacketCallback = packet => EncryptAndSend(packet);
 
             // Cache the SendVariableUpdate delegate once to eliminate
             // per-tick allocation on the 30 Hz flush path.
@@ -337,9 +346,11 @@ namespace RTMPE.Core
 
             // Room API manager. Receives the shared PacketBuilder for
             // sequence numbering and a delegate to send fully-built packets.
+            // Route through EncryptAndSend so room packets are AEAD-encrypted
+            // once the session is established.
             _roomManager = new RoomManager(
                 _packetBuilder,
-                packet => _networkThread?.SendOwned(packet),
+                packet => EncryptAndSend(packet),
                 () => _state,
                 id => SetLocalRoomPlayerId(id));   // wire local player UUID
 
@@ -406,13 +417,18 @@ namespace RTMPE.Core
             // Reset the packet builder so sequence numbers start fresh on reconnect.
             _packetBuilder = new PacketBuilder();
 
+            // Reset the outbound AEAD nonce counter so the first encrypted packet
+            // of every session starts at counter = 0, matching the gateway's
+            // NonceGenerator which also resets to 0 for each new EstablishedSession.
+            System.Threading.Interlocked.Exchange(ref _outboundNonceCounter, -1);
+
             // Recreate RoomManager with the new PacketBuilder so room operations
             // share the same sequence counter as handshake and heartbeat packets.
             // Using an independent counter would be a protocol violation and may
             // trigger gateway replay protection.
             _roomManager = new RoomManager(
                 _packetBuilder,
-                packet => _networkThread?.SendOwned(packet),
+                packet => EncryptAndSend(packet),
                 () => _state,
                 id => SetLocalRoomPlayerId(id));  // wire local player UUID
             _roomManager.OnRoomJoined  += OnRoomManagerJoined;
@@ -472,6 +488,8 @@ namespace RTMPE.Core
 
         /// <summary>
         /// Enqueue a raw packet for transmission. Thread-safe.
+        /// The packet is AEAD-encrypted when the session is established.
+        /// A defensive copy is made internally so the caller can safely reuse its buffer.
         /// </summary>
         public void Send(byte[] data, bool reliable = false)
         {
@@ -483,7 +501,11 @@ namespace RTMPE.Core
 
             if (data == null || data.Length == 0) return;
 
-            _networkThread?.Send(data, reliable);
+            // Copy so the caller can safely reuse or discard its buffer after this call,
+            // which matches the original NetworkThread.Send(copy) contract.
+            var copy = new byte[data.Length];
+            Buffer.BlockCopy(data, 0, copy, 0, data.Length);
+            EncryptAndSend(copy);
         }
 
         // ── Handshake coroutine ────────────────────────────────────────────────
@@ -551,6 +573,28 @@ namespace RTMPE.Core
                     $"[RTMPE] Dropped packet: unsupported protocol version " +
                     $"{data[PacketProtocol.OFFSET_VERSION]} (expected {PacketProtocol.VERSION}).");
                 return;
+            }
+
+            // ── AEAD decryption (Fix: inbound decrypt pipeline) ──────────────────
+            // If FLAG_ENCRYPTED is set the gateway has wrapped the payload in a
+            // ChaCha20-Poly1305 AEAD envelope.  Decrypt before dispatching so every
+            // handler always receives plaintext — handlers are unaware of encryption.
+            //
+            // Precondition: _sessionKeys must be non-null (set during Challenge/
+            // HandshakeResponse exchange) and _cryptoId must be the gateway-assigned
+            // session_id (set during OnSessionAck).  Pre-session packets (Challenge,
+            // SessionAck, HandshakeAck) are always plaintext by gateway design, so
+            // this branch is only reachable once the session is fully established.
+            if ((data[PacketProtocol.OFFSET_FLAGS] & (byte)PacketFlags.Encrypted) != 0)
+            {
+                data = DecryptInboundPacket(data);
+                if (data == null)
+                {
+                    Debug.LogWarning(
+                        "[RTMPE] Dropped packet: AEAD authentication failed " +
+                        "(tag mismatch or no session keys).");
+                    return;
+                }
             }
 
             var packetType = (PacketType)data[PacketProtocol.OFFSET_TYPE];
@@ -1044,9 +1088,10 @@ namespace RTMPE.Core
         private void SendDisconnect()
         {
             if (_packetBuilder == null) return;
-            // Use SendOwned — BuildDisconnect returns a fresh array.
             var packet = _packetBuilder.BuildDisconnect();
-            _networkThread?.SendOwned(packet);
+            // Route through EncryptAndSend so the Disconnect packet is AEAD-encrypted
+            // when a session is active, matching gateway expectations.
+            EncryptAndSend(packet);
             LogDebug("Sent Disconnect packet.");
         }
 
@@ -1076,6 +1121,8 @@ namespace RTMPE.Core
             _localPlayerId         = 0;
             _localPlayerStringId   = null;
             _currentRoomId         = 0;
+            // Reset AEAD nonce counter so a future reconnect starts at counter = 0.
+            System.Threading.Interlocked.Exchange(ref _outboundNonceCounter, -1);
             _roomManager?.ClearState();
             _spawnManager?.ClearAll();     // Destroy all spawned objects
             _handshakeHandler?.Dispose();  // Zero key material before GC can observe it
@@ -1201,7 +1248,7 @@ namespace RTMPE.Core
                 PacketFlags.Reliable,  // variable updates need guaranteed delivery
                 payload);
 
-            _networkThread.SendOwned(packet);
+            EncryptAndSend(packet);
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -1313,7 +1360,7 @@ namespace RTMPE.Core
                 PacketFlags.None,
                 payload);
 
-            _networkThread.Send(packet);
+            EncryptAndSend(packet);
         }
 
         /// <summary>

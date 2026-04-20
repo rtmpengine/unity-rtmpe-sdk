@@ -130,13 +130,14 @@ namespace RTMPE.Core
 
         private static void WriteF32LE(byte[] buf, ref int offset, float value)
         {
-            var bits = BitConverter.GetBytes(value);
-            // BinaryPrimitives is not available in .NET Standard 2.1 Unity;
-            // BitConverter.GetBytes on LE platforms (x86, ARM LE) is already LE.
-            buf[offset++] = bits[0];
-            buf[offset++] = bits[1];
-            buf[offset++] = bits[2];
-            buf[offset++] = bits[3];
+            // Use SingleToInt32Bits + explicit byte extraction for endian-safe LE encoding.
+            // BitConverter.GetBytes(float) is platform-endian and would produce wrong byte
+            // order on big-endian platforms. This matches TransformPacketBuilder.WriteF32LE.
+            int bits = BitConverter.SingleToInt32Bits(value);
+            buf[offset++] = (byte) bits;
+            buf[offset++] = (byte)(bits >>  8);
+            buf[offset++] = (byte)(bits >> 16);
+            buf[offset++] = (byte)(bits >> 24);
         }
     }
 }

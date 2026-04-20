@@ -148,9 +148,15 @@ namespace RTMPE.Core
 
         private static float ReadF32LE(byte[] buf, ref int offset)
         {
-            float v = BitConverter.ToSingle(buf, offset);
+            // Explicit byte assembly + Int32BitsToSingle for endian-safe LE decoding.
+            // BitConverter.ToSingle(buf, offset) is platform-endian and would misread
+            // bytes on big-endian platforms. This matches TransformPacketParser.ReadF32LE.
+            int bits = buf[offset]
+                     | (buf[offset + 1] <<  8)
+                     | (buf[offset + 2] << 16)
+                     | (buf[offset + 3] << 24);
             offset += 4;
-            return v;
+            return BitConverter.Int32BitsToSingle(bits);
         }
     }
 }

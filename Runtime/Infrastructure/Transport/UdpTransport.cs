@@ -172,6 +172,30 @@ namespace RTMPE.Transport
             _socket.SendTo(data, _remoteEndPoint);
         }
 
+        /// <summary>
+        /// Send a slice of a buffer without forcing the caller to allocate a
+        /// fresh array.  Preferred in hot paths that build packets into
+        /// <see cref="System.Buffers.ArrayPool{T}"/>-rented buffers — the
+        /// pool requires the exact rented array to be returned, so callers
+        /// cannot afford to slice-copy before Send.
+        /// </summary>
+        /// <param name="buffer">Source buffer (must not be null).</param>
+        /// <param name="offset">Starting index inside <paramref name="buffer"/>.</param>
+        /// <param name="count">Number of bytes to send from <paramref name="offset"/>.</param>
+        public void Send(byte[] buffer, int offset, int count)
+        {
+            if (_socket == null)
+                throw new InvalidOperationException("Transport is not connected. Call Connect() first.");
+            if (buffer == null)
+                throw new ArgumentNullException(nameof(buffer));
+            if (offset < 0 || count < 0 || offset + count > buffer.Length)
+                throw new ArgumentOutOfRangeException(
+                    nameof(count),
+                    $"offset={offset}, count={count}, buffer.Length={buffer.Length}");
+
+            _socket.SendTo(buffer, offset, count, SocketFlags.None, _remoteEndPoint);
+        }
+
         /// <inheritdoc/>
         public override int Receive(byte[] buffer)
         {

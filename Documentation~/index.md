@@ -7,6 +7,8 @@ Welcome to the RTMPE SDK documentation.
 - [Quick Start](getting-started.md) — step-by-step guide: install, configure, connect, spawn, sync
 - [Architecture](architecture.md) — SDK layers, threading model, crypto flow, data flow diagrams
 - [Protocol Reference](protocol.md) — wire format, PacketType values, flag bits, payload layouts
+- [Troubleshooting](troubleshooting.md) — common issues and diagnostic checklists
+- [Performance Tuning](performance-tuning.md) — tick rate, memory budget, IL2CPP tips
 - [API Reference](api/index.md) — complete C# class and method reference
 - [Samples](../Samples~/BasicConnection/README.md) — runnable example projects
 - [Changelog](../CHANGELOG.md) — version history

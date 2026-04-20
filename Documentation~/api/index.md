@@ -385,7 +385,7 @@ event Action<T, T> OnValueChanged   // (previousValue, newValue)
 
 ### Available types
 
-| Class | T | Wire size | Constructor `variableId` type |
+| Class | T  | Wire size | Constructor `variableId` type |
 |-------|----|-----------|-------------------------------|
 | `NetworkVariableInt` | `int` | 4 bytes (LE i32) | `ushort` |
 | `NetworkVariableFloat` | `float` | 4 bytes (LE f32) | `ushort` |

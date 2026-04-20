@@ -795,7 +795,8 @@ bool UnregisterPrefab(uint prefabId)
 bool HasPrefab(uint prefabId)
 
 // Call Spawn after OnRoomCreated / OnRoomJoined fires.
-NetworkBehaviour Spawn(uint prefabId, Vector3 position, Quaternion rotation)
+// ownerPlayerId defaults to NetworkManager.LocalPlayerStringId when null.
+NetworkBehaviour Spawn(uint prefabId, Vector3 position, Quaternion rotation, string ownerPlayerId = null)
 
 // Pass the NetworkObjectId (ulong), not the component reference.
 void Despawn(ulong networkObjectId)
@@ -821,7 +822,7 @@ protected virtual void OnNetworkDespawn()
 ### NetworkVariable types
 
 ```csharp
-// Constructor signature: (NetworkBehaviour owner, int variableId, T initialValue)
+// Constructor signature: (NetworkBehaviour owner, ushort variableId, T initialValue)
 var hp       = new NetworkVariableInt(this,    0, 100);
 var speed    = new NetworkVariableFloat(this,  1, 0f);
 var alive    = new NetworkVariableBool(this,   2, true);

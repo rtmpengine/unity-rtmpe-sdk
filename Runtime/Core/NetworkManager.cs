@@ -1000,6 +1000,27 @@ namespace RTMPE.Core
                 return;
             }
 
+            // Phase 2 (2026-04-22): enforce Ed25519 server pinning when the
+            // operator has opted in via NetworkSettings.requirePinnedServerPublicKey.
+            //
+            // Rationale: ValidateChallenge() below always verifies the signature,
+            // but without a pinned key the verification only asserts that the
+            // server holds SOME Ed25519 private key — which is trivially true
+            // for any rogue gateway.  Requiring a pinned public key binds the
+            // session to an operator-chosen identity; a MITM with its own valid
+            // keypair is rejected.  We fail BEFORE invoking ValidateChallenge
+            // so the intent is unambiguous in logs and tests.
+            if (_settings != null && _settings.requirePinnedServerPublicKey && pinnedKey == null)
+            {
+                Debug.LogError(
+                    "[RTMPE] NetworkSettings.requirePinnedServerPublicKey is true but " +
+                    "pinnedServerPublicKeyHex is empty. Refusing to complete handshake — " +
+                    "any valid Ed25519 server would otherwise be accepted. Set the pinned " +
+                    "public key in your NetworkSettings asset, or disable " +
+                    "requirePinnedServerPublicKey for unpinned dev builds.");
+                return;
+            }
+
             if (!_handshakeHandler.ValidateChallenge(
                     payload,
                     out _,                  // serverEphemeralPub (stored inside handler)

@@ -117,6 +117,52 @@ namespace RTMPE.Core
         }
 
         /// <summary>
+        /// Remove entries whose <c>GameObject</c> has been destroyed by Unity
+        /// (scene unload, external <c>Object.Destroy</c>, explicit scene load).
+        /// Returns the number of evicted entries.
+        ///
+        /// <para>Unlike <see cref="Get"/>, which lazily evicts one stale entry
+        /// per call, this method sweeps the full dictionary in a single pass.
+        /// Call it after scene transitions to keep the registry tight.</para>
+        ///
+        /// <para>Does NOT fire <see cref="NetworkBehaviour.OnNetworkDespawn"/> —
+        /// the managed reference is unusable by the time this runs (Unity's
+        /// null-equality returns true even before the C# field is set to null),
+        /// so calling SetSpawned(false) would fault the user's handler.  Apps
+        /// that care about despawn callbacks must destroy via
+        /// <see cref="SpawnManager.Despawn"/> rather than letting a scene load
+        /// reap the GameObject.</para>
+        ///
+        /// <para>Caller must be on the Unity main thread — uses Unity's null
+        /// equality which is not safe from background threads.</para>
+        /// </summary>
+        public int PruneDestroyed()
+        {
+            List<ulong> staleIds = null;
+            lock (_lock)
+            {
+                // Single pass: collect keys whose GameObject has been Unity-
+                // destroyed.  Mutating a Dictionary while iterating throws
+                // InvalidOperationException, so we accumulate into a scratch
+                // list first and remove afterwards.
+                foreach (var kv in _objects)
+                {
+                    // Unity's overloaded == compares destroyed UnityEngine.Object
+                    // to null even when the managed reference is still live.
+                    if (kv.Value == null)
+                    {
+                        (staleIds ??= new List<ulong>()).Add(kv.Key);
+                    }
+                }
+
+                if (staleIds == null) return 0;
+
+                foreach (var id in staleIds) _objects.Remove(id);
+                return staleIds.Count;
+            }
+        }
+
+        /// <summary>
         /// Clear all registered objects.
         ///
         /// Calls <see cref="NetworkBehaviour.SetSpawned(bool)"/> with

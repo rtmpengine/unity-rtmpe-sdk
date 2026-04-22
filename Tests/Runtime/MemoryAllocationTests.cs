@@ -2,7 +2,7 @@
 //
 // NUnit Edit-Mode tests that assert the hot path stays allocation-free.
 // Runs under the Mono scripting backend (the IL2CPP variant is covered by
-// future M2 test additions).  Uses GC.GetAllocatedBytesForCurrentThread
+// future test additions).  Uses GC.GetAllocatedBytesForCurrentThread
 // which is available on .NET Standard 2.1 / Unity 2021.3+.
 
 using System;

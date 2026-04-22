@@ -87,13 +87,30 @@ namespace RTMPE.Sync
         // despite out-of-order UDP delivery or duplicate packets.
         private double _latestTimestamp = double.MinValue;
 
+        // Lock guarding all ring-buffer mutations and reads (_buffer, _head,
+        // _latestTimestamp).  The SDK convention routes packet callbacks through
+        // MainThreadDispatcher, so in practice AddState() runs on the Unity main
+        // thread; but the PUBLIC API allows any caller, and Update() also reads
+        // on the main thread — a misbehaving integration (e.g. custom transport
+        // forgetting to marshal) would otherwise corrupt the ring buffer with no
+        // diagnostic.  The lock is uncontended in the common case (same thread
+        // always), so overhead is one interlocked CAS per call (~20 ns).
+        private readonly object _syncRoot = new object();
+
         // ── Properties (test-visible) ──────────────────────────────────────────
 
         /// <summary>
         /// Number of states currently held in the delay buffer.
         /// Useful for Inspector debug display and unit tests.
         /// </summary>
-        public int BufferCount => _buffer.Count;
+        public int BufferCount
+        {
+            // Read under the same lock as AddState/TryInterpolate so the
+            // returned count is coherent with the internal state (not a
+            // racing mid-write List.Count that briefly observes the wrong
+            // value during Add/Clear).
+            get { lock (_syncRoot) return _buffer.Count; }
+        }
 
         /// <summary>
         /// The configured interpolation delay in seconds.
@@ -120,23 +137,26 @@ namespace RTMPE.Sync
         /// </param>
         public void AddState(TransformState state, double timestamp)
         {
-            // Discard out-of-order and duplicate states — only strictly newer
-            // timestamps advance the ring buffer.
-            if (timestamp <= _latestTimestamp) return;
-            _latestTimestamp = timestamp;
+            lock (_syncRoot)
+            {
+                // Discard out-of-order and duplicate states — only strictly newer
+                // timestamps advance the ring buffer.
+                if (timestamp <= _latestTimestamp) return;
+                _latestTimestamp = timestamp;
 
-            // Fill the backing list to capacity on initial population, then
-            // overwrite the oldest slot in-place — O(1) regardless of buffer size.
-            if (_buffer.Count < _bufferSize)
-            {
-                _buffer.Add(new TimestampedState { Timestamp = timestamp, State = state });
-                // _head stays 0 while filling; oldest is always index 0 during fill.
-            }
-            else
-            {
-                // Overwrite the oldest slot and advance the ring head.
-                _buffer[_head] = new TimestampedState { Timestamp = timestamp, State = state };
-                _head = (_head + 1) % _bufferSize;
+                // Fill the backing list to capacity on initial population, then
+                // overwrite the oldest slot in-place — O(1) regardless of buffer size.
+                if (_buffer.Count < _bufferSize)
+                {
+                    _buffer.Add(new TimestampedState { Timestamp = timestamp, State = state });
+                    // _head stays 0 while filling; oldest is always index 0 during fill.
+                }
+                else
+                {
+                    // Overwrite the oldest slot and advance the ring head.
+                    _buffer[_head] = new TimestampedState { Timestamp = timestamp, State = state };
+                    _head = (_head + 1) % _bufferSize;
+                }
             }
         }
 
@@ -169,33 +189,42 @@ namespace RTMPE.Sync
         {
             result = default;
 
-            // Need at least two states to define an interpolation segment.
-            if (_buffer.Count < 2) return false;
-
-            // With the ring buffer, states are stored in logical order starting at
-            // _head.  A helper that reads logical index i maps to physical:
-            //   physical = (_head + i) % _buffer.Count.
-            // Walk forward (oldest → newest) to find the bracketing pair.
-            int count = _buffer.Count;
-            int fromIndex = -1;
-            for (int i = 0; i < count - 1; i++)
+            // Snapshot the two buffered states we need while holding the lock,
+            // then release it before the Vector/Quaternion math.  This keeps
+            // the critical section tiny (no floating-point work under the lock)
+            // and ensures AddState() is never blocked by per-frame arithmetic.
+            TimestampedState from;
+            TimestampedState to;
+            lock (_syncRoot)
             {
-                int iA = (_head + i)     % count;
-                int iB = (_head + i + 1) % count;
-                if (_buffer[iA].Timestamp <= renderTime && _buffer[iB].Timestamp >= renderTime)
+                // Need at least two states to define an interpolation segment.
+                if (_buffer.Count < 2) return false;
+
+                // With the ring buffer, states are stored in logical order starting at
+                // _head.  A helper that reads logical index i maps to physical:
+                //   physical = (_head + i) % _buffer.Count.
+                // Walk forward (oldest → newest) to find the bracketing pair.
+                int count = _buffer.Count;
+                int fromIndex = -1;
+                for (int i = 0; i < count - 1; i++)
                 {
-                    fromIndex = i;
-                    break;
+                    int iA = (_head + i)     % count;
+                    int iB = (_head + i + 1) % count;
+                    if (_buffer[iA].Timestamp <= renderTime && _buffer[iB].Timestamp >= renderTime)
+                    {
+                        fromIndex = i;
+                        break;
+                    }
                 }
+
+                // renderTime is outside the buffered range — no interpolation possible.
+                if (fromIndex < 0) return false;
+
+                int physFrom = (_head + fromIndex)     % count;
+                int physTo   = (_head + fromIndex + 1) % count;
+                from = _buffer[physFrom];
+                to   = _buffer[physTo];
             }
-
-            // renderTime is outside the buffered range — no interpolation possible.
-            if (fromIndex < 0) return false;
-
-            int physFrom = (_head + fromIndex)     % count;
-            int physTo   = (_head + fromIndex + 1) % count;
-            TimestampedState from = _buffer[physFrom];
-            TimestampedState to   = _buffer[physTo];
 
             // Guard against division by zero when two states share the same
             // timestamp (e.g. two packets decoded in the same frame).
@@ -268,12 +297,18 @@ namespace RTMPE.Sync
             float interpolationDelay = 0.1f,
             bool  interpolateScale   = false)
         {
-            _bufferSize          = bufferSize;
-            _interpolationDelay  = interpolationDelay;
-            _interpolateScale    = interpolateScale;
-            // Reset ring-buffer state for a consistent starting condition.
-            _buffer.Clear();
-            _head = 0;
+            lock (_syncRoot)
+            {
+                _bufferSize          = bufferSize;
+                _interpolationDelay  = interpolationDelay;
+                _interpolateScale    = interpolateScale;
+                // Reset ring-buffer state for a consistent starting condition.
+                _buffer.Clear();
+                _head = 0;
+                // Reset the high-water timestamp so subsequent AddState calls
+                // with small timestamps (test vectors) are not silently dropped.
+                _latestTimestamp = double.MinValue;
+            }
         }
     }
 }

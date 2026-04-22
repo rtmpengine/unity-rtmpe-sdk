@@ -2,7 +2,7 @@
 //
 // NUnit Edit-Mode tests covering UdpTransport edge cases not exercised by
 // higher-level integration tests: construction validation, send-before-connect,
-// dispose idempotency, the M1-SDK-1.1 slice-send overload, and concurrent
+// dispose idempotency, the slice-send overload, and concurrent
 // send/receive safety.
 
 using System;

@@ -255,6 +255,35 @@ namespace RTMPE.Core
         }
 
         /// <summary>
+        /// Force every tracked <see cref="NetworkVariableBase"/> back into the
+        /// dirty set so the next 30 Hz flush transmits its current value, even
+        /// when the stored value has not changed since the last send.
+        ///
+        /// <para>Used by the SDK to bootstrap late joiners: when another
+        /// player joins the room, every existing owner client calls this on
+        /// each of their owned objects so the new player sees a full state
+        /// snapshot on the next tick instead of waiting for a future
+        /// value-change event that may never come for static variables.</para>
+        ///
+        /// <para>Safe to call on non-owned or non-spawned objects — the dirty
+        /// flag is still set, but <see cref="FlushDirtyVariables"/> is a no-op
+        /// under those conditions so the flag will remain sticky until this
+        /// object is owned + spawned again.  Callers that want to avoid that
+        /// corner case should filter via <see cref="IsOwner"/> and
+        /// <see cref="IsSpawned"/> before calling.</para>
+        /// </summary>
+        internal void MarkAllVariablesDirty()
+        {
+            // NetworkVariableBase.IsDirty setter is protected, so we use
+            // the public MarkDirtyForResync hook below that each variable
+            // exposes through its own public API via a new internal method.
+            foreach (var v in _trackedVariables)
+            {
+                v.MarkDirtyForResync();
+            }
+        }
+
+        /// <summary>
         /// Apply a single variable update received from the server.
         /// Called by <c>NetworkManager.HandleVariableUpdatePacket</c> for each
         /// [var_id:2 LE][value_len:2 LE][value_bytes:N] entry in the payload.

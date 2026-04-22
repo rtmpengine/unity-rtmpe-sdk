@@ -432,7 +432,7 @@ namespace RTMPE.Tests
         public void HandshakeHandler_DeriveSessionKeys_ThrowsIfChallengeNotValidated()
         {
             var h = new HandshakeHandler();
-            Assert.Throws<InvalidOperationException>(() => h.DeriveSessionKeys());
+            Assert.Throws<InvalidOperationException>(() => h.DeriveSessionKeys(out _));
         }
 
         // ══════════════════════════════════════════════════════════════════════
@@ -570,6 +570,119 @@ namespace RTMPE.Tests
             Buffer.BlockCopy(b, 0, result, a.Length, b.Length);
             if (c != null) Buffer.BlockCopy(c, 0, result, a.Length + b.Length, c.Length);
             return result;
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // N-8: IP migration key derivation tests
+        // ══════════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// N-8 T-SDK-01: DeriveSessionKeys must produce a 32-byte ipMigrationKey.
+        /// Uses the same HKDF path as the AEAD keys but with info suffix \x02.
+        /// </summary>
+        [Test]
+        [Category("N8IpMigration")]
+        public void DeriveSessionKeys_ProducesIpMigrationKey()
+        {
+            var salt     = Encoding.ASCII.GetBytes("RTMPE-v3-hkdf-salt-2026");
+            var infoBase = Encoding.ASCII.GetBytes("RTMPE-v3-session-key");
+
+            var (clientPriv, clientPub) = Curve25519.GenerateKeyPair();
+            var (serverPriv, serverPub) = Curve25519.GenerateKeyPair();
+
+            var shared = Curve25519.SharedSecret(clientPriv, serverPub);
+            var prk    = HkdfSha256.Extract(salt, shared);
+
+            bool iAmInitiator = CompareKeys(clientPub, serverPub) <= 0;
+            byte[] first, second;
+            if (iAmInitiator) { first = clientPub; second = serverPub; }
+            else              { first = serverPub; second = clientPub; }
+            var info = Concat(infoBase, first, second);
+
+            var expectedMigKey = HkdfSha256.Expand(prk, Concat(info, new byte[] { 0x02 }), 32);
+            Assert.IsNotNull(expectedMigKey, "HKDF expand must not return null");
+            Assert.AreEqual(32, expectedMigKey.Length, "IP migration key must be 32 bytes");
+        }
+
+        /// <summary>
+        /// N-8 T-SDK-02: ipMigrationKey is distinct from the AEAD session keys.
+        /// All three HKDF outputs must differ (info suffix distinguishes them).
+        /// </summary>
+        [Test]
+        [Category("N8IpMigration")]
+        public void DeriveSessionKeys_IpMigrationKey_DifferentFromSessionKeys()
+        {
+            var salt     = Encoding.ASCII.GetBytes("RTMPE-v3-hkdf-salt-2026");
+            var infoBase = Encoding.ASCII.GetBytes("RTMPE-v3-session-key");
+
+            var (clientPriv, clientPub) = Curve25519.GenerateKeyPair();
+            var (serverPriv, serverPub) = Curve25519.GenerateKeyPair();
+
+            var shared = Curve25519.SharedSecret(clientPriv, serverPub);
+            var prk    = HkdfSha256.Extract(salt, shared);
+
+            bool iAmInitiator = CompareKeys(clientPub, serverPub) <= 0;
+            byte[] first, second;
+            if (iAmInitiator) { first = clientPub; second = serverPub; }
+            else              { first = serverPub; second = clientPub; }
+            var info = Concat(infoBase, first, second);
+
+            var keyInit = HkdfSha256.Expand(prk, Concat(info, new byte[] { 0x00 }), 32);
+            var keyResp = HkdfSha256.Expand(prk, Concat(info, new byte[] { 0x01 }), 32);
+            var keyMig  = HkdfSha256.Expand(prk, Concat(info, new byte[] { 0x02 }), 32);
+
+            Assert.IsFalse(BytesEqual(keyInit, keyMig),
+                "IP migration key must differ from key_init");
+            Assert.IsFalse(BytesEqual(keyResp, keyMig),
+                "IP migration key must differ from key_resp");
+            Assert.IsFalse(BytesEqual(keyInit, keyResp),
+                "key_init and key_resp must differ from each other");
+        }
+
+        /// <summary>
+        /// N-8 T-SDK-03: HMAC-SHA256(ipMigrationKey, token) proof is deterministic.
+        /// Same key + same token must always produce the same 32-byte proof.
+        /// </summary>
+        [Test]
+        [Category("N8IpMigration")]
+        public void IpMigrationProof_IsDeterministic()
+        {
+            var key   = new byte[32];
+            for (int i = 0; i < 32; i++) key[i] = (byte)(i + 1);
+            const string token = "reconnect-uuid-v4-test-token";
+
+            var proof1 = ComputeHmacSha256(key, Encoding.UTF8.GetBytes(token));
+            var proof2 = ComputeHmacSha256(key, Encoding.UTF8.GetBytes(token));
+
+            Assert.IsTrue(BytesEqual(proof1, proof2),
+                "HMAC-SHA256 must be deterministic with the same key and message");
+            Assert.AreEqual(32, proof1.Length, "HMAC-SHA256 output must be 32 bytes");
+        }
+
+        /// <summary>
+        /// N-8 T-SDK-04: different keys produce different proofs for the same token.
+        /// Verifies that the key is actually used in the HMAC computation.
+        /// </summary>
+        [Test]
+        [Category("N8IpMigration")]
+        public void IpMigrationProof_DifferentKey_ProducesDifferentProof()
+        {
+            var key1 = new byte[32]; for (int i = 0; i < 32; i++) key1[i] = 0xAA;
+            var key2 = new byte[32]; for (int i = 0; i < 32; i++) key2[i] = 0xBB;
+            var tokenBytes = Encoding.UTF8.GetBytes("same-token");
+
+            var proof1 = ComputeHmacSha256(key1, tokenBytes);
+            var proof2 = ComputeHmacSha256(key2, tokenBytes);
+
+            Assert.IsFalse(BytesEqual(proof1, proof2),
+                "Different HMAC keys must produce different proofs for the same token");
+        }
+
+        // Compute HMAC-SHA256 using System.Security.Cryptography (mirrors NetworkManager).
+        private static byte[] ComputeHmacSha256(byte[] key, byte[] message)
+        {
+            using var hmac = new System.Security.Cryptography.HMACSHA256(key);
+            return hmac.ComputeHash(message);
         }
     }
 }

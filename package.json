@@ -1,6 +1,6 @@
 {
     "name": "com.rtmpe.sdk",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "displayName": "RTMPE SDK",
     "description": "Real-Time Multiplayer Engine — Unity client SDK for converting single-player games to multiplayer in under 15 minutes.",
     "unity": "6000.0",

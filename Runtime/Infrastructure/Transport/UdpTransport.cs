@@ -144,13 +144,37 @@ namespace RTMPE.Transport
                 using var probe = new Socket(family, SocketType.Dgram, ProtocolType.Udp);
                 probe.Connect(_remoteEndPoint);
                 var probeLocal = probe.LocalEndPoint as IPEndPoint;
-                _localEndPoint = probeLocal != null
-                    ? new IPEndPoint(probeLocal.Address, boundPort)
-                    : new IPEndPoint(loopback, boundPort);
+                if (probeLocal != null)
+                {
+                    _localEndPoint = new IPEndPoint(probeLocal.Address, boundPort);
+                }
+                else
+                {
+                    // Should not happen on any supported platform, but guard defensively.
+                    UnityEngine.Debug.LogWarning(
+                        "[RTMPE] UdpTransport: routing probe returned a null LocalEndPoint " +
+                        "after connect — falling back to loopback as source IP. " +
+                        "HandshakeInit AAD will use loopback; the handshake will fail " +
+                        "when connecting to a non-loopback server.");
+                    _localEndPoint = new IPEndPoint(loopback, boundPort);
+                }
             }
-            catch
+            catch (Exception ex)
             {
-                // Fallback: use loopback IP (works for localhost dev/test).
+                // The routing probe is a best-effort kernel lookup (no data is sent).
+                // It can fail on hosts with no default route (isolated test containers,
+                // offline CI, certain mobile network transitions).
+                // When it does, we fall back to loopback as the source IP, which means
+                // HandshakeInit AAD will be [0x04][127][0][0][1][port LE] instead of
+                // the real interface IP — the gateway will reject the handshake with
+                // an AEAD auth failure.  Log a prominent warning so the failure is
+                // diagnosable rather than appearing as a silent handshake timeout.
+                UnityEngine.Debug.LogWarning(
+                    $"[RTMPE] UdpTransport: routing probe failed " +
+                    $"({ex.GetType().Name}: {ex.Message}). " +
+                    "Falling back to loopback as source IP. " +
+                    "If connecting to a remote server the handshake will fail; " +
+                    "this is expected in isolated test environments with no default route.");
                 _localEndPoint = new IPEndPoint(loopback, boundPort);
             }
         }
@@ -168,8 +192,22 @@ namespace RTMPE.Transport
         {
             if (_socket == null)
                 throw new InvalidOperationException("Transport is not connected. Call Connect() first.");
+            if (data == null)
+                throw new ArgumentNullException(nameof(data));
 
-            _socket.SendTo(data, _remoteEndPoint);
+            // `Socket.SendTo` for UDP returns the number of bytes accepted by the
+            // kernel.  For datagram sockets this is either the full payload
+            // length or a SocketException is thrown (EMSGSIZE for oversize,
+            // ENOBUFS for send-buffer exhaustion, etc.).  Microsoft's contract
+            // does not formally permit a partial return, but this check is
+            // cheap and catches platform quirks (e.g. Mono/IL2CPP edge cases)
+            // before the symptom manifests as mysteriously dropped packets.
+            int sent = _socket.SendTo(data, _remoteEndPoint);
+            if (sent != data.Length)
+            {
+                throw new System.Net.Sockets.SocketException(
+                    (int)System.Net.Sockets.SocketError.MessageSize);
+            }
         }
 
         /// <summary>
@@ -193,7 +231,13 @@ namespace RTMPE.Transport
                     nameof(count),
                     $"offset={offset}, count={count}, buffer.Length={buffer.Length}");
 
-            _socket.SendTo(buffer, offset, count, SocketFlags.None, _remoteEndPoint);
+            // See the note in Send(byte[]) for why the return value is asserted.
+            int sent = _socket.SendTo(buffer, offset, count, SocketFlags.None, _remoteEndPoint);
+            if (sent != count)
+            {
+                throw new System.Net.Sockets.SocketException(
+                    (int)System.Net.Sockets.SocketError.MessageSize);
+            }
         }
 
         /// <inheritdoc/>

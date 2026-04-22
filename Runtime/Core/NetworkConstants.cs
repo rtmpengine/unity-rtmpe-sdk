@@ -70,6 +70,18 @@ namespace RTMPE.Core
         HandshakeResponse = 0x07,   // Client → Server: [client_pub_key:32]
         SessionAck        = 0x08,   // Server → Client: [crypto_id:4 LE][jwt_len:2 LE][jwt:N][reconnect_len:2 LE][reconnect:N]
 
+        // ── N-1: Reconnect flow ───────────────────────────────────────────────
+        // Client presents a previously-issued reconnect token to resume a
+        // session without a full PSK re-authentication.  Server replies with a
+        // normal Challenge (0x06) and the rest of the flow continues as usual.
+        //
+        // ReconnectInit payload: [token_len:2 LE][token:N]
+        //
+        // MUST stay in sync with modules/gateway/src/packet/header.rs
+        // (PacketType::ReconnectInit = 0x09, ReconnectAck = 0x0A).
+        ReconnectInit     = 0x09,   // Client → Server: resume previous session via reconnect token
+        ReconnectAck      = 0x0A,   // Reserved for future single-round-trip variant (unused today)
+
         // ── Keep-alive ────────────────────────────────────────────────────────
         Heartbeat         = 0x03,   // Client → Server: periodic keepalive
         HeartbeatAck      = 0x04,   // Server → Client: keepalive acknowledged

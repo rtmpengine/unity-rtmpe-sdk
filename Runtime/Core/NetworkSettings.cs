@@ -50,6 +50,16 @@ namespace RTMPE.Core
         [Range(1, 128)]
         public int tickRate = 30;
 
+        // ── Reconnect behaviour ─────────────────────────────────────────────────
+
+        [Header("Reconnect")]
+        [Tooltip(
+            "When true (default), after a successful token-based Reconnect() the SDK automatically " +
+            "rejoins the last room (by ID) that was active immediately before the disconnect. " +
+            "Fires RoomManager.OnRoomJoined as usual. " +
+            "Set to false if your app wants to prompt the user or run room-selection UI on reconnect.")]
+        public bool autoRejoinLastRoomOnReconnect = true;
+
         // ── Buffers ─────────────────────────────────────────────────────────────
 
         [Header("Buffers")]

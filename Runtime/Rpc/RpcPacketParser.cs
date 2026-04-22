@@ -160,9 +160,17 @@ namespace RTMPE.Rpc
         }
 
         /// <summary>
-        /// Build an RPC response payload (for server-side or test use).
+        /// Build an RPC response payload.  This method is the server-side /
+        /// test-fixture counterpart to <see cref="TryParseResponse"/>.
+        ///
+        /// Visibility: <c>internal</c>.  Client code (game scripts that import
+        /// the SDK) must NOT construct response packets — doing so bypasses the
+        /// server-authoritative trust model and could corrupt a peer's state
+        /// if the bytes reach the network.  Unit tests access this method via
+        /// <c>InternalsVisibleTo("RTMPE.SDK.Tests")</c> declared in
+        /// <c>AssemblyInfo.cs</c>.
         /// </summary>
-        public static byte[] BuildResponse(
+        internal static byte[] BuildResponse(
             uint requestId,
             uint methodId,
             ulong senderId,

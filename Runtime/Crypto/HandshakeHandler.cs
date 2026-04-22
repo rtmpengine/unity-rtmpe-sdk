@@ -127,14 +127,22 @@ namespace RTMPE.Crypto
         }
 
         /// <summary>
-        /// Complete the X25519 ECDH and derive two directional session keys via HKDF-SHA256.
+        /// Complete the X25519 ECDH and derive directional session keys + IP migration key
+        /// via HKDF-SHA256.
         ///
         /// Must be called after <see cref="ValidateChallenge"/> succeeds.
-        /// Returns <see langword="null"/> if the challenge has not been validated yet
-        /// or if the ECDH shared secret is degenerate (all-zero).
+        /// Returns <see langword="null"/> if the ECDH shared secret is degenerate (all-zero).
         /// </summary>
-        public SessionKeys DeriveSessionKeys()
+        /// <param name="ipMigrationKey">
+        /// Receives the 32-byte N-8 IP migration HMAC key derived with info suffix <c>\x02</c>.
+        /// Used to compute <c>HMAC-SHA256(ipMigrationKey, reconnect_token)</c> proofs so the
+        /// client can reconnect from a new IP (WiFi → 4G) without re-authenticating.
+        /// Set to <see langword="null"/> when the method returns <see langword="null"/>.
+        /// </param>
+        public SessionKeys DeriveSessionKeys(out byte[] ipMigrationKey)
         {
+            ipMigrationKey = null;
+
             if (_serverEphemeralPub == null)
                 throw new InvalidOperationException(
                     "ValidateChallenge must succeed before DeriveSessionKeys can be called.");
@@ -144,9 +152,6 @@ namespace RTMPE.Crypto
             if (sharedSecret == null) return null; // degenerate key — reject
 
             SessionKeys result;
-            // Declare prk outside the try block so the finally clause can
-            // zero it.  prk is derived from the ECDH shared secret and must not
-            // linger in the managed heap after the session keys are produced.
             byte[] prk = null;
             try
             {
@@ -163,10 +168,13 @@ namespace RTMPE.Crypto
                 Buffer.BlockCopy(first,        0, info, HkdfInfoBase.Length, 32);
                 Buffer.BlockCopy(second,       0, info, HkdfInfoBase.Length + 32, 32);
 
-                // HKDF-Extract
+                // HKDF-Extract — single PRK for all three expansions.
                 prk = HkdfSha256.Extract(HkdfSalt, sharedSecret);
 
-                // HKDF-Expand × 2: info+\x00 → initiator key, info+\x01 → responder key
+                // HKDF-Expand × 3:
+                //   info+\x00 → initiator AEAD key
+                //   info+\x01 → responder AEAD key
+                //   info+\x02 → IP migration HMAC key (N-8)
                 var infoInit = new byte[info.Length + 1];
                 Buffer.BlockCopy(info, 0, infoInit, 0, info.Length);
                 infoInit[info.Length] = 0x00;
@@ -177,20 +185,19 @@ namespace RTMPE.Crypto
                 infoResp[info.Length] = 0x01;
                 var keyResp = HkdfSha256.Expand(prk, infoResp, 32);
 
+                var infoMig = new byte[info.Length + 1];
+                Buffer.BlockCopy(info, 0, infoMig, 0, info.Length);
+                infoMig[info.Length] = 0x02;
+                ipMigrationKey = HkdfSha256.Expand(prk, infoMig, 32);
+
                 // Assign encrypt/decrypt based on initiator role (mirrors the Rust gateway logic).
-                // Initiator sends with key_init and receives with key_resp; responder is opposite.
                 result = iAmInitiator
                     ? new SessionKeys(encryptKey: keyInit, decryptKey: keyResp)
                     : new SessionKeys(encryptKey: keyResp, decryptKey: keyInit);
             }
             finally
             {
-                // Zero the ECDH shared secret immediately after key derivation.
-                // The secret is no longer needed once PRK is derived; clearing it in-place
-                // limits the lifetime of raw DH output in the managed heap.
                 Array.Clear(sharedSecret, 0, sharedSecret.Length);
-                // Zero the PRK (HKDF pseudo-random key derived from the
-                // shared secret).  prk may be null if Extract threw before assignment.
                 if (prk != null) Array.Clear(prk, 0, prk.Length);
             }
             return result;

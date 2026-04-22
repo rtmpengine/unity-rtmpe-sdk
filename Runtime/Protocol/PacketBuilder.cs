@@ -54,6 +54,54 @@ namespace RTMPE.Protocol
         }
 
         /// <summary>
+        /// **N-1** — build a <c>ReconnectInit</c> packet (type 0x09).
+        /// <para>
+        /// Payload layout: <c>[token_len: u16 LE][token: N bytes UTF-8]</c>.
+        /// </para>
+        /// <para>
+        /// The gateway consumes the token atomically (single-use), verifies
+        /// the source IP matches the binding recorded at issue time, and
+        /// responds with a <see cref="PacketType.Challenge"/> that the client
+        /// answers with a normal <see cref="PacketType.HandshakeResponse"/>.
+        /// </para>
+        /// </summary>
+        /// <param name="reconnectToken">
+        /// The token obtained from the previous <c>SessionAck</c>.  Must be a
+        /// non-empty UTF-8 string no longer than 128 bytes (the gateway caps
+        /// token length at 128).
+        /// </param>
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="reconnectToken"/> is null, empty, or
+        /// its UTF-8 encoding exceeds 128 bytes.
+        /// </exception>
+        public byte[] BuildReconnectInit(string reconnectToken, byte[] proof = null)
+        {
+            if (string.IsNullOrEmpty(reconnectToken))
+                throw new ArgumentException("reconnectToken must not be null or empty.", nameof(reconnectToken));
+
+            var tokenBytes = System.Text.Encoding.UTF8.GetBytes(reconnectToken);
+            if (tokenBytes.Length > 128)
+                throw new ArgumentException(
+                    $"reconnectToken UTF-8 length {tokenBytes.Length} exceeds 128 bytes (gateway cap).",
+                    nameof(reconnectToken));
+
+            if (proof != null && proof.Length != 32)
+                throw new ArgumentException("proof must be exactly 32 bytes.", nameof(proof));
+
+            // Payload: [token_len: u16 LE][token: N][proof: 32 optional]
+            // The gateway detects the proof by checking payload.len() > 2 + token_len.
+            int proofLen = proof != null ? 32 : 0;
+            var payload = new byte[2 + tokenBytes.Length + proofLen];
+            payload[0] = (byte)(tokenBytes.Length & 0xFF);
+            payload[1] = (byte)((tokenBytes.Length >> 8) & 0xFF);
+            Buffer.BlockCopy(tokenBytes, 0, payload, 2, tokenBytes.Length);
+            if (proof != null)
+                Buffer.BlockCopy(proof, 0, payload, 2 + tokenBytes.Length, 32);
+
+            return Build(PacketType.ReconnectInit, PacketFlags.None, payload);
+        }
+
+        /// <summary>
         /// Build a <c>Heartbeat</c> packet (type 0x03) with no payload.
         /// </summary>
         public byte[] BuildHeartbeat()

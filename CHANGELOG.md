@@ -8,6 +8,80 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
 
 ---
 
+## [1.1.0] — 2026-04-22
+
+**Gameplay-readiness release — five targeted fixes that close the remaining
+"day-of-launch" gaps in v1.0. All changes are additive; no breaking API
+changes. Defaults preserve v1.0 behaviour.**
+
+### Late-join state snapshot (Critical)
+- `Runtime/Core/SpawnManager.cs` — `MarkAllVariablesDirtyForResync()` re-flags every
+  `NetworkVariable` on every locally-owned, spawned object so the next 30 Hz flush
+  retransmits full state.
+- `Runtime/Core/NetworkBehaviour.cs` — `MarkAllVariablesDirty()` internal hook.
+- `Runtime/Sync/NetworkVariable.cs` — `NetworkVariableBase.MarkDirtyForResync()`
+  forces the dirty flag without firing `OnValueChanged`.
+- Auto-wired to `RoomManager.OnPlayerJoined` — new joiners see correct
+  `NetworkVariable` values within ~33 ms instead of waiting for the next
+  value change.
+
+### Pluggable transport factory (High)
+- `Runtime/Core/NetworkManager.cs` — `SetTransportFactory(TransportFactoryFn)`,
+  `ClearTransportFactory()`, `HasCustomTransportFactory` static API.
+- `TransportFactoryFn` delegate receives the active `NetworkSettings`.
+- Opens the door to WebGL builds via user-provided WebSocket transport and
+  enables clean mock-transport injection for integration tests.
+- Factory exceptions and null returns fall back to the built-in
+  `UdpTransport` with a diagnostic log.
+
+### Auto room re-join after reconnect (High)
+- `Runtime/Core/NetworkManager.cs` — new properties `LastRoomId`, `LastRoomCode`
+  preserved across token-preserving session clears.
+- `OnAutoRejoinAttempt(string roomId)` event.
+- `Runtime/Core/NetworkSettings.cs` — new `autoRejoinLastRoomOnReconnect` bool
+  (default `true`).
+- After a successful `Reconnect()` → `SessionAck`, the SDK automatically calls
+  `Rooms.JoinRoom(LastRoomId)` when the setting is enabled. The snapshot is
+  wiped on explicit `Disconnect()` or `LeaveRoom()` so those never auto-rejoin.
+
+### Scene transition handling (Medium)
+- `Runtime/Core/NetworkObjectRegistry.cs` — `PruneDestroyed()` sweeps the
+  dictionary in one pass and evicts entries whose Unity `GameObject` has been
+  destroyed. Returns the number of evictions.
+- `Runtime/Core/NetworkManager.cs` — subscribes to
+  `UnityEngine.SceneManagement.SceneManager.sceneUnloaded` and `sceneLoaded`,
+  calling `PruneDestroyed()` to prevent slow leaks under additive /
+  single-mode scene loads.
+
+### Object pool interface (Medium)
+- `Runtime/Core/INetworkObjectPool.cs` — new interface (`Acquire`, `Release`).
+- `Runtime/Core/SpawnManager.cs` — `SetObjectPool(INetworkObjectPool)`,
+  `ClearObjectPool()`, `ObjectPool` property. Both `CreateLocal` and
+  `DestroyLocal` route through the pool when installed; fall back to
+  `Object.Instantiate`/`Object.Destroy` otherwise.
+- `SpawnManager` now tracks the prefab ID of every live object so the pool
+  receives a stable `prefabId` at `Release` time.
+
+### Refactor
+- `NetworkManager` consolidates `RoomManager` / `SpawnManager` wiring into a
+  single private `RecreateRoomAndSpawnManagers()` helper, eliminating three
+  near-identical wiring blocks in `InitialiseNetwork`, `Connect`, and
+  `Reconnect`. Guarantees identical event topology on all three paths.
+
+### Testing
+- `Tests/Runtime/CryptoAndNetworkTests.cs` — 16 new tests across 5 fixtures:
+  - `LateJoinResyncTests` (3) — dirty-reflag semantics, owner-only filter.
+  - `PluggableTransportTests` (4) — factory install, fallback on null / throw.
+  - `NetworkObjectRegistryPruneTests` (2) — stale-entry eviction.
+  - `ObjectPoolTests` (2) — pool routing with and without installed pool.
+  - `AutoRejoinTests` (5) — `LastRoomId` preservation + default semantics.
+
+### Documentation
+- Complete refresh of all seven guides in `Documentation~/` plus the top-level
+  `README.md` and `CHANGELOG.md` to reflect v1.1 API surface.
+
+---
+
 ## [1.0.0] — 2026-04-17
 
 **Production release — RTMPE SDK v1.0.0 complete.**

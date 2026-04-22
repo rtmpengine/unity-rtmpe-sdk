@@ -99,6 +99,17 @@ namespace RTMPE.Core
             "Leaving blank skips pinning and trusts any valid Ed25519 signature.")]
         public string pinnedServerPublicKeyHex = "";
 
+        [Tooltip(
+            "Phase 2 (2026-04-22): reject the handshake entirely when pinnedServerPublicKeyHex " +
+            "is empty.\n\n" +
+            "When FALSE (default, back-compat): blank pinning trusts any valid Ed25519 signature " +
+            "— convenient for development but vulnerable to a substituted-key MITM if an attacker " +
+            "controls a rogue gateway with its own valid Ed25519 identity.\n\n" +
+            "When TRUE (recommended for production): the SDK refuses to complete a handshake " +
+            "unless pinnedServerPublicKeyHex is set, and emits a clear error so the operator " +
+            "cannot ship a build that silently accepts any gateway.")]
+        public bool requirePinnedServerPublicKey;
+
         // ── Derived ──────────────────────────────────────────────────────────────
 
         /// <summary>Tick interval in seconds (<c>1 / tickRate</c>).</summary>

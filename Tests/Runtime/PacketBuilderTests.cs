@@ -213,5 +213,56 @@ namespace RTMPE.Tests
             var pkt = _builder.BuildHeartbeat();
             Assert.AreEqual(0x00, pkt[4], "flags byte should be 0x00 for standard heartbeat.");
         }
+
+        // ── N-8: BuildReconnectInit with HMAC proof ───────────────────────────
+
+        [Test]
+        public void BuildReconnectInit_WithProof_AppendsProofAfterToken()
+        {
+            const string token = "test-reconnect-token";
+            var proof = new byte[32];
+            for (int i = 0; i < 32; i++) proof[i] = (byte)(i + 1);
+
+            var pkt = _builder.BuildReconnectInit(token, proof);
+
+            // Header is 13 bytes; payload starts at offset 13.
+            var tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
+            int tokenLen = tokenBytes.Length;
+            int payloadOffset = 13;
+
+            int declaredLen = pkt[payloadOffset] | (pkt[payloadOffset + 1] << 8);
+            Assert.AreEqual(tokenLen, declaredLen, "token_len prefix must match token length");
+
+            // Token bytes at payload[2..2+tokenLen]
+            for (int i = 0; i < tokenLen; i++)
+                Assert.AreEqual(tokenBytes[i], pkt[payloadOffset + 2 + i],
+                    $"token byte mismatch at index {i}");
+
+            // Proof bytes at payload[2+tokenLen..2+tokenLen+32]
+            for (int i = 0; i < 32; i++)
+                Assert.AreEqual(proof[i], pkt[payloadOffset + 2 + tokenLen + i],
+                    $"proof byte mismatch at index {i}");
+        }
+
+        [Test]
+        public void BuildReconnectInit_WithoutProof_HasNoProofBytes()
+        {
+            const string token = "test-token-no-proof";
+            var pkt = _builder.BuildReconnectInit(token); // no proof
+
+            var tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
+            // Payload = 2 (len) + tokenLen; no extra bytes
+            Assert.AreEqual(13 + 2 + tokenBytes.Length, pkt.Length,
+                "packet without proof must not have extra bytes");
+        }
+
+        [Test]
+        public void BuildReconnectInit_WithProof_WrongProofLength_Throws()
+        {
+            Assert.Throws<ArgumentException>(() =>
+                _builder.BuildReconnectInit("tok", new byte[16]));
+            Assert.Throws<ArgumentException>(() =>
+                _builder.BuildReconnectInit("tok", new byte[33]));
+        }
     }
 }

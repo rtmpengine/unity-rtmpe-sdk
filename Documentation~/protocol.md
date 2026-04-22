@@ -1,6 +1,6 @@
 # RTMPE SDK — Protocol Reference
 
-> SDK Version: `com.rtmpe.sdk 1.0.0`  
+> SDK Version: `com.rtmpe.sdk 1.1.0`
 > Protocol Version: **v3** — Magic `0x5254` ("RT")
 
 ---
@@ -60,7 +60,7 @@ The `flags` byte is a bitmask. Multiple flags may be set simultaneously.
 
 | Bit    | Hex    | Name          | Meaning |
 |--------|--------|---------------|---------|
-| Bit 0  | `0x01` | `Compressed`  | Payload was compressed with LZ4 (reserved, not yet active) |
+| Bit 0  | `0x01` | `Compressed`  | Payload is LZ4-compressed (applied before AEAD when `CompressIfBeneficial` shrinks the payload) |
 | Bit 1  | `0x02` | `Encrypted`   | Payload is ChaCha20-Poly1305 AEAD encrypted |
 | Bit 2  | `0x04` | `Reliable`    | Packet is sent over the reliable KCP channel (port 7778) |
 
@@ -71,32 +71,41 @@ PacketFlags.Encrypted  = 0x02
 PacketFlags.Reliable   = 0x04
 ```
 
+**Compression order:** `Lz4Compressor.CompressIfBeneficial` is applied to the
+plaintext payload *before* AEAD sealing. The `Compressed` flag is set in both
+the header and the AAD so the gateway verifies it was not tampered with in
+transit. The SDK decompresses transparently; handlers always receive
+uncompressed plaintext.
+
 ---
 
 ## 3. Packet Types
 
 | Hex    | Name               | Direction | Channel   | Payload format |
 |--------|--------------------|-----------|-----------|----------------|
-| `0x01` | `Handshake`        | C↔S       | KCP       | FlatBuffers *(legacy, W3–W5 only)* |
-| `0x02` | `HandshakeAck`     | S→C       | KCP       | FlatBuffers *(legacy, W3–W5 only)* |
-| `0x03` | `Heartbeat`        | C→S       | UDP       | FlatBuffers |
-| `0x04` | `HeartbeatAck`     | S→C       | UDP       | FlatBuffers |
+| `0x01` | `Handshake`        | C↔S       | KCP       | FlatBuffers *(legacy, pre-v3 only)* |
+| `0x02` | `HandshakeAck`     | S→C       | KCP       | FlatBuffers *(legacy, pre-v3 only)* |
+| `0x03` | `Heartbeat`        | C→S       | UDP       | empty — see §13 |
+| `0x04` | `HeartbeatAck`     | S→C       | UDP       | empty — see §13 |
 | `0x05` | `HandshakeInit`    | C→S       | KCP       | **Raw binary** — see §5 |
 | `0x06` | `Challenge`        | S→C       | KCP       | **Raw binary** — see §5 |
 | `0x07` | `HandshakeResponse`| C→S       | KCP       | **Raw binary** — see §5 |
 | `0x08` | `SessionAck`       | S→C       | KCP       | **Raw binary** — see §5 |
-| `0x10` | `Data`             | C→S       | UDP       | FlatBuffers |
-| `0x11` | `DataAck`          | S→C       | UDP       | FlatBuffers |
-| `0x20` | `RoomCreate`       | C→S       | KCP       | Custom binary — see §8 |
-| `0x21` | `RoomJoin`         | C→S       | KCP       | Custom binary — see §8 |
-| `0x22` | `RoomLeave`        | C→S       | KCP       | Custom binary — see §8 |
-| `0x23` | `RoomList`         | C→S       | KCP       | Custom binary — see §8 |
-| `0x30` | `Spawn`            | S→C       | KCP       | Custom binary — see §9 |
-| `0x31` | `Despawn`          | S→C       | KCP       | Custom binary — see §9 |
+| `0x09` | `ReconnectInit`    | C→S       | KCP       | **Raw binary** — see §5 (token + optional HMAC proof) |
+| `0x0A` | `ReconnectAck`     | reserved  | KCP       | reserved — future single-round-trip variant |
+| `0x10` | `Data`             | C↔S       | UDP       | application-defined |
+| `0x11` | `DataAck`          | S→C       | UDP       | empty |
+| `0x20` | `RoomCreate`       | C↔S       | KCP       | Custom binary — see §8 |
+| `0x21` | `RoomJoin`         | C↔S       | KCP       | Custom binary — see §8 |
+| `0x22` | `RoomLeave`        | C↔S       | KCP       | Custom binary — see §8 |
+| `0x23` | `RoomList`         | C↔S       | KCP       | Custom binary — see §8 |
+| `0x30` | `Spawn`            | C↔S       | KCP       | Custom binary — see §9 |
+| `0x31` | `Despawn`          | C↔S       | KCP       | Custom binary — see §9 |
 | `0x40` | `StateSync`        | S→C       | UDP       | Custom binary — see §10 |
+| `0x41` | `VariableUpdate`   | C→S→C     | KCP       | Custom binary — see §12 (client → server relays to room) |
 | `0x50` | `Rpc`              | C→S       | KCP       | Custom binary — see §11 |
 | `0x51` | `RpcResponse`      | S→C       | KCP       | Custom binary — see §11 |
-| `0xFF` | `Disconnect`       | C↔S       | KCP       | FlatBuffers — see §14 |
+| `0xFF` | `Disconnect`       | C↔S       | KCP       | empty — see §14 |
 
 > **C↔S** = bidirectional. **C→S** = client to server. **S→C** = server to client.
 
@@ -125,9 +134,22 @@ Client encrypts its API key with the PSK (`GATEWAY_API_KEY_ENCRYPTION_KEY_HEX`):
 ```
 plaintext = [api_key_len:2 LE u16][api_key_bytes:N]
 nonce     = random 12 bytes (from RandomNumberGenerator.GetBytes)
-AAD       = [0x04][source_ip:4 bytes][source_port:2 LE u16]  (IPv4)
 payload   = [nonce:12][ChaCha20-Poly1305.Seal(PSK, nonce, AAD, plaintext)]
 ```
+
+The AAD binds the encrypted API key to the client's source endpoint, so a
+relayed or spoofed `HandshakeInit` is rejected by the gateway:
+
+| Family | AAD layout (binary)                                          | Length  |
+|--------|--------------------------------------------------------------|---------|
+| IPv4   | `[0x04][ip:4 octets, network order][port:2 LE u16]`          | 7 bytes |
+| IPv6   | `[0x06][ip:16 octets, network order][port:2 LE u16]`         | 19 bytes |
+
+The first byte (`0x04` / `0x06`) is the IP-family discriminator and matches
+the gateway's AAD parser. The `UdpTransport` routing probe (see
+[Architecture §3](architecture.md#3-transport-layer)) supplies the real
+outgoing interface address; a failed probe falls back to loopback and the
+gateway will reject the handshake with an AEAD tag mismatch.
 
 ### Step 2 — Challenge
 
@@ -158,25 +180,50 @@ payload = [crypto_id:4 LE][jwt_len:2 LE][jwt:jwt_len][rc_len:2 LE][reconnect_tok
 
 - `crypto_id` — a server-assigned `u32` used as the high 4 bytes of every subsequent AEAD nonce.
 - `jwt` — HS256-signed JWT session token (UTF-8 encoded).
-- `reconnect_token` — opaque token for reconnect (future use).
+- `reconnect_token` — opaque single-use token that resumes the session via
+  `ReconnectInit` (0x09). Used by `NetworkManager.Reconnect()`. Also used by
+  the HKDF N-8 path to derive an IP-migration HMAC key.
 
-After Step 4, both sides have derived two directional HKDF-SHA256 keys (see
+After Step 4, both sides have derived two directional HKDF-SHA256 keys plus
+a third HKDF expansion for the IP-migration HMAC key (see
 [Architecture §4](architecture.md#4-crypto-layer)). All subsequent packets use
 AEAD encryption.
 
+### Reconnect shortcut — ReconnectInit (0x09)
+
+After a transient drop (heartbeat timeout, transport error, IP migration), a
+client holding a valid `reconnect_token` may call `NetworkManager.Reconnect()`
+and skip the PSK path. The server replies with a normal `Challenge` (0x06),
+and the full ECDH exchange resumes from that point.
+
+```
+payload = [token_len:2 LE u16][token:N UTF-8]
+          [proof:32]?    (optional HMAC-SHA256 of token, for IP migration)
+```
+
+- `token` — the UTF-8 `reconnect_token` issued at the last `SessionAck`.
+- `proof` — HMAC-SHA256(ip_migration_key, token_bytes). Only present when the
+  SDK holds a non-null `ip_migration_key` — included so the gateway accepts a
+  reconnect from a new source IP (WiFi ↔ 4G handoff).
+
+The token is **single-use**: the gateway consumes it atomically on receipt. On
+timeout the SDK clears its stored token so repeated attempts do not feed stale
+tokens that always fail.
+
 ---
 
-## 5. Raw Binary Packets (0x05–0x08)
+## 5. Raw Binary Packets (0x05–0x09)
 
-> ⚠ **Critical:** Packets `0x05` through `0x08` use a custom binary layout, **NOT FlatBuffers**.
+> ⚠ **Critical:** Packets `0x05` through `0x09` use a custom binary layout, **NOT FlatBuffers**.
 > Attempting to parse them as FlatBuffers tables will produce garbage or a crash.
 
-| Packet         | Exact byte layout |
-|----------------|-------------------|
-| `HandshakeInit`| `[nonce:12][ct+tag:N]` — N = plaintext + 16 (Poly1305 tag) |
-| `Challenge`    | `[eph_pub:32][static_pub:32][ed25519_sig:64]` = 128 bytes exactly |
+| Packet           | Exact byte layout |
+|------------------|-------------------|
+| `HandshakeInit`  | `[nonce:12][ct+tag:N]` — N = plaintext + 16 (Poly1305 tag) |
+| `Challenge`      | `[eph_pub:32][static_pub:32][ed25519_sig:64]` = 128 bytes exactly |
 | `HandshakeResponse` | `[client_pub:32]` = 32 bytes exactly |
-| `SessionAck`   | `[crypto_id:4][jwt_len:2][jwt:N][rc_len:2][rc:R]` (first AEAD-encrypted) |
+| `SessionAck`     | `[crypto_id:4][jwt_len:2][jwt:N][rc_len:2][rc:R]` (first AEAD-encrypted) |
+| `ReconnectInit`  | `[token_len:2][token:N][proof:32]?` — see §4 reconnect shortcut |
 
 ---
 
@@ -188,18 +235,28 @@ is set in the header flags.
 ### Encryption (outbound)
 
 ```
-1. Build plaintext:
+1. Optionally compress the application payload:
+     compressed = Lz4Compressor.CompressIfBeneficial(payload, out didCompress)
+     if didCompress:
+         application_payload = compressed
+         flags |= 0x01                  // set FLAG_COMPRESSED BEFORE AAD
+     else:
+         application_payload = payload   // unchanged
+
+2. Build plaintext (sealed under AEAD):
      plaintext = [origSeq:4 LE u32][application_payload]
 
-2. Compute AAD (2 bytes):
+3. Compute AAD (2 bytes) — using flags AFTER compression step but BEFORE step 5:
      aad[0] = packetType
-     aad[1] = flags WITHOUT 0x02 (before setting Encrypted flag)
+     aad[1] = flags & ~0x02             // EXCLUDES Encrypted;
+                                        // INCLUDES Compressed (0x01) when set;
+                                        // INCLUDES Reliable (0x04) when set.
 
-3. Build nonce (12 bytes):
+4. Build nonce (12 bytes):
      nonce[0..7]  = outboundNonceCounter (u64 LE, starts at 0, increments per packet)
      nonce[8..11] = cryptoId             (u32 LE, from SessionAck)
 
-4. Encrypt:
+5. Encrypt:
      ciphertext = ChaCha20-Poly1305.Seal(
          key   = SessionKeys.EncryptKey,
          nonce = nonce,
@@ -208,11 +265,16 @@ is set in the header flags.
      )
      // ciphertext length = plaintext length + 16 (Poly1305 tag appended)
 
-5. Update header:
-     header.sequence = nonce counter   (receiver reconstructs nonce from this)
-     header.flags   |= 0x02            (set Encrypted flag)
+6. Update header:
+     header.sequence    = nonce counter   (receiver reconstructs nonce from this)
+     header.flags      |= 0x02            (set Encrypted flag — AFTER AAD is fixed)
      header.payload_len = len(ciphertext)
 ```
+
+> **Why `FLAG_COMPRESSED` is covered by AAD:** a MITM that strips the flag
+> would cause the receiver to skip decompression and treat raw compressed
+> bytes as the application payload. Including the flag in AAD causes Poly1305
+> to reject any such tampering.
 
 ### Decryption (inbound)
 
@@ -223,7 +285,9 @@ is set in the header flags.
 
 2. Compute AAD (2 bytes):
      aad[0] = packetType
-     aad[1] = header.flags & ~0x02   (strip Encrypted bit)
+     aad[1] = header.flags & ~0x02   // strip Encrypted bit only.
+                                     // Preserves FLAG_COMPRESSED (0x01) and
+                                     // FLAG_RELIABLE (0x04) exactly as sent.
 
 3. Decrypt:
      plaintext = ChaCha20-Poly1305.Open(
@@ -234,10 +298,21 @@ is set in the header flags.
      )
      // Poly1305 tag verification failure → drop packet silently
 
-4. Recover original sequence:
+4. Recover original sequence and payload:
      origSeq          = plaintext[0..3]  (u32 LE)
      header.sequence  = origSeq          (restored)
-     payload          = plaintext[4..]
+     inner_payload    = plaintext[4..]
+
+5. Decompress if flagged:
+     if (header.flags & 0x01) != 0:          // FLAG_COMPRESSED was set
+         payload = Lz4Compressor.Decompress(inner_payload)
+     else:
+         payload = inner_payload
+
+6. Clear flags and restore payload_len:
+     header.flags      &= ~(0x01 | 0x02)   // strip Encrypted + Compressed;
+                                           // downstream handlers always see plaintext.
+     header.payload_len = len(payload)
 ```
 
 ---
@@ -256,7 +331,21 @@ Offset  Size  Content
 > The counter is a `u64` on the gateway (Rust) but the SDK header `sequence` field
 > is `u32`. The SDK stores the counter in bytes `[0..3]` LE with bytes `[4..7]` = `0x00`
 > (zero-extended from u32 to u64). This provides 2³² ≈ 4 billion unique nonces per
-> session — sufficient for continuous 30 Hz game traffic for 16+ hours.
+> session — sufficient for continuous 30 Hz game traffic for ~4.5 years.
+
+### Nonce exhaustion (hard stop)
+
+The SDK tracks its outbound counter as a `long` starting at `-1`. The first
+`Interlocked.Increment` returns `0`. Two thresholds mirror the Rust gateway's
+`SEQUENCE_EXHAUSTION_THRESHOLD` / `NEAR_EXHAUSTION_MARGIN`:
+
+| Threshold                          | Value (constant)              | Effect |
+|------------------------------------|-------------------------------|--------|
+| `OutboundNonceExhaustionThreshold` | `(long)uint.MaxValue + 1`     | Hard stop — SDK calls `Disconnect()` and logs an error |
+| Near-exhaustion warning            | threshold − `1_048_576`       | `Debug.LogWarning` — ~9.7 h remaining at 30 Hz |
+
+Any packet that would use a counter value ≥ the hard stop is refused; the
+session must be fully re-established.
 
 **Anti-replay:** The gateway maintains a 128-bit sliding window per session. A packet
 whose nonce counter falls outside the window (replayed or too old) is dropped without
@@ -385,33 +474,6 @@ snapshot arrives at 30 Hz.
 
 Maximum size: 8 + 1 + 12 + 16 + 12 = **49 bytes** (all components present).
 
-### NetworkVariable update payload (within Data 0x10)
-
-```
-[object_id:8 LE u64]
-[var_count:1 u8]
-per variable:
-  [var_id:2 LE u16]
-  [value_len:2 LE u16]
-  [value_bytes:value_len]
-```
-
-Variable value encodings by type:
-
-| Type                    | Encoding |
-|-------------------------|----------|
-| `NetworkVariableInt`    | 4 bytes LE i32 (`BinaryWriter.Write(int)`) |
-| `NetworkVariableFloat`  | 4 bytes LE f32 (`BinaryWriter.Write(float)`) |
-| `NetworkVariableBool`   | 1 byte — `0x01` true, `0x00` false |
-| `NetworkVariableVector3`| 12 bytes — `[x:4][y:4][z:4]` LE f32 |
-| `NetworkVariableQuaternion`| 16 bytes — `[x:4][y:4][z:4][w:4]` LE f32 |
-| `NetworkVariableString` | N bytes — UTF-8, no length prefix (use `value_len`) |
-
-> `BinaryWriter.Write(float)` and `BinaryWriter.Write(int)` produce little-endian output
-> on all Unity platforms (x86-64, ARM LE, iOS, Android). These types use the BCL writer
-> directly and are safe. Spawn/transform floats use the explicit `SingleToInt32Bits`
-> pattern for additional clarity and big-endian portability.
-
 ---
 
 ## 11. RPC Payloads
@@ -449,16 +511,52 @@ RPC packets travel over KCP (reliable), encrypted with AEAD.
 
 ---
 
-## 12. NetworkVariable Wire Format
+## 12. NetworkVariable Wire Format (VariableUpdate — 0x41)
 
-Standalone variable-only updates (not bundled with a StateDelta) use the framing:
+`VariableUpdate` (0x41) is the dedicated packet type for replicating dirty
+`NetworkVariable` values. It travels over the reliable KCP channel and is
+flushed at 30 Hz by the SDK for every owned, spawned object that has at least
+one dirty variable. On the server it is relayed to all other clients in the room.
+
+### Top-level payload
 
 ```
-[var_id:2 LE u16][value_len:2 LE u16][value_bytes:value_len]
+[object_id:8 LE u64]
+[var_count:1 u8]
+per variable:
+  [var_id:2 LE u16]
+  [value_len:2 LE u16]
+  [value_bytes:value_len]
 ```
 
-This framing allows incremental decoding: the reader advances by `value_len` per
-variable without needing to know the type ahead of time.
+The 4-byte `[var_id][value_len]` prefix lets receivers skip entries with
+unknown variable IDs without losing alignment for the rest of the packet.
+
+### Per-type value encoding
+
+| Type                          | Encoding |
+|-------------------------------|----------|
+| `NetworkVariableInt`          | 4 bytes LE i32 (`BinaryWriter.Write(int)`) |
+| `NetworkVariableFloat`        | 4 bytes LE f32 (`BinaryWriter.Write(float)`) |
+| `NetworkVariableBool`         | 1 byte — `0x01` true, `0x00` false |
+| `NetworkVariableVector3`      | 12 bytes — `[x:4][y:4][z:4]` LE f32 |
+| `NetworkVariableQuaternion`   | 16 bytes — `[x:4][y:4][z:4][w:4]` LE f32 |
+| `NetworkVariableString`       | `[utf8_len:2 LE u16][utf8_bytes:N]` — the 2-byte length prefix is part of `value_bytes` |
+
+> `BinaryWriter.Write(float)` and `BinaryWriter.Write(int)` produce little-endian output
+> on all Unity platforms (x86-64, ARM LE, iOS, Android). Spawn/transform floats use the
+> explicit `SingleToInt32Bits` pattern for additional clarity and big-endian portability.
+
+### Late-join snapshot (v1.1)
+
+When another player joins the current room, the SDK automatically re-flags
+every `NetworkVariable` on every locally-owned, spawned object as dirty. The
+next 30 Hz flush emits a `VariableUpdate` that carries the full current value
+of every tracked variable, so the newly-joined client sees correct state
+within ~33 ms instead of waiting for the next application-level value change.
+
+The wire format is identical to a regular flush — there is no separate
+"snapshot" packet type.
 
 ---
 
@@ -472,7 +570,11 @@ sufficient for keep-alive purposes; the gateway identifies them by `packet_type 
 | `Heartbeat`    | 0x03 | C→S | Every `HeartbeatIntervalMs` (default 5 000 ms) |
 | `HeartbeatAck` | 0x04 | S→C | Immediately on receipt of Heartbeat |
 
-Three consecutive missed `HeartbeatAck` responses trigger `DisconnectReason.Timeout`.
+Three consecutive missed `HeartbeatAck` responses trigger an `OnDisconnected`
+event with `DisconnectReason.ConnectionLost`. (The `Timeout` reason is reserved
+for a failed **initial** handshake or **reconnect** that exceeds
+`NetworkSettings.connectionTimeoutMs` — see `ConnectionTimeoutRoutine` in
+`NetworkManager.cs`.)
 
 ---
 
@@ -491,4 +593,4 @@ The packet carries no payload; the reason is implicit (connection closure).
 
 ---
 
-*RTMPE SDK 1.0.0 — [Getting Started](getting-started.md) — [Architecture](architecture.md) — [API Reference](api/index.md)*
+*RTMPE SDK 1.1.0 — [Getting Started](getting-started.md) — [Architecture](architecture.md) — [API Reference](api/index.md)*

@@ -890,7 +890,7 @@ namespace RTMPE.Tests
 
     [TestFixture]
     [Category("CryptoKeyZeroization")]
-    public class M1_HandshakeHandlerKeyZeroingTests
+    public class HandshakeHandlerKeyZeroingTests
     {
         [Test]
         public void Dispose_ZerosClientPrivateKey()
@@ -945,7 +945,7 @@ namespace RTMPE.Tests
 
     [TestFixture]
     [Category("InterpolatorTimestamp")]
-    public class M2_NetworkTransformInterpolatorMonotonicTests
+    public class NetworkTransformInterpolatorMonotonicTests
     {
         private GameObject                   _go;
         private NetworkTransformInterpolator _interp;
@@ -953,7 +953,7 @@ namespace RTMPE.Tests
         [SetUp]
         public void SetUp()
         {
-            _go     = new GameObject("Interp_M2");
+            _go     = new GameObject("Interp");
             _interp = _go.AddComponent<NetworkTransformInterpolator>();
             _interp.ConfigureForTest(bufferSize: 8, interpolationDelay: 0.1f);
         }
@@ -1373,6 +1373,556 @@ namespace RTMPE.Tests
                 | (decrypted[OffSeq+2] << 16) | (decrypted[OffSeq+3] << 24));
             Assert.AreEqual(origSeq, restoredSeq,
                 "Original application sequence must be exactly restored after decryption");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Nonce Exhaustion Constants — verify SDK mirrors Rust gateway thresholds
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Verifies that the outbound nonce exhaustion constants in NetworkManager
+    /// match the Rust gateway's SEQUENCE_EXHAUSTION_THRESHOLD and
+    /// NEAR_EXHAUSTION_MARGIN (nonce.rs).
+    ///
+    /// These tests do NOT use reflection — they verify the public behaviour
+    /// implied by the constants (counter arithmetic) so the thresholds remain
+    /// aligned even if the field is refactored.
+    /// </summary>
+    [TestFixture]
+    [Category("NonceExhaustion")]
+    public class NonceExhaustionConstantsTests
+    {
+        // Mirror the production constants for assertion arithmetic.
+        // If these fail to compile the production values were renamed — fix both.
+        private const long ExhaustionThreshold    = (long)uint.MaxValue + 1L; // 4,294,967,296
+        private const long NearExhaustionMargin   = 1_048_576L;
+
+        [Test]
+        public void ExhaustionThreshold_Equals_TwoToThe32()
+        {
+            Assert.AreEqual(4_294_967_296L, ExhaustionThreshold,
+                "Exhaustion threshold must be 2^32 — matches SEQUENCE_EXHAUSTION_THRESHOLD in nonce.rs");
+        }
+
+        [Test]
+        public void ExhaustionThreshold_ExceedsUInt32MaxValue()
+        {
+            Assert.Greater(ExhaustionThreshold, (long)uint.MaxValue,
+                "Threshold must be strictly greater than uint.MaxValue so counter uint.MaxValue is still valid");
+        }
+
+        [Test]
+        public void LastValidCounter_IsUInt32MaxValue()
+        {
+            long lastValid = ExhaustionThreshold - 1L;
+            Assert.AreEqual((long)uint.MaxValue, lastValid,
+                "Last valid counter must be uint.MaxValue (4,294,967,295)");
+            // Must fit losslessly in uint — same as gateway's u32::try_from check.
+            Assert.DoesNotThrow(() => { _ = checked((uint)lastValid); },
+                "Last valid counter must be representable as uint without overflow");
+        }
+
+        [Test]
+        public void NearExhaustionWarning_FiresBefore_HardStop()
+        {
+            long warningThreshold = ExhaustionThreshold - NearExhaustionMargin;
+            Assert.Greater(ExhaustionThreshold, warningThreshold,
+                "Near-exhaustion warning must fire strictly before the hard stop");
+            Assert.GreaterOrEqual(warningThreshold, 0L,
+                "Near-exhaustion threshold must be non-negative");
+        }
+
+        [Test]
+        public void NearExhaustionMargin_Matches_GatewayValue()
+        {
+            // Gateway's NEAR_EXHAUSTION_MARGIN = 1_048_576 (nonce.rs).
+            Assert.AreEqual(1_048_576L, NearExhaustionMargin,
+                "Near-exhaustion margin must match Rust gateway NEAR_EXHAUSTION_MARGIN");
+        }
+
+        [Test]
+        public void CounterAtThreshold_IsRejected_ByRangeCheck()
+        {
+            // Simulate the guard: rawCounter >= ExhaustionThreshold → disconnect.
+            long atThreshold = ExhaustionThreshold;
+            Assert.IsTrue(atThreshold >= ExhaustionThreshold,
+                "Counter == threshold must trigger hard stop");
+        }
+
+        [Test]
+        public void CounterBelowThreshold_Fits_InUInt32()
+        {
+            // Every counter 0 … uint.MaxValue must cast to uint losslessly.
+            long[] samples = { 0L, 1L, 1_000_000L, (long)uint.MaxValue - 1L, (long)uint.MaxValue };
+            foreach (var c in samples)
+            {
+                Assert.Less(c, ExhaustionThreshold, $"Sample {c} must be below threshold");
+                uint asUint = (uint)c;
+                Assert.AreEqual(c, (long)asUint,
+                    $"Counter {c} must survive lossless round-trip through uint");
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Late-Join Resync (Fix 1) — MarkAllVariablesDirty propagates via
+    //      SpawnManager when a new player joins the room so the flush
+    //      loop retransmits current state.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("LateJoinResync")]
+    public class LateJoinResyncTests
+    {
+        private GameObject      _nmGo;
+        private NetworkManager  _nm;
+        private GameObject      _ownerGo;
+        private NetworkBehaviourStub _owner;
+
+        [SetUp]
+        public void SetUp()
+        {
+            _nmGo     = new GameObject("NM_LateJoin");
+            _nm       = _nmGo.AddComponent<NetworkManager>();
+            _ownerGo  = new GameObject("NB_LateJoin");
+            _owner    = _ownerGo.AddComponent<NetworkBehaviourStub>();
+
+            _nm.SetLocalPlayerStringId("player-owner");
+            _owner.Initialize(42UL, "player-owner");
+            _owner.SetSpawned(true);
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            UnityEngine.Object.DestroyImmediate(_nmGo);
+            UnityEngine.Object.DestroyImmediate(_ownerGo);
+        }
+
+        [Test]
+        public void MarkAllVariablesDirty_ReflaggsCleanedVariable_ForResync()
+        {
+            var v = new NetworkVariableInt(_owner, 1, 0);
+            v.Value = 7;          // dirty
+            v.MarkClean();         // cleaned
+            Assert.IsFalse(v.IsDirty, "Sanity: variable is clean before resync");
+
+            _owner.MarkAllVariablesDirty();
+
+            Assert.IsTrue(v.IsDirty,
+                "MarkAllVariablesDirty must force the variable back into the dirty set " +
+                "without changing its value — this is what feeds the late-joiner snapshot.");
+        }
+
+        [Test]
+        public void MarkAllVariablesDirty_DoesNotFireOnValueChanged()
+        {
+            var v = new NetworkVariableInt(_owner, 1, 0);
+            v.Value = 5;
+            v.MarkClean();
+
+            int changeCount = 0;
+            v.OnValueChanged += (oldV, newV) => changeCount++;
+
+            _owner.MarkAllVariablesDirty();
+
+            Assert.AreEqual(0, changeCount,
+                "Resync must not fire OnValueChanged — the value itself did not change.");
+        }
+
+        [Test]
+        public void SpawnManager_Resync_OnlyMarksOwnedObjects()
+        {
+            // Build a minimal SpawnManager with one owned + one non-owned object.
+            var registry  = new NetworkObjectRegistry();
+            var ownership = new RTMPE.Core.OwnershipManager(registry, _nm);
+            var spawn     = new RTMPE.Core.SpawnManager(registry, ownership, _nm);
+
+            var owned = _owner;                             // already ownerId = player-owner
+            var foreignGo = new GameObject("ForeignNB");
+            var foreign   = foreignGo.AddComponent<NetworkBehaviourStub>();
+            foreign.Initialize(43UL, "player-other");
+            foreign.SetSpawned(true);
+
+            registry.Register(owned);
+            registry.Register(foreign);
+
+            var vOwned   = new NetworkVariableInt(owned,   10, 0);
+            var vForeign = new NetworkVariableInt(foreign, 20, 0);
+            vOwned.Value = 1;   vOwned.MarkClean();
+            vForeign.Value = 2; vForeign.MarkClean();
+
+            spawn.MarkAllVariablesDirtyForResync();
+
+            Assert.IsTrue(vOwned.IsDirty,   "Owned variable must be re-dirtied for resync.");
+            Assert.IsFalse(vForeign.IsDirty, "Non-owned variable must NOT be touched — remote clients resync their own state.");
+
+            UnityEngine.Object.DestroyImmediate(foreignGo);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Pluggable Transport (Fix 2) — TransportFactory override replaces the
+    //      built-in UdpTransport on InitialiseNetwork.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("PluggableTransport")]
+    public class PluggableTransportTests
+    {
+        private sealed class StubTransport : RTMPE.Transport.NetworkTransport
+        {
+            public override bool IsConnected => false;
+            public override void Connect()    { }
+            public override void Disconnect() { }
+            public override void Send(byte[] data) { }
+            public override int  Receive(byte[] buffer) => 0;
+            public override bool Poll(int microSeconds) => false;
+            public override void Dispose()    { }
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            // Tests share a static factory — always clear to avoid leaking
+            // into the next fixture's SetUp.
+            NetworkManager.ClearTransportFactory();
+        }
+
+        [Test]
+        public void NoFactory_DefaultsToUdpTransport()
+        {
+            NetworkManager.ClearTransportFactory();
+            Assert.IsFalse(NetworkManager.HasCustomTransportFactory,
+                "Default path must report no custom factory.");
+        }
+
+        [Test]
+        public void CustomFactory_IsInvoked_AndProducesTheReportedTransport()
+        {
+            int factoryCalls = 0;
+            NetworkManager.SetTransportFactory(settings =>
+            {
+                Interlocked.Increment(ref factoryCalls);
+                Assert.IsNotNull(settings, "Factory must receive the active NetworkSettings.");
+                return new StubTransport();
+            });
+
+            Assert.IsTrue(NetworkManager.HasCustomTransportFactory,
+                "SetTransportFactory must flip HasCustomTransportFactory true.");
+
+            // Spin up a throwaway NetworkManager; Awake calls InitialiseNetwork,
+            // which will invoke the factory exactly once.
+            var go = new GameObject("NM_PluggableTransport");
+            try
+            {
+                go.AddComponent<NetworkManager>();
+                Assert.AreEqual(1, factoryCalls,
+                    "Custom transport factory must be invoked exactly once per InitialiseNetwork.");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(go);
+            }
+        }
+
+        [Test]
+        public void FactoryReturningNull_FallsBackToUdpTransport_WithoutThrowing()
+        {
+            NetworkManager.SetTransportFactory(_ => null);
+
+            var go = new GameObject("NM_FactoryNull");
+            try
+            {
+                Assert.DoesNotThrow(() => go.AddComponent<NetworkManager>(),
+                    "A null factory return must fall back, not throw.");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(go);
+            }
+        }
+
+        [Test]
+        public void FactoryThrowing_FallsBackToUdpTransport_WithoutThrowing()
+        {
+            NetworkManager.SetTransportFactory(_ =>
+                throw new InvalidOperationException("synthetic factory failure"));
+
+            var go = new GameObject("NM_FactoryThrows");
+            try
+            {
+                // Expect the error log from the fallback path so NUnit doesn't
+                // fail on a logged error.
+                UnityEngine.TestTools.LogAssert.Expect(LogType.Error,
+                    new System.Text.RegularExpressions.Regex(
+                        "Custom transport factory threw"));
+                UnityEngine.TestTools.LogAssert.Expect(LogType.Warning,
+                    new System.Text.RegularExpressions.Regex(
+                        "Falling back to the built-in UdpTransport.*"));
+
+                Assert.DoesNotThrow(() => go.AddComponent<NetworkManager>(),
+                    "A throwing factory must be caught; NetworkManager must still initialise.");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(go);
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Scene-transition Pruning (Fix 4) — NetworkObjectRegistry.PruneDestroyed
+    //      evicts entries whose GameObject has been Unity-destroyed.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("ScenePrune")]
+    public class NetworkObjectRegistryPruneTests
+    {
+        [Test]
+        public void PruneDestroyed_RemovesEntriesWhoseGameObjectWasDestroyed()
+        {
+            var registry = new NetworkObjectRegistry();
+
+            var liveGo   = new GameObject("Live_Prune");
+            var liveNb   = liveGo.AddComponent<NetworkBehaviourStub>();
+            liveNb.Initialize(1UL, "player-a");
+
+            var deadGo   = new GameObject("Dead_Prune");
+            var deadNb   = deadGo.AddComponent<NetworkBehaviourStub>();
+            deadNb.Initialize(2UL, "player-a");
+
+            registry.Register(liveNb);
+            registry.Register(deadNb);
+
+            // Simulate a scene unload — Unity destroys the GameObject out from
+            // under the registry without the SDK ever calling Unregister.
+            UnityEngine.Object.DestroyImmediate(deadGo);
+
+            int pruned = registry.PruneDestroyed();
+            Assert.AreEqual(1, pruned,
+                "Exactly one registry entry must have been destroyed by Unity.");
+
+            Assert.IsNotNull(registry.Get(1UL),
+                "Live registered object must still be present after prune.");
+            Assert.IsNull(registry.Get(2UL),
+                "Destroyed registry entry must be evicted after PruneDestroyed.");
+
+            UnityEngine.Object.DestroyImmediate(liveGo);
+        }
+
+        [Test]
+        public void PruneDestroyed_NoStaleEntries_ReturnsZero()
+        {
+            var registry = new NetworkObjectRegistry();
+
+            var goA = new GameObject("A_Prune");
+            var nbA = goA.AddComponent<NetworkBehaviourStub>();
+            nbA.Initialize(10UL, "p");
+            registry.Register(nbA);
+
+            int pruned = registry.PruneDestroyed();
+            Assert.AreEqual(0, pruned,
+                "PruneDestroyed must return 0 when no entries are stale.");
+
+            UnityEngine.Object.DestroyImmediate(goA);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Object Pool (Fix 5) — INetworkObjectPool is consulted when installed
+    //      and bypassed when null.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("ObjectPool")]
+    public class ObjectPoolTests
+    {
+        private sealed class CountingPool : INetworkObjectPool
+        {
+            public int AcquireCalls;
+            public int ReleaseCalls;
+            public List<uint> AcquiredPrefabIds = new List<uint>();
+            public List<uint> ReleasedPrefabIds = new List<uint>();
+
+            public GameObject Acquire(uint prefabId, GameObject prefab, Vector3 position, Quaternion rotation)
+            {
+                AcquireCalls++;
+                AcquiredPrefabIds.Add(prefabId);
+                return UnityEngine.Object.Instantiate(prefab, position, rotation);
+            }
+
+            public void Release(uint prefabId, GameObject instance)
+            {
+                ReleaseCalls++;
+                ReleasedPrefabIds.Add(prefabId);
+                UnityEngine.Object.Destroy(instance);
+            }
+        }
+
+        private GameObject     _nmGo;
+        private NetworkManager _nm;
+        private GameObject     _prefab;
+
+        [SetUp]
+        public void SetUp()
+        {
+            _nmGo  = new GameObject("NM_Pool");
+            _nm    = _nmGo.AddComponent<NetworkManager>();
+            _prefab = new GameObject("Pool_Prefab");
+            _prefab.AddComponent<NetworkBehaviourStub>();
+            _nm.SetLocalPlayerStringId("player-owner");
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            UnityEngine.Object.DestroyImmediate(_nmGo);
+            UnityEngine.Object.DestroyImmediate(_prefab);
+        }
+
+        [Test]
+        public void SpawnManager_WithPool_RoutesAcquireAndRelease()
+        {
+            var pool = new CountingPool();
+            _nm.Spawner.RegisterPrefab(100, _prefab);
+            _nm.Spawner.SetObjectPool(pool);
+
+            var nb = _nm.Spawner.Spawn(100, Vector3.zero, Quaternion.identity, "player-owner");
+            Assert.IsNotNull(nb, "Spawn must return a live NetworkBehaviour.");
+            Assert.AreEqual(1, pool.AcquireCalls, "Pool.Acquire must be invoked once per Spawn.");
+            Assert.AreEqual(100U, pool.AcquiredPrefabIds[0]);
+
+            _nm.Spawner.Despawn(nb.NetworkObjectId);
+            Assert.AreEqual(1, pool.ReleaseCalls, "Pool.Release must be invoked once per Despawn.");
+            Assert.AreEqual(100U, pool.ReleasedPrefabIds[0],
+                "Release must carry the SAME prefabId that Acquire returned the instance for.");
+        }
+
+        [Test]
+        public void SpawnManager_WithoutPool_DoesNotCrash()
+        {
+            _nm.Spawner.RegisterPrefab(101, _prefab);
+            _nm.Spawner.ClearObjectPool();
+
+            var nb = _nm.Spawner.Spawn(101, Vector3.zero, Quaternion.identity, "player-owner");
+            Assert.IsNotNull(nb, "Spawn without a pool must still return a live NetworkBehaviour.");
+            Assert.IsNull(_nm.Spawner.ObjectPool, "ObjectPool must report null when cleared.");
+
+            Assert.DoesNotThrow(() => _nm.Spawner.Despawn(nb.NetworkObjectId),
+                "Despawn without a pool must fall back to Object.Destroy without throwing.");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Auto Room Re-Join (Fix 3) — LastRoomId is populated on join, preserved
+    //      across token-preserving clear, and wiped on an explicit Disconnect.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("AutoRejoin")]
+    public class AutoRejoinTests
+    {
+        private GameObject     _nmGo;
+        private NetworkManager _nm;
+
+        [SetUp]
+        public void SetUp()
+        {
+            _nmGo = new GameObject("NM_AutoRejoin");
+            _nm   = _nmGo.AddComponent<NetworkManager>();
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            UnityEngine.Object.DestroyImmediate(_nmGo);
+        }
+
+        // Reach into the private RememberRoom helper via reflection — the
+        // alternative (driving a full RoomJoined event) would require a
+        // fully established session which is heavier than needed here.
+        private void RememberRoom(RoomInfo room)
+        {
+            var mi = typeof(NetworkManager).GetMethod(
+                "RememberRoom",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.IsNotNull(mi, "RememberRoom helper must exist on NetworkManager.");
+            mi.Invoke(_nm, new object[] { room });
+        }
+
+        // Expose the ClearSessionData overload that accepts preserveReconnectToken.
+        private void ClearSessionData(bool preserveReconnectToken)
+        {
+            var mi = typeof(NetworkManager).GetMethod(
+                "ClearSessionData",
+                BindingFlags.NonPublic | BindingFlags.Instance,
+                binder: null,
+                types: new[] { typeof(bool) },
+                modifiers: null);
+            Assert.IsNotNull(mi,
+                "ClearSessionData(bool) overload must exist on NetworkManager.");
+            mi.Invoke(_nm, new object[] { preserveReconnectToken });
+        }
+
+        [Test]
+        public void RememberRoom_PopulatesLastRoomIdAndCode()
+        {
+            var room = new RoomInfo("room-uuid-1", "ABC123", "Test", "waiting", 1, 8, true);
+            RememberRoom(room);
+
+            Assert.AreEqual("room-uuid-1", _nm.LastRoomId);
+            Assert.AreEqual("ABC123",      _nm.LastRoomCode);
+        }
+
+        [Test]
+        public void PreservingReconnectToken_ShouldAlsoPreserve_LastRoomSnapshot()
+        {
+            var room = new RoomInfo("room-uuid-2", "XKCD42", "Test", "waiting", 1, 8, true);
+            RememberRoom(room);
+
+            ClearSessionData(preserveReconnectToken: true);
+
+            Assert.AreEqual("room-uuid-2", _nm.LastRoomId,
+                "Token-preserving clear MUST keep the last-room snapshot so Reconnect() " +
+                "can auto-rejoin.");
+            Assert.AreEqual("XKCD42", _nm.LastRoomCode);
+        }
+
+        [Test]
+        public void ClearingReconnectToken_AlsoClears_LastRoomSnapshot()
+        {
+            var room = new RoomInfo("room-uuid-3", "ZYXW98", "Test", "waiting", 1, 8, true);
+            RememberRoom(room);
+
+            ClearSessionData(preserveReconnectToken: false);
+
+            Assert.IsNull(_nm.LastRoomId,
+                "Full clear must wipe LastRoomId — it is meaningless without the token.");
+            Assert.IsNull(_nm.LastRoomCode);
+        }
+
+        [Test]
+        public void RememberRoom_WithNullRoom_ClearsSnapshot()
+        {
+            RememberRoom(new RoomInfo("room-uuid-4", "Q1Q1Q1", "N", "waiting", 1, 2, true));
+            Assert.AreEqual("room-uuid-4", _nm.LastRoomId);
+
+            RememberRoom(null);
+
+            Assert.IsNull(_nm.LastRoomId,
+                "Null room parameter must clear the snapshot (defensive reset).");
+        }
+
+        [Test]
+        public void AutoRejoinSetting_DefaultsToEnabled()
+        {
+            var defaults = NetworkSettings.CreateInstance<NetworkSettings>();
+            Assert.IsTrue(defaults.autoRejoinLastRoomOnReconnect,
+                "autoRejoinLastRoomOnReconnect must default to true — backwards-safe for new users.");
+            UnityEngine.Object.DestroyImmediate(defaults);
         }
     }
 

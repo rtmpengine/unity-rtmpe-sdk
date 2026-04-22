@@ -26,6 +26,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using UnityEngine;
 
 namespace RTMPE.Core
@@ -44,7 +45,31 @@ namespace RTMPE.Core
         private readonly Dictionary<uint, GameObject> _prefabs =
             new Dictionary<uint, GameObject>();
 
-        private ulong _nextLocalId = 1;
+        // Remembers which prefab each spawned GameObject came from so that
+        // Release() can route it back to the correct pool bucket at despawn.
+        // Populated by CreateLocal; consulted (and cleared) in DestroyLocal.
+        // Runtime cost is O(N_live_objects) — negligible vs the per-frame
+        // registry traversal.
+        private readonly Dictionary<ulong, uint> _prefabOfObject =
+            new Dictionary<ulong, uint>();
+
+        // Optional pluggable pool — null means "no pooling" (use Instantiate/Destroy).
+        // Assigned via SetObjectPool; cleared via ClearObjectPool.  Main-thread only.
+        private INetworkObjectPool _pool;
+
+        // Monotonic counter for the low 32 bits of locally-generated object IDs.
+        // Stored as `long` (not `ulong`) so that `Interlocked.Increment` — whose
+        // public overload on .NET Standard 2.1 only accepts `ref long` — can be
+        // used to guarantee thread safety.  The contract remains main-thread-only
+        // for correctness of the GameObject lifecycle, but atomic increment
+        // preserves uniqueness even if a third-party integration accidentally
+        // calls Spawn() from a background thread.
+        //
+        // Starts at 0 so that the first Interlocked.Increment returns 1 — preserving
+        // the historical behaviour of the previous post-increment implementation
+        // (`_nextLocalId = 1` + `_nextLocalId++`).  The low 32 bits are masked at
+        // use-time; values cast back to ulong are always in [1, uint.MaxValue].
+        private long _nextLocalId;
 
         // ── Properties ─────────────────────────────────────────────────────────
 
@@ -100,6 +125,27 @@ namespace RTMPE.Core
 
         /// <summary>True if a prefab is registered under <paramref name="prefabId"/>.</summary>
         public bool HasPrefab(uint prefabId) => _prefabs.ContainsKey(prefabId);
+
+        // ── Pooling ────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Install a custom <see cref="INetworkObjectPool"/>.
+        /// From the next spawn onwards, <see cref="SpawnManager"/> routes every
+        /// instantiate/destroy through the pool.  Pass <see langword="null"/>
+        /// to restore the built-in Instantiate/Destroy path.
+        /// </summary>
+        /// <remarks>
+        /// Swapping pools at runtime is allowed but does NOT migrate already-live
+        /// objects — they will be released to whichever pool is active at despawn
+        /// time.  Apps that need to migrate should despawn + respawn explicitly.
+        /// </remarks>
+        public void SetObjectPool(INetworkObjectPool pool) => _pool = pool;
+
+        /// <summary>Remove any installed pool, reverting to Instantiate/Destroy.</summary>
+        public void ClearObjectPool() => _pool = null;
+
+        /// <summary>The currently-installed pool, or <see langword="null"/> when none is set.</summary>
+        public INetworkObjectPool ObjectPool => _pool;
 
         // ── Spawn / Despawn (Public API) ───────────────────────────────────────
 
@@ -176,19 +222,54 @@ namespace RTMPE.Core
                 return null;
             }
 
-            var go = UnityEngine.Object.Instantiate(prefab, position, rotation);
+            // Route through the pool when installed; fall back to Instantiate
+            // otherwise.  A null return from a pool is a contract violation and
+            // is treated as a fatal error — the surrounding game code assumes
+            // Spawn produces a live object.
+            GameObject go;
+            if (_pool != null)
+            {
+                go = _pool.Acquire(prefabId, prefab, position, rotation);
+                if (go == null)
+                {
+                    Debug.LogError(
+                        $"[SpawnManager] CreateLocal: INetworkObjectPool.Acquire " +
+                        $"returned null for prefabId {prefabId}. Pools MUST return " +
+                        "a live GameObject. Falling back to Instantiate this time.");
+                    go = UnityEngine.Object.Instantiate(prefab, position, rotation);
+                }
+                else
+                {
+                    // The pool may have handed us a cached instance whose position
+                    // was set at a previous despawn.  Force both transform fields
+                    // before the NetworkBehaviour wakes up so OnNetworkSpawn sees
+                    // the correct pose.  Use localPosition/localRotation for safety
+                    // when the pool parents instances under a reuse bucket.
+                    go.transform.SetPositionAndRotation(position, rotation);
+                    if (!go.activeSelf) go.SetActive(true);
+                }
+            }
+            else
+            {
+                go = UnityEngine.Object.Instantiate(prefab, position, rotation);
+            }
+
             var nb = go.GetComponent<NetworkBehaviour>();
             if (nb == null)
             {
                 Debug.LogError(
                     $"[SpawnManager] CreateLocal: prefab {prefabId} has no " +
                     "NetworkBehaviour component. Destroying instantiated object.");
+                // A pooled instance that lost its NetworkBehaviour somehow —
+                // destroy rather than returning it to the pool to prevent a
+                // corrupted instance from being reused.
                 UnityEngine.Object.Destroy(go);
                 return null;
             }
 
             nb.Initialize(objectId, ownerPlayerId ?? string.Empty);
             _registry.Register(nb);
+            _prefabOfObject[objectId] = prefabId;
             nb.SetSpawned(true);
 
             return nb;
@@ -202,14 +283,80 @@ namespace RTMPE.Core
         internal void DestroyLocal(ulong objectId)
         {
             var nb = _registry.Get(objectId);
-            if (nb == null) return;
+            if (nb == null)
+            {
+                // Still try to clear any stale prefab mapping for this id so the
+                // dictionary doesn't accumulate orphans when objects are
+                // externally destroyed.
+                _prefabOfObject.Remove(objectId);
+                return;
+            }
 
             nb.SetSpawned(false);
             _registry.Unregister(objectId);
 
+            _prefabOfObject.TryGetValue(objectId, out uint prefabId);
+            _prefabOfObject.Remove(objectId);
+
             // Unity null check: the GO may have been destroyed externally.
-            if (nb != null)
+            if (nb == null) return;
+
+            // When a pool is installed, return the instance for reuse instead
+            // of destroying it.  The pool is responsible for deactivating the
+            // GameObject — but we do a final IsOwner-safe NetworkBehaviour
+            // reset so the pooled instance is in a known state next spawn.
+            if (_pool != null)
+            {
+                try { _pool.Release(prefabId, nb.gameObject); }
+                catch (Exception ex)
+                {
+                    Debug.LogException(ex);
+                    // If the pool throws, fall back to destroy to avoid a leak.
+                    UnityEngine.Object.Destroy(nb.gameObject);
+                }
+            }
+            else
+            {
                 UnityEngine.Object.Destroy(nb.gameObject);
+            }
+        }
+
+        // ── Late-Join Resync ───────────────────────────────────────────────────
+
+        /// <summary>
+        /// Mark every NetworkVariable on every locally-owned object as dirty
+        /// so the next 30 Hz flush retransmits its current value.  Called by
+        /// <see cref="NetworkManager"/> when another player joins the current
+        /// room, giving the new joiner a full state snapshot within ~33 ms
+        /// instead of waiting for a future value change.
+        /// <para>
+        /// No-op when the registry is empty or no objects are locally owned.
+        /// Runs on the Unity main thread.
+        /// </para>
+        /// <para>
+        /// Current scope: only <c>NetworkVariable</c> values participate.
+        /// <c>NetworkTransform</c> already forces its next broadcast on each
+        /// interpolation frame, so pose sync is naturally covered.  The
+        /// trade-off of marking ALL variables (vs only unchanged ones) is a
+        /// single redundant flush cycle per join — negligible at typical
+        /// object counts, and far cheaper than a new protocol round trip.
+        /// </para>
+        /// </summary>
+        public void MarkAllVariablesDirtyForResync()
+        {
+            var objects = _registry.GetAll();
+            foreach (var nb in objects)
+            {
+                if (nb == null) continue;
+                if (!nb.IsOwner || !nb.IsSpawned) continue;
+                try { nb.MarkAllVariablesDirty(); }
+                catch (Exception ex)
+                {
+                    // Isolate per-object failure: one misbehaving NetworkBehaviour
+                    // must not block resync for the rest of the owned roster.
+                    Debug.LogException(ex);
+                }
+            }
         }
 
         // ── Owner Leave Handling ───────────────────────────────────────────────
@@ -253,24 +400,46 @@ namespace RTMPE.Core
         /// </summary>
         public void ClearAll()
         {
-            // Snapshot before clearing — we need references to Destroy GameObjects
+            // Snapshot before clearing — we need references to Destroy/Release GameObjects
             // (registry Clear only despawns, it does not destroy GOs).
             var snapshot = _registry.GetAll();
+
+            // Copy the prefab-of-object map before the registry changes it so
+            // per-object pool routing survives the Clear() sweep below.
+            var prefabSnapshot = new Dictionary<ulong, uint>(_prefabOfObject);
 
             // Clear registry: fires SetSpawned(false) for each live object.
             _registry.Clear();
 
-            // Destroy the Unity GameObjects.
+            // Destroy or release the Unity GameObjects.
             foreach (var obj in snapshot)
             {
-                if (obj != null)
+                if (obj == null) continue;
+                try
                 {
-                    try { UnityEngine.Object.Destroy(obj.gameObject); }
-                    catch (Exception ex) { Debug.LogException(ex); }
+                    if (_pool != null)
+                    {
+                        // Use the recorded prefab id when available; otherwise the
+                        // pool must either route by its own bookkeeping or destroy.
+                        uint prefabId = prefabSnapshot.TryGetValue(obj.NetworkObjectId, out var pid)
+                            ? pid : uint.MaxValue;
+                        _pool.Release(prefabId, obj.gameObject);
+                    }
+                    else
+                    {
+                        UnityEngine.Object.Destroy(obj.gameObject);
+                    }
                 }
+                catch (Exception ex) { Debug.LogException(ex); }
             }
 
-            _nextLocalId = 1;
+            _prefabOfObject.Clear();
+
+            // Interlocked.Exchange is atomic w.r.t. concurrent Increment calls —
+            // a partial read/write mid-reset cannot observe a torn 64-bit value.
+            // The contract is still "reset only after ClearAll on disconnect",
+            // but the atomic reset provides defence against unexpected call sites.
+            Interlocked.Exchange(ref _nextLocalId, 0);
         }
 
         // ── Private ────────────────────────────────────────────────────────────
@@ -283,7 +452,13 @@ namespace RTMPE.Core
         private ulong GenerateObjectId()
         {
             var playerId = _networkManager.LocalPlayerId;
-            return ((playerId & 0xFFFFFFFF) << 32) | (_nextLocalId++);
+            // Atomic post-increment equivalent:
+            //   `_nextLocalId++` in the original returned N, then stored N+1.
+            //   `Interlocked.Increment` returns the incremented value (N+1),
+            //   so we use the RESULT as the new ID — first call returns 1,
+            //   matching the historical `_nextLocalId = 1` starting value.
+            ulong counter = (ulong)Interlocked.Increment(ref _nextLocalId);
+            return ((playerId & 0xFFFFFFFF) << 32) | (counter & 0xFFFFFFFFUL);
         }
 
         /// <summary>

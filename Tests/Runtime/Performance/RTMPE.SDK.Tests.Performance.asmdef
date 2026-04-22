@@ -1,0 +1,27 @@
+{
+    "name": "RTMPE.SDK.Tests.Performance",
+    "rootNamespace": "RTMPE.Tests.Performance",
+    "references": [
+        "RTMPE.SDK.Runtime",
+        "Unity.PerformanceTesting"
+    ],
+    "optionalUnityReferences": [
+        "TestAssemblies"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "RTMPE_PERFORMANCE_TESTING"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.test-framework.performance",
+            "expression": "3.0.0",
+            "define": "RTMPE_PERFORMANCE_TESTING"
+        }
+    ]
+}

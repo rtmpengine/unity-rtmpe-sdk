@@ -1,8 +1,8 @@
 # RTMPE SDK — Getting Started
 
-> **SDK Version:** `com.rtmpe.sdk 1.0.0`  
-> **Unity Version Required:** Unity 6000.0 LTS or later  
-> **Target Platform:** PC, Mac, Linux, Android, iOS
+> **SDK Version:** `com.rtmpe.sdk 1.1.0`
+> **Unity Version Required:** Unity 6000.0 LTS or later
+> **Target Platform:** PC, Mac, Linux, Android, iOS (WebGL via a user-provided WebSocket transport — see [Architecture §3](architecture.md#3-transport-layer))
 
 ---
 
@@ -20,11 +20,13 @@
 10. [Step 8 — Room List UI](#step-8--room-list-ui)
 11. [Step 9 — Handle Player Join and Leave Events](#step-9--handle-player-join-and-leave-events)
 12. [Step 10 — Disconnection and Cleanup](#step-10--disconnection-and-cleanup)
-13. [Complete API Reference](#complete-api-reference)
-14. [Connection State Machine](#connection-state-machine)
-15. [Pre-Launch Checklist](#pre-launch-checklist)
-16. [Common Errors and Fixes](#common-errors-and-fixes)
-17. [Performance Notes](#performance-notes)
+13. [Step 11 — Reconnect after a Drop](#step-11--reconnect-after-a-drop)
+14. [Step 12 — Object Pooling (Optional)](#step-12--object-pooling-optional)
+15. [Complete API Reference](#complete-api-reference)
+16. [Connection State Machine](#connection-state-machine)
+17. [Pre-Launch Checklist](#pre-launch-checklist)
+18. [Common Errors and Fixes](#common-errors-and-fixes)
+19. [Performance Notes](#performance-notes)
 
 ---
 
@@ -128,7 +130,7 @@ Or reference it by path in `Packages/manifest.json`:
 Open **Window → Package Manager**. You should see:
 
 ```
-RTMPE SDK   1.0.0   ✓
+RTMPE SDK   1.1.0   ✓
 ```
 
 The `RTMPE` namespace is now available in all scripts.
@@ -144,19 +146,20 @@ You can maintain multiple profiles (e.g. `RTMPESettings_Dev.asset`, `RTMPESettin
 2. Name the asset (e.g. `RTMPESettings_Prod.asset`).
 3. Configure the fields in the **Inspector**:
 
-| Field                      | Value                                      | Notes                                         |
-| -------------------------- | ------------------------------------------ | --------------------------------------------- |
-| `Server Host`              | Your RTMPE gateway hostname or IP          | Obtain from the RTMPE dashboard               |
-| `Server Port`              | `7777`                                     | Default UDP port                              |
-| `Heartbeat Interval Ms`    | `5000`                                     | 5-second keepalive interval                   |
-| `Connection Timeout Ms`    | `10000`                                    | 10-second handshake timeout                   |
-| `Tick Rate`                | `30`                                       | Must match the server room-service config     |
-| `Send Buffer Bytes`        | `4096`                                     | UDP socket SO_SNDBUF                         |
-| `Receive Buffer Bytes`     | `4096`                                     | UDP socket SO_RCVBUF                         |
-| `Network Thread Buffer Bytes` | `8192`                                  | Background thread read buffer                 |
-| `Enable Debug Logs`        | `true` during development, `false` in production | Unity Console connection traces        |
-| `Api Key Psk Hex`          | 64-char hex — copy from the RTMPE dashboard | Encrypts the API key in transit; leave blank for local dev only |
-| `Pinned Server Public Key Hex` | 64-char hex — copy from the RTMPE dashboard | Optional server certificate pinning   |
+| Field                              | Value                                      | Notes                                         |
+| ---------------------------------- | ------------------------------------------ | --------------------------------------------- |
+| `Server Host`                      | Your RTMPE gateway hostname or IP          | Obtain from the RTMPE dashboard               |
+| `Server Port`                      | `7777`                                     | Default UDP port                              |
+| `Heartbeat Interval Ms`            | `5000`                                     | 5-second keepalive interval                   |
+| `Connection Timeout Ms`            | `10000`                                    | 10-second handshake timeout                   |
+| `Tick Rate`                        | `30`                                       | Must match the server room-service config     |
+| `Auto Rejoin Last Room On Reconnect` | `true` (default)                          | v1.1 — auto-rejoin the last room after a successful token-based `Reconnect()` |
+| `Send Buffer Bytes`                | `4096`                                     | UDP socket SO_SNDBUF                          |
+| `Receive Buffer Bytes`             | `4096`                                     | UDP socket SO_RCVBUF                          |
+| `Network Thread Buffer Bytes`      | `8192`                                     | Background thread read buffer                 |
+| `Enable Debug Logs`                | `true` during development, `false` in production | Unity Console connection traces         |
+| `Api Key Psk Hex`                  | 64-char hex — copy from the RTMPE dashboard | Encrypts the API key in transit; leave blank for local dev only |
+| `Pinned Server Public Key Hex`     | 64-char hex — copy from the RTMPE dashboard | Optional server certificate pinning           |
 
 > **Security note:** Never commit your production `RTMPESettings` asset to a public
 > repository. Add `RTMPESettings_Prod.asset` to your `.gitignore`, or store the API key
@@ -706,6 +709,154 @@ public void QuitToMainMenu()
 
 ---
 
+## Step 11 — Reconnect after a Drop
+
+After the first successful connection, the SDK receives a **reconnect token**
+that can resume the session without re-sending the API key. Transient drops
+(heartbeat timeout, WiFi → 4G handoff) preserve the token; explicit
+`Disconnect()` calls wipe it.
+
+### Check whether a reconnect is possible
+
+```csharp
+private void OnDisconnected(DisconnectReason reason)
+{
+    if (NetworkManager.Instance.CanReconnect)
+    {
+        // Token is still valid — try the shortcut reconnect flow.
+        ShowReconnectingUi();
+        NetworkManager.Instance.Reconnect();
+    }
+    else
+    {
+        // Token is gone (explicit logout, handshake failure, server close).
+        // Ask for credentials and Connect(apiKey) from scratch.
+        UnityEngine.SceneManagement.SceneManager.LoadScene("MainMenu");
+    }
+}
+```
+
+### Auto room re-join (v1.1)
+
+When `NetworkSettings.autoRejoinLastRoomOnReconnect` is `true` (the default),
+the SDK automatically calls `Rooms.JoinRoom(LastRoomId)` after a successful
+`Reconnect()`. Subscribe to the new event to update UI:
+
+```csharp
+private void Start()
+{
+    var net = NetworkManager.Instance;
+
+    net.OnAutoRejoinAttempt += OnAutoRejoinAttempt;
+    net.Rooms.OnRoomJoined  += OnRoomEntered;     // fires on both manual and auto rejoin
+    net.Rooms.OnRoomError   += OnRoomError;       // fires if the room no longer exists
+}
+
+private void OnAutoRejoinAttempt(string roomId)
+{
+    Debug.Log($"[GameManager] Auto-rejoining room {roomId}…");
+    // Update UI, e.g. show a "Restoring session…" spinner.
+}
+```
+
+If your app wants custom lobby UI instead, disable the setting and use the
+preserved `LastRoomId` / `LastRoomCode` to drive your own flow:
+
+```csharp
+if (!string.IsNullOrEmpty(NetworkManager.Instance.LastRoomId))
+{
+    // Offer a "Rejoin last room?" prompt to the user.
+    ShowRejoinPrompt(NetworkManager.Instance.LastRoomId,
+                     NetworkManager.Instance.LastRoomCode);
+}
+```
+
+### Lifetime of the last-room snapshot
+
+The last-room snapshot shares its lifetime with the reconnect token — both
+are preserved together only when the SDK is confident the session is still
+server-side valid.
+
+| Event                                                   | `LastRoomId` state |
+|---------------------------------------------------------|--------------------|
+| Successful `OnRoomJoined` / `OnRoomCreated`             | **Set** to that room |
+| 3 missed `HeartbeatAck` (`ConnectionLost`, recoverable) | **Preserved**        |
+| `Rooms.LeaveRoom()` succeeds                            | **Cleared**          |
+| `NetworkManager.Disconnect()` (`ClientRequest`)         | **Cleared**          |
+| Server-initiated `Disconnect` (`ServerRequest`)         | **Cleared**          |
+| Handshake / token `Reconnect()` timeout (`Timeout`)     | **Cleared**          |
+| Transport `SocketException` (`ConnectionLost`, non-recoverable) | **Cleared** |
+| Server kick (`Kicked`)                                  | **Cleared**          |
+
+---
+
+## Step 12 — Object Pooling (Optional)
+
+For games that spawn/despawn frequently (bullets, hit FX, short-lived props),
+install an `INetworkObjectPool` to eliminate the GC pressure of repeated
+`Instantiate` / `Destroy` calls.
+
+### Minimal pool example
+
+```csharp
+using System.Collections.Generic;
+using UnityEngine;
+using RTMPE.Core;
+
+public sealed class SimplePool : INetworkObjectPool
+{
+    private readonly Dictionary<uint, Queue<GameObject>> _buckets =
+        new Dictionary<uint, Queue<GameObject>>();
+
+    public GameObject Acquire(uint prefabId, GameObject prefab,
+                              Vector3 position, Quaternion rotation)
+    {
+        if (_buckets.TryGetValue(prefabId, out var q) && q.Count > 0)
+        {
+            var go = q.Dequeue();
+            go.transform.SetPositionAndRotation(position, rotation);
+            go.SetActive(true);
+            return go;
+        }
+        return Object.Instantiate(prefab, position, rotation);
+    }
+
+    public void Release(uint prefabId, GameObject instance)
+    {
+        if (prefabId == uint.MaxValue) { Object.Destroy(instance); return; }
+
+        instance.SetActive(false);
+        if (!_buckets.TryGetValue(prefabId, out var q))
+            _buckets[prefabId] = q = new Queue<GameObject>();
+        q.Enqueue(instance);
+    }
+}
+```
+
+### Installing the pool
+
+```csharp
+private void OnConnected()
+{
+    var spawner = NetworkManager.Instance.Spawner;
+    spawner.RegisterPrefab(_playerPrefabId, _playerPrefab);
+    spawner.SetObjectPool(new SimplePool());   // install the pool
+    // …CreateRoom / JoinRoom as usual
+}
+```
+
+### Important notes
+
+- Install the pool **inside `OnConnected()`**, not before `Connect()`. A fresh
+  `SpawnManager` is created on every `Connect()`/`Reconnect()`.
+- When the pool is absent (`spawner.ObjectPool == null`), `SpawnManager` falls
+  back to `Object.Instantiate` / `Object.Destroy` — fully v1.0-compatible.
+- The `prefabId` argument passed to `Release` matches the one the object was
+  acquired with. `uint.MaxValue` is a sentinel meaning "the SDK lost track —
+  please destroy the instance".
+
+---
+
 ## Complete API Reference
 
 ### NetworkManager (singleton)
@@ -715,19 +866,34 @@ public void QuitToMainMenu()
 NetworkManager.Instance          // returns null after OnApplicationQuit
 NetworkManager.HasInstance       // thread-safe null check
 
+// Transport factory (v1.1 — static, install before Connect())
+NetworkManager.SetTransportFactory(settings => new MyTransport(settings));
+NetworkManager.ClearTransportFactory();
+NetworkManager.HasCustomTransportFactory;
+
 // Connection
 void Connect(string apiKey)
+bool Reconnect()                 // v1.1 — shortcut reconnect via stored token
 void Disconnect()
 
 // State
-NetworkState State               // Disconnected / Connecting / Connected / InRoom / Disconnecting
+NetworkState State               // Disconnected / Connecting / Connected / InRoom / Disconnecting / Reconnecting
 bool IsConnected                 // true when Connected or InRoom
 bool IsInRoom                    // true when inside a room
 
-// Identity
-ulong  LocalPlayerId             // numeric session ID (valid after Connect)
+// Identity & tokens
+ulong  LocalPlayerId             // numeric session ID (valid after SessionAck)
 string LocalPlayerStringId       // room player UUID (valid after JoinRoom/CreateRoom)
-float  LastRttMs                 // round-trip time in ms (-1 before first heartbeat)
+string JwtToken                  // HS256 JWT — use with Room Service REST API
+string ReconnectToken            // reconnect token (valid until consumed / cleared)
+bool   CanReconnect              // true when a reconnect token is held
+
+// Last-room snapshot (v1.1)
+string LastRoomId                // RoomInfo.RoomId — survives token-preserving clear
+string LastRoomCode              // RoomInfo.RoomCode — same lifetime as LastRoomId
+
+// Round-trip time
+float  LastRttMs                 // in ms; -1 before first heartbeat
 
 // Sub-managers
 RoomManager   Rooms
@@ -739,6 +905,9 @@ event Action<DisconnectReason>            OnDisconnected
 event Action<string>                      OnConnectionFailed
 event Action<NetworkState, NetworkState>  OnStateChanged
 event Action<float>                       OnRttUpdated
+event Action<byte[]>                      OnDataReceived
+event Action                              OnDataAcknowledged
+event Action<string>                      OnAutoRejoinAttempt   // v1.1
 ```
 
 ### RoomManager (`NetworkManager.Rooms`)
@@ -800,6 +969,16 @@ NetworkBehaviour Spawn(uint prefabId, Vector3 position, Quaternion rotation, str
 
 // Pass the NetworkObjectId (ulong), not the component reference.
 void Despawn(ulong networkObjectId)
+
+// v1.1 — Object pool (optional; see Step 12).
+void SetObjectPool(INetworkObjectPool pool)
+void ClearObjectPool()
+INetworkObjectPool ObjectPool { get; }
+
+// v1.1 — Auto-called on RoomManager.OnPlayerJoined. Re-flags every owned
+// NetworkVariable so late joiners receive a full state snapshot within
+// one 30 Hz tick. Apps rarely need to call this directly.
+void MarkAllVariablesDirtyForResync()
 ```
 
 > **Prefab ID rule:** The same `prefabId` (e.g. `1`) **must** map to the same prefab
@@ -842,14 +1021,19 @@ hp.OnValueChanged += (oldVal, newVal) => UpdateUI(newVal);
 
 ### DisconnectReason enum
 
-| Value            | Meaning                                   |
-| ---------------- | ----------------------------------------- |
-| `ClientRequest`  | You called `Disconnect()`                 |
-| `ConnectionLost` | Network interrupted                       |
-| `ServerRequest`  | Server closed the connection              |
-| `Timeout`        | Handshake or heartbeat timed out          |
-| `Kicked`         | Server forcibly removed the player        |
-| `Unknown`        | Unclassified reason                       |
+| Value            | Meaning                                                                 | Reconnect token preserved? |
+| ---------------- | ----------------------------------------------------------------------- | -------------------------- |
+| `Unknown`        | Unclassified reason                                                     | No                         |
+| `ClientRequest`  | You called `Disconnect()`                                               | No                         |
+| `ServerRequest`  | Server sent a `Disconnect` packet                                       | No                         |
+| `Timeout`        | Initial handshake or token `Reconnect()` did not complete within `connectionTimeoutMs` | No          |
+| `ConnectionLost` | 3 consecutive missed `HeartbeatAck` (recoverable) or a transport `SocketException` (not recoverable) | Heartbeat-miss only |
+| `Kicked`         | Server forcibly removed the player                                      | No                         |
+
+Only the heartbeat-miss path preserves the reconnect token. Check
+`NetworkManager.CanReconnect` in your `OnDisconnected` handler and call
+`Reconnect()` when it returns `true`; otherwise call `Connect(apiKey)` with
+fresh credentials. See [Step 11 — Reconnect after a Drop](#step-11--reconnect-after-a-drop).
 
 ---
 
@@ -858,35 +1042,58 @@ hp.OnValueChanged += (oldVal, newVal) => UpdateUI(newVal);
 ```
               Connect(apiKey)
 Disconnected ──────────────────▶ Connecting
-                                      │
-                                      │ Handshake + SessionAck ✅
-                                      ▼
-                                  Connected ◀── CreateRoom / JoinRoom available
-                                      │
-                                      │ CreateRoom / JoinRoom ✅
-                                      ▼
-                                   InRoom ◀──── Spawn objects here
-                                      │
-                                      │ LeaveRoom()
-                                      ▼
-                                  Connected
-                                      │
-                                      │ Disconnect()
-                                      ▼
-                               Disconnecting ──▶ Disconnected
+      ▲                              │
+      │                              │ Handshake + SessionAck ✅
+      │                              ▼
+      │                          Connected ◀── CreateRoom / JoinRoom available
+      │                              │
+      │                              │ CreateRoom / JoinRoom ✅
+      │                              ▼
+      │                            InRoom ◀── Spawn objects here
+      │                              │
+      │                              │ LeaveRoom()
+      │                              ▼
+      │                          Connected
+      │                              │
+      │                              │ Disconnect()
+      │                              ▼
+      │                       Disconnecting ──▶ Disconnected
+      │
+      │  v1.1 — shortcut path for transient drops
+      │
+      │                          (heartbeat timeout / transport error)
+      │                              │
+      │                              ▼   (token preserved)
+      │                         Disconnected
+      │                              │
+      │  Reconnect() (CanReconnect = true)
+      │                              ▼
+      │                        Reconnecting ──ReconnectInit──▶ Challenge ──▶ SessionAck
+      │                              │                                          │
+      │                              │                                          ▼
+      └──────(on token failure)──────┘                                      Connected
+                                                                                │
+                                                            autoRejoinLastRoomOnReconnect?
+                                                                                │
+                                                                                ▼
+                                                              Rooms.JoinRoom(LastRoomId)
+                                                                                │
+                                                                                ▼
+                                                                             InRoom
 ```
 
 **Key rules:**
 - Call `Connect()` only from `Disconnected` state.
+- Call `Reconnect()` only when `CanReconnect == true` (a reconnect token is held).
 - Call `CreateRoom()` / `JoinRoom()` only after `OnConnected` fires.
 - Call `Spawner.Spawn()` only after `OnRoomCreated` / `OnRoomJoined` fires.
-- Call `RegisterPrefab()` inside `OnConnected()` — never before `Connect()`.
+- Call `RegisterPrefab()` (and `SetObjectPool()`) inside `OnConnected()` — never before `Connect()`.
 
 ---
 
 ## Pre-Launch Checklist
 
-- [ ] SDK installed — `com.rtmpe.sdk` appears in Package Manager
+- [ ] SDK installed — `com.rtmpe.sdk 1.1.0` appears in Package Manager
 - [ ] `RTMPESettings` asset created with the correct `serverHost` and `serverPort`
 - [ ] `NetworkManager` GameObject exists **only in the boot scene** with the Settings asset assigned
 - [ ] `serverHost` and API key values come from environment / secure storage — not hardcoded in source
@@ -895,11 +1102,14 @@ Disconnected ──────────────────▶ Connectin
 - [ ] Player prefab has `NetworkTransformInterpolator` component attached
 - [ ] `GameManager._playerPrefabId` is consistent across all clients
 - [ ] `RegisterPrefab()` is called **inside `OnConnected()`**, not before `Connect()`
+- [ ] `SetObjectPool()` (if used) is called **inside `OnConnected()`**
 - [ ] All `NetworkVariable` IDs are unique within each component
 - [ ] All `NetworkVariable` types are initialized inside `OnNetworkSpawn()`, not `Awake()`/`Start()`
 - [ ] Every `Input.*` call is guarded with `if (!IsOwner) return;`
 - [ ] All event subscriptions use stored delegate references (not anonymous lambdas)
 - [ ] All events are unsubscribed in `OnDestroy()`
+- [ ] `OnDisconnected` handler checks `CanReconnect` before falling back to `Connect(apiKey)`
+- [ ] `autoRejoinLastRoomOnReconnect` matches your UX — disable it to show custom "rejoin?" UI
 - [ ] `enableDebugLogs = false` in the production Settings asset
 
 ---
@@ -965,15 +1175,17 @@ if (NetworkManager.Instance.State == NetworkState.Disconnected)
 
 | Parameter              | Value / Note                                                  |
 | ---------------------- | ------------------------------------------------------------- |
-| Tick rate              | 30 Hz — state updates every 33.3 ms                          |
-| Latency P99            | < 30 ms within region                                        |
-| Max players per room   | 16 (configurable per project in the dashboard)               |
+| Tick rate              | 30 Hz — state updates every 33.3 ms                           |
+| Latency P99            | < 30 ms within region                                         |
+| Max players per room   | 16 (configurable per project in the dashboard)                |
 | Position threshold     | 0.01 m — sub-centimetre moves are suppressed to save bandwidth |
-| Rotation threshold     | 0.1° — tiny rotations are suppressed                         |
-| NetworkVariable flush  | 30 Hz — no manual flush needed                               |
+| Rotation threshold     | 0.1° — tiny rotations are suppressed                          |
+| NetworkVariable flush  | 30 Hz — no manual flush needed                                |
+| Late-join snapshot     | v1.1 — full NetworkVariable state delivered within one 30 Hz tick after `OnPlayerJoined` |
+| Compression            | LZ4 — applied transparently when it shrinks the payload       |
 | Thread safety          | Never write `NetworkVariable.Value` from a background thread  |
 | Interpolation delay    | 100 ms default — smoother movement at the cost of slight visual delay |
 
 ---
 
-*RTMPE SDK 1.0.0 — [Changelog](../CHANGELOG.md) — [Protocol Reference](protocol.md) — [API Reference](api/index.md)*
+*RTMPE SDK 1.1.0 — [Changelog](../CHANGELOG.md) — [Protocol Reference](protocol.md) — [API Reference](api/index.md)*

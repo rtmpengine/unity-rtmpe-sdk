@@ -8,8 +8,9 @@
 //
 // This implementation targets .NET Standard 2.1 / Unity 6 with no native
 // dependencies and without unsafe code. BigInteger is used for Poly1305
-// 130-bit accumulator arithmetic, which is acceptable for the handshake
-// (once per connection).
+// 130-bit accumulator arithmetic; it is invoked on every Seal/Open call
+// (i.e. on every encrypted packet, not only during the handshake).
+// System.Numerics.BigInteger is not constant-time — see SECURITY / THREAT MODEL below.
 //
 // ============================================================================
 // SECURITY / THREAT MODEL

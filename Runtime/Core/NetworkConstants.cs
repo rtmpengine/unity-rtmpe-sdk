@@ -96,6 +96,46 @@ namespace RTMPE.Core
         RoomLeave         = 0x22,   // Client → Server: leave current room
         RoomList          = 0x23,   // Client → Server: request room list
 
+        // ── Custom properties ─────────────────────────────────────────────────
+        RoomPropertyUpdate   = 0x24,   // Client → Server → all: room-level property update (JSON payload)
+        PlayerPropertyUpdate = 0x25,   // Client → Server → all: per-player property update (JSON payload)
+
+        // ── Matchmaking (AutoJoinOrCreate) ───────────────────────────────────
+        // Flow: Client sends MatchmakingRequest; server atomically finds an open
+        //       waiting room matching (mode + lobby_name + project_id) or creates
+        //       a new one, joins the player, and replies with MatchmakingResponse.
+        //
+        // MatchmakingRequest payload  (JSON):
+        //   { "project_id": int64, "mode": string, "lobby_name"?: string,
+        //     "min_players"?: int, "max_players"?: int,
+        //     "player_id": string, "display_name"?: string }
+        //
+        // MatchmakingResponse payload (JSON):
+        //   { "ok": bool, "data"?: { "room_id": string, "room_code": string, "created": bool },
+        //     "error"?: string }
+        //
+        // MUST stay in sync with:
+        //   modules/gateway/src/packet/header.rs  (PacketType::MatchmakingRequest = 0x26)
+        //   modules/room/infrastructure/messaging/nats_matchmaking_handler.go
+        MatchmakingRequest  = 0x26,   // Client → Server: AutoJoinOrCreate request
+        MatchmakingResponse = 0x2B,   // Server → Client: matchmaking result
+
+        // ── Lobby system (Phase 1.3) ─────────────────────────────────────────
+        // Flow: LobbyJoin → server responds with current room list (JSON array).
+        //       LobbyLeave is fire-and-forget; no server reply is expected.
+        //       LobbyList requests a one-shot room listing with filters / sort.
+        //       LobbyRoomListUpdate is a server-push update to subscribed clients.
+        LobbyJoin           = 0x27,   // Client → Server: enter lobby browser (reply = current room list)
+        LobbyLeave          = 0x28,   // Client → Server: exit lobby browser (fire-and-forget)
+        LobbyList           = 0x29,   // Client → Server: filtered room list request (reply = JSON array)
+        LobbyRoomListUpdate = 0x2A,   // Server → Client: push update when lobby changes
+
+        // ── Room management ───────────────────────────────────────────────────
+        MasterClientChanged  = 0x2C,   // Server → All clients: master-client changed (auto or manual)
+        MasterClientTransfer = 0x2D,   // Client → Server: request to transfer master-client role
+        KickPlayer           = 0x2E,   // Client → Server / Server → All clients: kick request / broadcast
+        SceneLoaded          = 0x2F,   // Client → Server / Server → All clients: scene-load readiness
+
         // ── Networked object lifecycle ────────────────────────────────────────
         Spawn             = 0x30,   // Server → Client: spawn networked object
         Despawn           = 0x31,   // Server → Client: remove networked object
@@ -105,9 +145,23 @@ namespace RTMPE.Core
         // ── Network variable delta synchronisation ───────────────────────
         // Payload: [object_id:8 LE][var_count:1][for each: [var_id:2 LE][value bytes...]]
         VariableUpdate    = 0x41,   // Client → Server → all room clients: dirty variable delta
+        // ── Interest Management (Feature #6) ─────────────────────────────
+        // Payload: [x: float LE 4 B][y: float LE 4 B] — total 8 bytes.
+        // Client → Server only; opts the session into zone-filtered delivery.
+        // Clients that never send this packet receive every room-wide broadcast.
+        // MUST stay in sync with PacketType::PositionUpdate = 0x42 in
+        // modules/gateway/src/packet/header.rs
+        PositionUpdate    = 0x42,   // Client → Server: 2-D world position for interest-zone filtering
         // ── RPC system ────────────────────────────────────────────────────────
         Rpc               = 0x50,   // Client → Server: RPC request (method_id dispatch)
         RpcResponse       = 0x51,   // Server → Client: RPC response (or broadcast)
+        /// <summary>
+        /// Server → Client: late-joiner RPC replay buffer.
+        /// Payload: [event_count:2 LE u16][for each: [payload_len:2 LE u16][payload:N bytes]]
+        /// Each payload entry is a raw Enhanced RPC payload (27+ bytes, same format as Rpc 0x50 with FLAG_ENHANCED_RPC).
+        /// MUST stay in sync with PacketType::RpcBufferReplay in modules/gateway/src/packet/header.rs
+        /// </summary>
+        RpcBufferReplay   = 0x52,   // Server → Client: buffered RPC events for late joiners
 
         // ── Session termination ───────────────────────────────────────────────
         Disconnect        = 0xFF,   // Client-initiated graceful disconnect
@@ -116,14 +170,14 @@ namespace RTMPE.Core
     /// <summary>
     /// Packet header flags bitfield (header byte offset 4).
     /// Values MUST match <c>FLAG_*</c> constants in <c>modules/gateway/src/packet/header.rs</c>.
-    /// Only three flags exist; no fragmentation bits are defined in this protocol version.
     /// </summary>
     [Flags]
     public enum PacketFlags : byte
     {
-        None       = 0x00,
-        Compressed = 0x01,   // FLAG_COMPRESSED — payload is LZ4-compressed
-        Encrypted  = 0x02,   // FLAG_ENCRYPTED  — payload is ChaCha20-Poly1305 AEAD-encrypted
-        Reliable   = 0x04,   // FLAG_RELIABLE   — packet requires KCP acknowledgement
+        None        = 0x00,
+        Compressed  = 0x01,   // FLAG_COMPRESSED  — payload is LZ4-compressed
+        Encrypted   = 0x02,   // FLAG_ENCRYPTED   — payload is ChaCha20-Poly1305 AEAD-encrypted
+        Reliable    = 0x04,   // FLAG_RELIABLE    — packet requires KCP acknowledgement
+        EnhancedRpc = 0x08,   // FLAG_ENHANCED_RPC — Rpc(0x50) payload uses 27-byte Enhanced RPC header
     }
 }

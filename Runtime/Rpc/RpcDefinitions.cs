@@ -63,10 +63,17 @@ namespace RTMPE.Rpc
         public const int MaxPayloadBytes = 4096;
 
         /// <summary>
-        /// RPC request header size (bytes) — excludes the 13-byte standard packet header.
+        /// Legacy RPC request header size (bytes) — excludes the 13-byte standard packet header.
         /// Layout: method_id(4) + sender_id(8) + request_id(4) + payload_len(2) = 18.
         /// </summary>
         public const int RequestHeaderSize = 18;
+
+        /// <summary>
+        /// Enhanced RPC request header size (bytes) — excludes the 13-byte standard packet header.
+        /// Layout: method_id(4) + sender_id(8) + request_id(4) + object_id(8) + target(1) + rpc_flags(1) + param_count(1) = 27.
+        /// Identified by <see cref="RTMPE.Core.PacketFlags.EnhancedRpc"/> flag set on the outer packet header.
+        /// </summary>
+        public const int EnhancedRequestHeaderSize = 27;
 
         /// <summary>
         /// RPC response header size (bytes) — excludes the 13-byte standard packet header.

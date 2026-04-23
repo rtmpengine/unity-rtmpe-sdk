@@ -26,8 +26,14 @@ namespace RTMPE.Rpc
     public static class RpcPacketBuilder
     {
         /// <summary>
-        /// Build the payload for an RPC request.
+        /// Build the payload for a legacy RPC request (18-byte header).
         /// </summary>
+        /// <remarks>
+        /// Prefer <see cref="EnhancedRpcPacketBuilder.Build"/> with the
+        /// <see cref="RtmpeRpcAttribute"/> / <c>NetworkBehaviour.RPC()</c> API for new code.
+        /// This method remains supported for the fixed built-in method IDs
+        /// defined in <see cref="RpcMethodId"/> (Ping, TransferOwnership, etc.).
+        /// </remarks>
         /// <param name="methodId">Registered method identifier (see <see cref="RpcMethodId"/>).</param>
         /// <param name="senderId">Sender's session ID (gateway-assigned).</param>
         /// <param name="requestId">Client correlation ID for response matching.</param>
@@ -36,6 +42,8 @@ namespace RTMPE.Rpc
         /// <exception cref="ArgumentException">
         /// Thrown when <paramref name="payload"/> exceeds <see cref="RpcLimits.MaxPayloadBytes"/>.
         /// </exception>
+        [System.Obsolete("Use EnhancedRpcPacketBuilder.Build() + NetworkBehaviour.RPC() for new RPCs. " +
+                         "This method is retained only for the built-in method IDs (Ping, TransferOwnership, etc.).")]
         public static byte[] BuildRequest(
             uint methodId,
             ulong senderId,
@@ -88,8 +96,10 @@ namespace RTMPE.Rpc
         /// <summary>
         /// Build a Ping request payload (method_id = 100, no payload).
         /// </summary>
+#pragma warning disable CS0618
         public static byte[] BuildPing(ulong senderId, uint requestId)
             => BuildRequest(RpcMethodId.Ping, senderId, requestId);
+#pragma warning restore CS0618
 
         /// <summary>
         /// Build a TransferOwnership request payload (method_id = 200).
@@ -132,7 +142,9 @@ namespace RTMPE.Rpc
             // [10..] new_owner UTF-8
             Buffer.BlockCopy(ownerBytes, 0, payload, 10, ownerBytes.Length);
 
+#pragma warning disable CS0618
             return BuildRequest(RpcMethodId.TransferOwnership, senderId, requestId, payload);
+#pragma warning restore CS0618
         }
     }
 }

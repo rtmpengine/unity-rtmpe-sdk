@@ -20,8 +20,10 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using System.Text;
 using UnityEngine;
+using RTMPE.Rpc;
 using RTMPE.Sync;
 
 namespace RTMPE.Core
@@ -92,6 +94,70 @@ namespace RTMPE.Core
         /// Enforcement is performed by <c>SpawnManager</c>.
         /// </summary>
         public bool DestroyWithOwner { get; set; } = true;
+
+        // ── Enhanced RPC API ──────────────────────────────────────────────────
+
+        /// <summary>
+        /// Send an Enhanced RPC call to the network.
+        /// The method named <paramref name="methodName"/> must exist on this
+        /// component's type and be decorated with <see cref="RtmpeRpcAttribute"/>.
+        /// Delivery audience is taken from the attribute (<c>All</c>, <c>Others</c>,
+        /// or <c>Server</c>).
+        ///
+        /// <para>Must be called from the Unity main thread while connected and in a room.</para>
+        /// </summary>
+        /// <param name="methodName">
+        /// Name of a public, non-static method on this type decorated with
+        /// <c>[RtmpeRpc]</c>.  The name is resolved via <see cref="RpcRegistry"/>
+        /// (FNV-1a hash of <c>"TypeName.MethodName"</c>).
+        /// </param>
+        /// <param name="args">
+        /// Typed arguments forwarded to the remote method.  Supported types:
+        /// <c>int</c>, <c>float</c>, <c>bool</c>, <c>string</c>, <c>byte[]</c>,
+        /// <c>ulong</c>, <c>Vector3</c>, <c>Color</c>, <c>Quaternion</c>.
+        /// </param>
+        public void RPC(string methodName, params object[] args)
+        {
+            var nm = NetworkManager.Instance;
+            if (nm == null)
+            {
+                Debug.LogWarning("[RTMPE] NetworkBehaviour.RPC: NetworkManager not available.");
+                return;
+            }
+            nm.SendEnhancedRpc(this, methodName, args);
+        }
+
+        /// <summary>
+        /// Dispatch an inbound Enhanced RPC to the [RtmpeRpc]-decorated method
+        /// with the matching method ID.  Called by <c>NetworkManager</c> after it
+        /// resolves the target object from the registry.
+        /// </summary>
+        internal void DispatchEnhancedRpc(uint methodId, object[] args)
+        {
+            if (!RpcRegistry.TryFindMethod(GetType(), methodId, out MethodInfo method, out _))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] NetworkBehaviour: no [RtmpeRpc] method with id 0x{methodId:X8} " +
+                    $"on {GetType().Name}. Check that the method exists and is decorated with [RtmpeRpc].");
+                return;
+            }
+
+            try
+            {
+                method.Invoke(this, args);
+            }
+            catch (TargetInvocationException tie)
+            {
+                Debug.LogError(
+                    $"[RTMPE] RPC method '{GetType().Name}.{method.Name}' threw: " +
+                    $"{tie.InnerException?.Message ?? tie.Message}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError(
+                    $"[RTMPE] RPC dispatch error for '{GetType().Name}.{method.Name}': {ex.Message}");
+            }
+        }
 
         // ── Overridable callbacks ──────────────────────────────────────────────
 
@@ -282,6 +348,35 @@ namespace RTMPE.Core
                 v.MarkDirtyForResync();
             }
         }
+
+        // ── Client-Side Prediction hook ───────────────────────────────────────
+
+        /// <summary>
+        /// Override in a subclass to supply this frame's player input for
+        /// client-side prediction.  Only called on the owning client by
+        /// <see cref="RTMPE.Sync.NetworkTransform"/> when prediction is enabled.
+        ///
+        /// <para>Leave <see cref="InputPayload.Tick"/> at its default zero —
+        /// <see cref="CollectInput"/> stamps the correct tick before the payload
+        /// is pushed to the buffer.</para>
+        ///
+        /// <para>Return <c>default</c> for frames with no input.</para>
+        /// </summary>
+        protected virtual InputPayload GatherInput() => default;
+
+        /// <summary>
+        /// Collect this frame's input, stamp it with <paramref name="tick"/>,
+        /// and return the result.  Called by <see cref="RTMPE.Sync.NetworkTransform"/>
+        /// on the owning client.
+        /// </summary>
+        internal InputPayload CollectInput(uint tick)
+        {
+            var p  = GatherInput();
+            p.Tick = tick;
+            return p;
+        }
+
+        // ── Variable update (server → client) ────────────────────────────────
 
         /// <summary>
         /// Apply a single variable update received from the server.

@@ -4,6 +4,8 @@
 // Mirrors the GetRoomResponse / RoomSummary messages in room.proto.
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace RTMPE.Rooms
 {
@@ -37,6 +39,53 @@ namespace RTMPE.Rooms
         /// <summary>Player roster snapshot. May be empty for list responses.</summary>
         public PlayerInfo[] Players { get; }
 
+        /// <summary>
+        /// The room's <c>custom_properties</c> JSONB column mirrored as a
+        /// read-only map.  Always non-null; an empty map is the default state.
+        /// Callers MUST NOT mutate the underlying collection — the snapshot is
+        /// immutable by contract.
+        /// </summary>
+        public IReadOnlyDictionary<string, PropertyValue> Properties { get; }
+
+        /// <summary>
+        /// Monotonic version counter advanced by the server on every accepted
+        /// <c>RoomPropertyUpdate</c>.  Used for optimistic-concurrency control
+        /// when the local player issues an update.
+        /// </summary>
+        public int PropertiesVersion { get; }
+
+        /// <summary>
+        /// PlayerId of the current master client (room host), or empty string
+        /// when the roster has no host set.  Derived from <see cref="Players"/>
+        /// so no dedicated database column is required — the server
+        /// guarantees exactly one host per non-empty room via the <c>is_host</c>
+        /// column on <c>room_players</c>.
+        /// </summary>
+        public string MasterId =>
+            Players?.FirstOrDefault(p => p != null && p.IsHost)?.PlayerId ?? string.Empty;
+
+        /// <summary>
+        /// The authoritative scene currently loaded by the room, read from the
+        /// reserved <c>__scene</c> custom property.  Empty string when no
+        /// scene has been set.  Clients MUST treat this as read-only — the
+        /// room host drives scene changes via
+        /// <see cref="RoomManager.SetRoomProperties"/> (or the higher-level
+        /// <c>NetworkSceneManager</c> façade).
+        /// </summary>
+        public string CurrentScene
+        {
+            get
+            {
+                if (Properties != null
+                    && Properties.TryGetValue(ReservedPropertyKeys.Scene, out var v)
+                    && v.Type == PropertyType.String)
+                {
+                    return v.AsString();
+                }
+                return string.Empty;
+            }
+        }
+
         public RoomInfo(
             string roomId,
             string roomCode,
@@ -45,17 +94,69 @@ namespace RTMPE.Rooms
             int    playerCount,
             int    maxPlayers,
             bool   isPublic,
-            PlayerInfo[] players = null)
+            PlayerInfo[] players = null,
+            IReadOnlyDictionary<string, PropertyValue> properties = null,
+            int    propertiesVersion = 0)
         {
-            RoomId      = roomId ?? string.Empty;
-            RoomCode    = roomCode ?? string.Empty;
-            Name        = name ?? string.Empty;
-            State       = state ?? string.Empty;
-            PlayerCount = playerCount;
-            MaxPlayers  = maxPlayers;
-            IsPublic    = isPublic;
-            Players     = players ?? Array.Empty<PlayerInfo>();
+            RoomId            = roomId ?? string.Empty;
+            RoomCode          = roomCode ?? string.Empty;
+            Name              = name ?? string.Empty;
+            State             = state ?? string.Empty;
+            PlayerCount       = playerCount;
+            MaxPlayers        = maxPlayers;
+            IsPublic          = isPublic;
+            Players           = players ?? Array.Empty<PlayerInfo>();
+            // Defensive copy: an IReadOnlyDictionary surface does not prevent
+            // the caller from holding a reference to the underlying mutable
+            // Dictionary and mutating it after construction.  Copying here
+            // guarantees the snapshot is truly immutable for the SDK's
+            // lifetime contract.  Skipped for the canonical EmptyProperties
+            // singleton and for already-copied readonly dictionaries to avoid
+            // redundant allocation.
+            Properties        = FreezeProperties(properties);
+            PropertiesVersion = propertiesVersion;
         }
+
+        /// <summary>
+        /// Returns an immutable snapshot of <paramref name="source"/>.  Reuses
+        /// the shared empty singleton when the input is null or empty, and
+        /// defensively copies all other inputs so the returned reference is
+        /// safe against external mutation of the caller's dictionary.
+        /// </summary>
+        internal static IReadOnlyDictionary<string, PropertyValue> FreezeProperties(
+            IReadOnlyDictionary<string, PropertyValue> source)
+        {
+            if (source == null || source.Count == 0) return EmptyProperties;
+            var copy = new Dictionary<string, PropertyValue>(source.Count);
+            foreach (var kv in source) copy[kv.Key] = kv.Value;
+            return copy;
+        }
+
+        /// <summary>
+        /// Returns a new <see cref="RoomInfo"/> identical to this one but
+        /// with the supplied <paramref name="properties"/> and
+        /// <paramref name="version"/>.  Used by the RoomManager to apply
+        /// <c>room_properties_updated</c> broadcasts without mutating the
+        /// previous snapshot.
+        /// </summary>
+        public RoomInfo WithProperties(IReadOnlyDictionary<string, PropertyValue> properties, int version)
+            => new RoomInfo(
+                RoomId, RoomCode, Name, State, PlayerCount, MaxPlayers,
+                IsPublic, Players, properties, version);
+
+        /// <summary>
+        /// Returns a new <see cref="RoomInfo"/> with the supplied roster.
+        /// Provided for symmetry with <see cref="WithProperties"/> so the
+        /// RoomManager can apply player-level changes without duplicating
+        /// the rest of the snapshot.
+        /// </summary>
+        public RoomInfo WithPlayers(PlayerInfo[] players)
+            => new RoomInfo(
+                RoomId, RoomCode, Name, State, PlayerCount, MaxPlayers,
+                IsPublic, players, Properties, PropertiesVersion);
+
+        private static readonly IReadOnlyDictionary<string, PropertyValue> EmptyProperties
+            = new Dictionary<string, PropertyValue>(0);
 
         public override string ToString()
             => $"Room({RoomId}, \"{Name}\", {PlayerCount}/{MaxPlayers}, {State})";

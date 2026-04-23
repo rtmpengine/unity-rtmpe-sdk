@@ -213,6 +213,12 @@ namespace RTMPE.Core
         // Incremented atomically by SendRpc(); max-value wrap is safe (uint loops).
         private int _rpcRequestCounter;
 
+        // Monotone client-side tick counter for CSP (client-side prediction).
+        // Incremented once per 30 Hz variable-flush cycle while in a room.
+        // Wraps naturally at uint.MaxValue with no ill effect (all comparisons are
+        // tick-relative within a small window so overflow is safe by design).
+        private uint _localTick;
+
         // Outbound AEAD nonce counter (separate from the application sequence number
         // assigned by PacketBuilder).  Starts at -1L so the first Interlocked.Increment
         // returns 0, matching the gateway NonceGenerator which also starts at 0.
@@ -237,7 +243,13 @@ namespace RTMPE.Core
         private HeartbeatManager _heartbeatManager;
 
         // Room management
-        private RoomManager _roomManager;
+        private RoomManager  _roomManager;
+
+        // Lobby management
+        private LobbyManager _lobbyManager;
+
+        // Matchmaking
+        private MatchmakingManager _matchmakingManager;
 
         // Spawn management
         private SpawnManager _spawnManager;
@@ -282,11 +294,101 @@ namespace RTMPE.Core
         /// </summary>
         public string LocalPlayerStringId => _localPlayerStringId;
 
+        /// <summary>
+        /// Monotone client-side tick counter, incremented at 30 Hz while in a room.
+        /// Used by <see cref="RTMPE.Sync.NetworkTransform"/> to stamp
+        /// <see cref="InputPayload"/> entries for client-side prediction.
+        /// Wraps naturally at <c>uint.MaxValue</c> — tick-relative arithmetic
+        /// within a small window is safe across the wrap boundary.
+        /// </summary>
+        public uint LocalTick => _localTick;
+
         /// <summary>Room management API — create, join, leave, and list rooms.</summary>
         public RoomManager Rooms => _roomManager;
 
+        /// <summary>Lobby browser API — join a lobby, list rooms with filters, receive push updates.</summary>
+        public LobbyManager Lobby => _lobbyManager;
+
+        /// <summary>Matchmaking API — automatically find or create a room by game mode.</summary>
+        public MatchmakingManager Matchmaking => _matchmakingManager;
+
+        /// <summary>
+        /// <see langword="true"/> when the local player is the current master
+        /// client (room host) for <see cref="RoomManager.CurrentRoom"/>.  The
+        /// value is derived from the cached room snapshot, so it updates
+        /// automatically when the server publishes a
+        /// <c>master_client_changed</c> or <c>host_changed</c> event.
+        ///
+        /// Returns <see langword="false"/> when not in a room, when the room
+        /// snapshot has no master set, or when the local player ID is not yet
+        /// known (e.g. during connection setup).
+        /// </summary>
+        public bool IsMasterClient
+        {
+            get
+            {
+                if (_roomManager == null) return false;
+                var room = _roomManager.CurrentRoom;
+                if (room == null) return false;
+                var master = room.MasterId;
+                var localId = _localPlayerStringId;
+                return !string.IsNullOrEmpty(master)
+                    && !string.IsNullOrEmpty(localId)
+                    && master == localId;
+            }
+        }
+
+        /// <summary>
+        /// Local-player façade exposing
+        /// <see cref="LocalPlayerContext.SetProperty"/> so developers can use
+        /// the Photon-compatible <c>NetworkManager.LocalPlayer.SetProperty(...)</c>
+        /// shape without repeating the local player's UUID at every call site.
+        /// Never returns null after <c>Awake</c> — the inner context forwards
+        /// to <see cref="RoomManager"/> and no-ops (with a log) if the session
+        /// has not yet been authenticated.
+        ///
+        /// Thread safety: the lazy-init uses
+        /// <see cref="System.Threading.Interlocked.CompareExchange{T}(ref T,T,T)"/>
+        /// so concurrent access from the main thread plus a background thread
+        /// (e.g. a transport callback that inadvertently touches it) only ever
+        /// retains a single instance.  Production callers MUST still access
+        /// from the Unity main thread; this safeguard prevents accidental
+        /// double-allocation during SDK bootstraps.
+        /// </summary>
+        public LocalPlayerContext LocalPlayer
+        {
+            get
+            {
+                var existing = _localPlayer;
+                if (existing != null) return existing;
+                var fresh = new LocalPlayerContext(_roomManager, () => _localPlayerStringId);
+                return System.Threading.Interlocked.CompareExchange(ref _localPlayer, fresh, null) ?? fresh;
+            }
+        }
+        private LocalPlayerContext _localPlayer;
+
         /// <summary>Spawn management API — spawn, despawn, prefab registry, owner-leave handling.</summary>
         public SpawnManager Spawner => _spawnManager;
+
+        /// <summary>
+        /// Networked-scene management façade.  Drives room-wide scene
+        /// transitions through the reserved <c>__scene</c> custom property
+        /// and surfaces <c>SceneLoaded</c> (0x2F) readiness aggregation.
+        /// Thread-safe lazy-init via <see cref="System.Threading.Interlocked"/>
+        /// follows the same pattern as <see cref="LocalPlayer"/>.
+        /// </summary>
+        public NetworkSceneManager Scene
+        {
+            get
+            {
+                var existing = _sceneManager;
+                if (existing != null) return existing;
+                if (_roomManager == null) return null;
+                var fresh = new NetworkSceneManager(_roomManager);
+                return System.Threading.Interlocked.CompareExchange(ref _sceneManager, fresh, null) ?? fresh;
+            }
+        }
+        private NetworkSceneManager _sceneManager;
 
         /// <summary>JWT bearer token — valid after SessionAck. Use for Room Service calls.</summary>
         public string JwtToken => _jwtToken;
@@ -434,6 +536,11 @@ namespace RTMPE.Core
             {
                 _variableFlushAccum -= VariableFlushInterval;
                 FlushDirtyNetworkVariables();
+                // Advance the CSP tick in lock-step with the variable flush
+                // so that InputPayload.Tick and NetworkVariable deltas share
+                // the same 30 Hz cadence.  Only advance while in a room —
+                // ticks outside a room are meaningless for CSP.
+                if (IsInRoom) _localTick++;
             }
         }
 
@@ -591,6 +698,10 @@ namespace RTMPE.Core
             _handshakeHandler = null;
             _sessionKeys?.Dispose();       // Zero session keys before GC can observe it
             _sessionKeys      = null;
+            // Detach scene manager BEFORE tearing down the network thread so
+            // any in-flight SceneLoaded callbacks don't fire into a disposed manager.
+            _sceneManager?.Dispose();
+            _sceneManager = null;
             // Unsubscribe before dispose to break delegate references.
             if (_networkThread != null)
             {
@@ -671,6 +782,16 @@ namespace RTMPE.Core
             _roomManager.OnRoomJoined   += OnRoomManagerJoined;
             _roomManager.OnRoomLeft     += OnRoomManagerLeft;
             _roomManager.OnRoomCreated  += OnRoomManagerCreated;
+
+            _lobbyManager = new LobbyManager(
+                _packetBuilder,
+                packet => EncryptAndSend(packet));
+
+            _matchmakingManager = new MatchmakingManager(
+                _packetBuilder,
+                packet => EncryptAndSend(packet),
+                () => _state,
+                () => _localPlayerStringId ?? string.Empty);
 
             var registry  = new NetworkObjectRegistry();
             var ownership = new OwnershipManager(registry, this);
@@ -936,11 +1057,45 @@ namespace RTMPE.Core
                 // ── Keep-alive ───────────────────────────────────────────────
                 case PacketType.HeartbeatAck: OnHeartbeatAck(data); break;
 
-                // ── Room / session ─────────────────────────────────
+                // ── Room lifecycle (0x20–0x23) ─────────────────────
                 case PacketType.RoomCreate:
                 case PacketType.RoomJoin:
                 case PacketType.RoomLeave:
                 case PacketType.RoomList:
+                    OnRoomPacket(packetType, data);
+                    break;
+
+                // ── Custom property broadcasts (0x24–0x25) ─────────
+                case PacketType.RoomPropertyUpdate:
+                    OnRoomPropertyUpdateBroadcast(data);
+                    break;
+                case PacketType.PlayerPropertyUpdate:
+                    OnPlayerPropertyUpdateBroadcast(data);
+                    break;
+
+                // ── Matchmaking (0x26, 0x2B) ──────────────────────
+                case PacketType.MatchmakingResponse:
+                    _matchmakingManager?.HandleMatchmakingResponse(
+                        PacketParser.ExtractPayload(data));
+                    break;
+
+                // ── Lobby system (0x27–0x2A) ───────────────────────
+                case PacketType.LobbyJoin:
+                case PacketType.LobbyList:
+                    OnLobbyPacket(packetType, data);
+                    break;
+                case PacketType.LobbyLeave:
+                    // Fire-and-forget — no reply; notify listeners.
+                    OnLobbyPacket(packetType, data);
+                    break;
+                case PacketType.LobbyRoomListUpdate:
+                    OnLobbyRoomListUpdate(data);
+                    break;
+
+                // ── Room management broadcasts (0x2C, 0x2E, 0x2F) ──
+                case PacketType.MasterClientChanged:
+                case PacketType.KickPlayer:
+                case PacketType.SceneLoaded:
                     OnRoomPacket(packetType, data);
                     break;
 
@@ -961,6 +1116,7 @@ namespace RTMPE.Core
                 // ── RPC system ─────────────────────────────────────
                 case PacketType.Rpc:              OnRpcRequest(data);    break;
                 case PacketType.RpcResponse:      OnRpcResponse(data);   break;
+                case PacketType.RpcBufferReplay:  HandleRpcBufferReplay(PacketParser.ExtractPayload(data)); break;
 
                 // Receive inbound variable update packets.
                 case PacketType.VariableUpdate:   HandleVariableUpdatePacket(data); break;
@@ -1178,13 +1334,82 @@ namespace RTMPE.Core
         }
 
         /// <summary>
-        /// Route all room packets (0x20–0x23) to the RoomManager.
+        /// Route room packets to the RoomManager (lifecycle 0x20–0x23,
+        /// management 0x2C/0x2E/0x2F).
         /// </summary>
         private void OnRoomPacket(PacketType type, byte[] data)
         {
             if (_roomManager == null) return;
             var payload = PacketParser.ExtractPayload(data);
             _roomManager.HandleRoomPacket(type, payload);
+        }
+
+        /// <summary>
+        /// Routes a LobbyJoin reply (0x27) or LobbyList reply (0x29) to the
+        /// LobbyManager.  LobbyLeave (0x28) has no server reply but is passed
+        /// here for uniform event notification if needed.
+        /// </summary>
+        private void OnLobbyPacket(PacketType type, byte[] data)
+        {
+            if (_lobbyManager == null) return;
+            if (type == PacketType.LobbyLeave) return; // fire-and-forget: no reply payload
+            var payload = PacketParser.ExtractPayload(data);
+            _lobbyManager.HandleLobbyReply(payload);
+        }
+
+        /// <summary>
+        /// Routes a LobbyRoomListUpdate push (0x2A) to the LobbyManager.
+        /// </summary>
+        private void OnLobbyRoomListUpdate(byte[] data)
+        {
+            if (_lobbyManager == null) return;
+            var payload = PacketParser.ExtractPayload(data);
+            _lobbyManager.HandleLobbyRoomListUpdate(payload);
+        }
+
+        /// <summary>
+        /// Handle an inbound <c>RoomPropertyUpdate</c> (0x24) broadcast from
+        /// the server.  Decodes the JSON payload and applies the accepted
+        /// property snapshot to the local <see cref="RoomManager.CurrentRoom"/>.
+        /// </summary>
+        private void OnRoomPropertyUpdateBroadcast(byte[] data)
+        {
+            if (_roomManager == null) return;
+            var payload = PacketParser.ExtractPayload(data);
+            if (payload == null || payload.Length == 0) return;
+            try
+            {
+                var json = System.Text.Encoding.UTF8.GetString(payload);
+                var (version, props) = PropertyJson.DecodeRoomPayload(json);
+                _roomManager.ApplyRoomPropertiesBroadcast(version, props);
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"RoomPropertyUpdate broadcast: decode failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Handle an inbound <c>PlayerPropertyUpdate</c> (0x25) broadcast from
+        /// the server.  Decodes the JSON payload and applies the accepted
+        /// property snapshot to the matching player in
+        /// <see cref="RoomManager.CurrentRoom"/>.
+        /// </summary>
+        private void OnPlayerPropertyUpdateBroadcast(byte[] data)
+        {
+            if (_roomManager == null) return;
+            var payload = PacketParser.ExtractPayload(data);
+            if (payload == null || payload.Length == 0) return;
+            try
+            {
+                var json = System.Text.Encoding.UTF8.GetString(payload);
+                var (playerId, version, props) = PropertyJson.DecodePlayerPayload(json);
+                _roomManager.ApplyPlayerPropertiesBroadcast(playerId, version, props);
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"PlayerPropertyUpdate broadcast: decode failed: {ex.Message}");
+            }
         }
 
         // ── Spawn / Despawn inbound handlers ─────────────────────────
@@ -1241,7 +1466,18 @@ namespace RTMPE.Core
         /// </summary>
         private void OnRpcRequest(byte[] data)
         {
+            // Distinguish Enhanced RPC (27-byte header, typed params) from legacy (18-byte).
+            bool isEnhanced = (data[PacketProtocol.OFFSET_FLAGS] & (byte)PacketFlags.EnhancedRpc) != 0;
+
             var payload = PacketParser.ExtractPayload(data);
+
+            if (isEnhanced)
+            {
+                OnEnhancedRpcRequest(payload);
+                return;
+            }
+
+            // Legacy RPC path.
             if (!RpcPacketParser.TryParseRequest(payload, out var request))
             {
                 LogDebug("RPC request: malformed payload, dropped.");
@@ -1260,6 +1496,84 @@ namespace RTMPE.Core
                 default:
                     LogDebug($"RPC request: unhandled method_id {request.MethodId}.");
                     break;
+            }
+        }
+
+        /// <summary>
+        /// Dispatch an inbound Enhanced RPC packet to the target <c>NetworkBehaviour</c>.
+        /// Resolves the object via the spawn registry and invokes the correct
+        /// <c>[RtmpeRpc]</c> method via <see cref="RTMPE.Core.NetworkBehaviour.DispatchEnhancedRpc"/>.
+        /// </summary>
+        private void OnEnhancedRpcRequest(byte[] payload)
+        {
+            if (!EnhancedRpcPacketParser.TryParse(payload, out var req))
+            {
+                LogDebug("Enhanced RPC: malformed payload, dropped.");
+                return;
+            }
+
+            var nb = _spawnManager?.Registry?.Get(req.ObjectId);
+            if (nb == null)
+            {
+                LogDebug($"Enhanced RPC: no spawned object with id {req.ObjectId} — dropped.");
+                return;
+            }
+
+            nb.DispatchEnhancedRpc(req.MethodId, req.Args);
+        }
+
+        /// <summary>
+        /// Handle an <c>RpcBufferReplay</c> (0x52) packet delivered immediately after joining a room.
+        /// Decodes the binary replay buffer and dispatches each Enhanced RPC event as if it arrived live.
+        /// </summary>
+        /// <param name="payload">
+        /// Binary payload: [event_count:2 LE u16][for each: [payload_len:2 LE u16][payload:N bytes]]
+        /// </param>
+        private void HandleRpcBufferReplay(byte[] payload)
+        {
+            if (payload == null || payload.Length < 2)
+            {
+                LogDebug("RpcBufferReplay: empty or truncated payload, skipped.");
+                return;
+            }
+
+            int offset = 0;
+            ushort eventCount = (ushort)(payload[offset] | (payload[offset + 1] << 8));
+            offset += 2;
+
+            for (int i = 0; i < eventCount; i++)
+            {
+                if (offset + 2 > payload.Length)
+                {
+                    LogDebug($"RpcBufferReplay: truncated at event {i}/{eventCount}, aborting replay.");
+                    return;
+                }
+                ushort payloadLen = (ushort)(payload[offset] | (payload[offset + 1] << 8));
+                offset += 2;
+
+                if (offset + payloadLen > payload.Length)
+                {
+                    LogDebug($"RpcBufferReplay: event {i} payload truncated ({payloadLen} bytes), aborting.");
+                    return;
+                }
+
+                var eventPayload = new byte[payloadLen];
+                Array.Copy(payload, offset, eventPayload, 0, payloadLen);
+                offset += payloadLen;
+
+                if (!EnhancedRpcPacketParser.TryParse(eventPayload, out var request))
+                {
+                    LogDebug($"RpcBufferReplay: failed to parse event {i}, skipped.");
+                    continue;
+                }
+
+                var nb = _spawnManager?.Registry?.Get(request.ObjectId);
+                if (nb == null)
+                {
+                    LogDebug($"RpcBufferReplay: no spawned object {request.ObjectId} for event {i}, skipped.");
+                    continue;
+                }
+                nb.DispatchEnhancedRpc(request.MethodId, request.Args);
             }
         }
 
@@ -1999,16 +2313,10 @@ namespace RTMPE.Core
             var nb = _spawnManager.Registry.Get(objectId);
             if (nb == null) return;
 
-            // Owning client: we are the sender; do not apply our own updates.
-            if (nb.IsOwner) return;
-
-            // Find the interpolator on the same GameObject.
-            var interp = nb.GetComponent<NetworkTransformInterpolator>();
-            if (interp == null) return;
-
             // Build a blended state: merge only the fields present in the delta.
             // Fields absent from the delta keep zero-initialised values in `state`
-            // which would clobber the current transform — use the live transform instead.
+            // which would clobber the current transform — fall back to the live
+            // transform for those axes.
             var current = nb.GetComponent<NetworkTransform>()?.GetState()
                           ?? new TransformState { Position = nb.transform.position,
                                                   Rotation = nb.transform.rotation,
@@ -2022,6 +2330,19 @@ namespace RTMPE.Core
                 Scale    = (changedMask & TransformPacketParser.ChangedScale) != 0
                                ? state.Scale : current.Scale,
             };
+
+            // Owning client: feed the server's authoritative state into the
+            // NetworkTransform reconciliation path (CSP correction) if prediction
+            // is enabled; otherwise discard as before.
+            if (nb.IsOwner)
+            {
+                nb.GetComponent<NetworkTransform>()?.ApplyReconciliation(blended);
+                return;
+            }
+
+            // Non-owning client: buffer into the interpolator for smooth playback.
+            var interp = nb.GetComponent<NetworkTransformInterpolator>();
+            if (interp == null) return;
 
             interp.AddState(blended, UnityEngine.Time.timeAsDouble);
         }
@@ -2111,6 +2432,38 @@ namespace RTMPE.Core
             EncryptAndSend(packet);
         }
 
+        // ── Position update send path (Feature #6 — Interest Management) ───
+
+        /// <summary>
+        /// Build and enqueue a <c>PositionUpdate</c> (0x42) packet carrying the
+        /// client's 2-D world position so the gateway can apply zone-based
+        /// interest filtering to room-wide broadcasts.
+        ///
+        /// <para>Call this from <see cref="RTMPE.Rooms.InterestManager"/> at the
+        /// configured update interval while in a room.  Sending outside a room is
+        /// a no-op (the gateway has no room context to filter against).</para>
+        ///
+        /// <para>Payload layout: <c>[x: f32 LE 4 B][y: f32 LE 4 B]</c> — 8 bytes.</para>
+        /// </summary>
+        internal void SendPositionUpdate(float x, float y)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+
+            var payload = new byte[8];
+            var xBytes = BitConverter.GetBytes(x);
+            var yBytes = BitConverter.GetBytes(y);
+            if (!BitConverter.IsLittleEndian)
+            {
+                System.Array.Reverse(xBytes);
+                System.Array.Reverse(yBytes);
+            }
+            System.Buffer.BlockCopy(xBytes, 0, payload, 0, 4);
+            System.Buffer.BlockCopy(yBytes, 0, payload, 4, 4);
+
+            var packet = _packetBuilder.Build(PacketType.PositionUpdate, PacketFlags.None, payload);
+            EncryptAndSend(packet);
+        }
+
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
@@ -2136,8 +2489,72 @@ namespace RTMPE.Core
             }
 
             uint requestId = (uint)System.Threading.Interlocked.Increment(ref _rpcRequestCounter);
+#pragma warning disable CS0618  // intentional: built-in method IDs still use the legacy builder
             byte[] rpcMessage = RpcPacketBuilder.BuildRequest(methodId, LocalPlayerId, requestId, rpcPayload);
+#pragma warning restore CS0618
             byte[] packet     = BuildPacket(PacketType.Rpc, PacketFlags.Reliable, rpcMessage);
+            Send(packet, reliable: true);
+        }
+
+        /// <summary>
+        /// Build and enqueue an Enhanced RPC request for a
+        /// <see cref="RtmpeRpcAttribute"/>-decorated method on a
+        /// <see cref="NetworkBehaviour"/> component.
+        ///
+        /// <para>Called internally by <see cref="NetworkBehaviour.RPC"/>. Game code
+        /// should not call this directly — use <c>NetworkBehaviour.RPC()</c> instead.</para>
+        /// </summary>
+        /// <param name="sender">The <c>NetworkBehaviour</c> originating the call.</param>
+        /// <param name="methodName">Name of the <c>[RtmpeRpc]</c>-decorated method.</param>
+        /// <param name="args">Typed arguments (must be serializable by <see cref="RpcSerializer"/>).</param>
+        public void SendEnhancedRpc(NetworkBehaviour sender, string methodName, object[] args)
+        {
+            if (!IsInRoom)
+            {
+                Debug.LogWarning("[RTMPE] NetworkManager.SendEnhancedRpc: must be in a room.");
+                return;
+            }
+
+            if (sender == null)
+            {
+                Debug.LogWarning("[RTMPE] NetworkManager.SendEnhancedRpc: sender is null.");
+                return;
+            }
+
+            if (!RpcRegistry.TryGetMethodId(sender.GetType(), methodName, out uint methodId))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] NetworkManager.SendEnhancedRpc: no [RtmpeRpc] method named " +
+                    $"'{methodName}' on {sender.GetType().Name}. Ensure the method is public " +
+                    "and decorated with [RtmpeRpc].");
+                return;
+            }
+
+            // Read target from the attribute so callers do not pass it explicitly.
+            RpcRegistry.TryFindMethod(sender.GetType(), methodId, out _, out var attr);
+            var target = attr?.Target ?? RpcTarget.All;
+
+            uint requestId = (uint)System.Threading.Interlocked.Increment(ref _rpcRequestCounter);
+
+            byte[] rpcPayload;
+            try
+            {
+                rpcPayload = EnhancedRpcPacketBuilder.Build(
+                    methodId, LocalPlayerId, requestId,
+                    sender.NetworkObjectId, target, args);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError(
+                    $"[RTMPE] NetworkManager.SendEnhancedRpc: failed to build packet for " +
+                    $"'{sender.GetType().Name}.{methodName}': {ex.Message}");
+                return;
+            }
+
+            byte[] packet = BuildPacket(
+                PacketType.Rpc,
+                PacketFlags.Reliable | PacketFlags.EnhancedRpc,
+                rpcPayload);
             Send(packet, reliable: true);
         }
 

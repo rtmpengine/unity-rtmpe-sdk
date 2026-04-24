@@ -2298,7 +2298,15 @@ namespace RTMPE.Core
 
         /// <summary>
         /// Route incoming <c>StateSync</c>/<c>Data</c> server broadcasts to
-        /// the <see cref="NetworkTransformInterpolator"/> on the matching spawned object.
+        /// the appropriate sync component on the matching spawned object.
+        ///
+        /// <para>Dispatch priority:</para>
+        /// <list type="number">
+        ///   <item><see cref="TransformPacketParser"/> — handles transform deltas (changed_mask bits 0x01–0x07 only).</item>
+        ///   <item><see cref="PhysicsPacketParser.IsPhysics2D"/> — handles 2-D Rigidbody2D packets (bit 0x80 set).</item>
+        ///   <item><see cref="PhysicsPacketParser.IsPhysics3D"/> — handles 3-D Rigidbody packets (bit 0x40 set, bit 0x80 clear).</item>
+        /// </list>
+        ///
         /// Subscribed to <see cref="OnDataReceived"/> in <see cref="InitialiseNetwork"/>.
         /// </summary>
         private void HandleStateSyncPacket(byte[] data)
@@ -2306,45 +2314,101 @@ namespace RTMPE.Core
             if (_spawnManager == null) return;
 
             var payload = PacketParser.ExtractPayload(data);
-            if (!TransformPacketParser.TryParseStateDelta(
+            if (payload == null || payload.Length < 9) return;
+
+            // ── 1. Try transform parse ─────────────────────────────────────────
+            if (TransformPacketParser.TryParseStateDelta(
                     payload, out ulong objectId, out byte changedMask, out TransformState state))
-                return;
-
-            var nb = _spawnManager.Registry.Get(objectId);
-            if (nb == null) return;
-
-            // Build a blended state: merge only the fields present in the delta.
-            // Fields absent from the delta keep zero-initialised values in `state`
-            // which would clobber the current transform — fall back to the live
-            // transform for those axes.
-            var current = nb.GetComponent<NetworkTransform>()?.GetState()
-                          ?? new TransformState { Position = nb.transform.position,
-                                                  Rotation = nb.transform.rotation,
-                                                  Scale    = nb.transform.localScale };
-            var blended = new TransformState
             {
-                Position = (changedMask & TransformPacketParser.ChangedPosition) != 0
-                               ? state.Position : current.Position,
-                Rotation = (changedMask & TransformPacketParser.ChangedRotation) != 0
-                               ? state.Rotation : current.Rotation,
-                Scale    = (changedMask & TransformPacketParser.ChangedScale) != 0
-                               ? state.Scale : current.Scale,
-            };
+                var nb = _spawnManager.Registry.Get(objectId);
+                if (nb == null) return;
 
-            // Owning client: feed the server's authoritative state into the
-            // NetworkTransform reconciliation path (CSP correction) if prediction
-            // is enabled; otherwise discard as before.
-            if (nb.IsOwner)
-            {
-                nb.GetComponent<NetworkTransform>()?.ApplyReconciliation(blended);
+                // Build a blended state: merge only the fields present in the delta.
+                // Fields absent from the delta keep zero-initialised values in `state`
+                // which would clobber the current transform — fall back to the live
+                // transform for those axes.
+                var current = nb.GetComponent<NetworkTransform>()?.GetState()
+                              ?? new TransformState { Position = nb.transform.position,
+                                                      Rotation = nb.transform.rotation,
+                                                      Scale    = nb.transform.localScale };
+                var blended = new TransformState
+                {
+                    Position = (changedMask & TransformPacketParser.ChangedPosition) != 0
+                                   ? state.Position : current.Position,
+                    Rotation = (changedMask & TransformPacketParser.ChangedRotation) != 0
+                                   ? state.Rotation : current.Rotation,
+                    Scale    = (changedMask & TransformPacketParser.ChangedScale) != 0
+                                   ? state.Scale : current.Scale,
+                };
+
+                if (nb.IsOwner)
+                {
+                    nb.GetComponent<NetworkTransform>()?.ApplyReconciliation(blended);
+                    return;
+                }
+
+                var interp = nb.GetComponent<NetworkTransformInterpolator>();
+                if (interp == null) return;
+                interp.AddState(blended, UnityEngine.Time.timeAsDouble);
                 return;
             }
 
-            // Non-owning client: buffer into the interpolator for smooth playback.
-            var interp = nb.GetComponent<NetworkTransformInterpolator>();
-            if (interp == null) return;
+            // ── 2. Try 2-D physics parse (bit 0x80 discriminates from 3-D) ────
+            if (PhysicsPacketParser.IsPhysics2D(payload))
+            {
+                HandlePhysicsSync2DPacket(payload);
+                return;
+            }
 
-            interp.AddState(blended, UnityEngine.Time.timeAsDouble);
+            // ── 3. Try 3-D physics parse (bit 0x40 set, bit 0x80 clear) ────────
+            if (PhysicsPacketParser.IsPhysics3D(payload))
+            {
+                HandlePhysicsSyncPacket(payload);
+            }
+        }
+
+        /// <summary>
+        /// Route an inbound 3-D physics-sync payload to the
+        /// <see cref="NetworkRigidbody"/> component on the matching object.
+        /// </summary>
+        private void HandlePhysicsSyncPacket(byte[] payload)
+        {
+            if (!PhysicsPacketParser.TryParsePhysicsState(
+                    payload, out ulong objectId, out byte changedMask, out PhysicsState state))
+                return;
+
+            var nb = _spawnManager?.Registry.Get(objectId);
+            if (nb == null) return;
+
+            if (nb.IsOwner)
+            {
+                nb.GetComponent<NetworkRigidbody>()?.ApplyReconciliation(state, changedMask);
+                return;
+            }
+
+            nb.GetComponent<NetworkRigidbody>()?.ApplyRemoteState(state, changedMask);
+        }
+
+        /// <summary>
+        /// Route an inbound 2-D physics-sync payload to the
+        /// <see cref="NetworkRigidbody2D"/> component on the matching object.
+        /// </summary>
+        private void HandlePhysicsSync2DPacket(byte[] payload)
+        {
+            if (!PhysicsPacketParser.TryParsePhysicsState2D(
+                    payload, out ulong objectId, out byte changedMask, out PhysicsState2D state))
+                return;
+
+            var nb = _spawnManager?.Registry.Get(objectId);
+            if (nb == null) return;
+
+            if (nb.IsOwner)
+            {
+                nb.GetComponent<NetworkRigidbody2D>()?.ApplyReconciliation(state, changedMask);
+                return;
+            }
+
+            nb.GetComponent<NetworkRigidbody2D>()?.ApplyRemoteState(state, changedMask);
         }
 
         // ── Variable update inbound handler ────────────────────────────
@@ -2449,16 +2513,20 @@ namespace RTMPE.Core
         {
             if (_networkThread == null || _packetBuilder == null) return;
 
+            // Use SingleToInt32Bits + explicit byte extraction (same pattern as
+            // TransformPacketBuilder.WriteF32LE) to avoid the two temporary byte[]
+            // allocations that BitConverter.GetBytes(float) causes per call.
             var payload = new byte[8];
-            var xBytes = BitConverter.GetBytes(x);
-            var yBytes = BitConverter.GetBytes(y);
-            if (!BitConverter.IsLittleEndian)
-            {
-                System.Array.Reverse(xBytes);
-                System.Array.Reverse(yBytes);
-            }
-            System.Buffer.BlockCopy(xBytes, 0, payload, 0, 4);
-            System.Buffer.BlockCopy(yBytes, 0, payload, 4, 4);
+            int xBits = BitConverter.SingleToInt32Bits(x);
+            int yBits = BitConverter.SingleToInt32Bits(y);
+            payload[0] = (byte) xBits;
+            payload[1] = (byte)(xBits >>  8);
+            payload[2] = (byte)(xBits >> 16);
+            payload[3] = (byte)(xBits >> 24);
+            payload[4] = (byte) yBits;
+            payload[5] = (byte)(yBits >>  8);
+            payload[6] = (byte)(yBits >> 16);
+            payload[7] = (byte)(yBits >> 24);
 
             var packet = _packetBuilder.Build(PacketType.PositionUpdate, PacketFlags.None, payload);
             EncryptAndSend(packet);
@@ -2634,6 +2702,36 @@ namespace RTMPE.Core
 
             var packet = _packetBuilder.Build(
                 PacketType.Data,
+                PacketFlags.None,
+                payload);
+
+            EncryptAndSend(packet);
+        }
+
+        /// <summary>
+        /// Wrap <paramref name="payload"/> in a <see cref="PacketType.StateSync"/> header
+        /// and transmit it as an unreliable UDP packet.
+        ///
+        /// <para>Called by <see cref="RTMPE.Sync.NetworkRigidbody"/> and
+        /// <see cref="RTMPE.Sync.NetworkRigidbody2D"/> to send physics-state updates.
+        /// StateSync packets flow through the Sync Engine which aggregates and
+        /// rebroadcasts them to all room members at the 30 Hz tick rate.</para>
+        ///
+        /// <para>Sending as StateSync rather than Data means the Sync Engine
+        /// processes the payload as object state, applying interest-zone filtering
+        /// and dead-client pruning before the broadcast.</para>
+        /// </summary>
+        /// <param name="payload">
+        /// Physics-state payload built by <see cref="RTMPE.Sync.PhysicsPacketBuilder"/>.
+        /// A <see langword="null"/> or empty array is silently ignored.
+        /// </param>
+        internal void SendStateSync(byte[] payload)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+            if (payload == null || payload.Length == 0) return;
+
+            var packet = _packetBuilder.Build(
+                PacketType.StateSync,
                 PacketFlags.None,
                 payload);
 

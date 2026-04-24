@@ -1,0 +1,367 @@
+// RTMPE SDK — Runtime/Sync/NetworkRigidbody2D.cs
+//
+// MonoBehaviour component that synchronises a GameObject's 2-D Rigidbody2D
+// physics state (position, rotation, velocity, angular velocity, sleep) over
+// the RTMPE network.
+//
+// ── Architecture ──────────────────────────────────────────────────────────────
+//
+//   Mirrors NetworkRigidbody exactly but targets Rigidbody2D instead of Rigidbody.
+//   Key 2-D differences:
+//     • Position is Vector2 (XY plane); Z is never touched.
+//     • Rotation is a single float in degrees (not a Quaternion).
+//     • AngularVelocity is a single float in degrees/second.
+//     • MovePosition(Vector2) / MoveRotation(float) are used for non-kinematic
+//       correction (Rigidbody2D's equivalents of the 3-D MovePosition/Rotation).
+//
+//   Owner (authoritative physics):
+//     FixedUpdate() captures Rigidbody2D state and sends PhysicsSync2D payloads
+//     as PacketType.StateSync (0x40) when enabled fields change beyond thresholds.
+//
+//   Non-owner (remote simulation):
+//     ApplyRemoteState() is called by NetworkManager when a 2-D physics packet
+//     arrives.  FixedUpdate() applies dead reckoning, position/rotation correction,
+//     and velocity blending each physics step.
+//
+// ── Threading ─────────────────────────────────────────────────────────────────
+//
+//   All methods run on the Unity main thread.  No locks needed.
+//
+// ── Angle conventions ─────────────────────────────────────────────────────────
+//
+//   Rigidbody2D.rotation returns degrees in the range (-180, 180].
+//   Rigidbody2D.angularVelocity returns degrees/second.
+//   Both values are transmitted as-is (no conversion to radians).
+//   Quaternion.Angle is NOT used for rotation-change detection; Mathf.Abs of
+//   the delta angle (with DeltaAngle normalisation) is used instead.
+
+using UnityEngine;
+using RTMPE.Core;
+
+namespace RTMPE.Sync
+{
+    /// <summary>
+    /// Synchronises a 2-D <see cref="UnityEngine.Rigidbody2D"/> over the RTMPE network.
+    /// <para>
+    /// Attach alongside a <see cref="NetworkBehaviour"/> subclass on any prefab
+    /// that is spawned via <c>SpawnManager</c> and driven by Unity 2-D physics.
+    /// </para>
+    /// </summary>
+    [AddComponentMenu("RTMPE/Network Rigidbody 2D")]
+    [RequireComponent(typeof(Rigidbody2D))]
+    public class NetworkRigidbody2D : NetworkBehaviour
+    {
+        // ── Inspector — Sync toggles ───────────────────────────────────────────
+
+        [Header("Sync Fields")]
+        [Tooltip("Synchronise world-space 2-D position.")]
+        [SerializeField] private bool _syncPosition = true;
+
+        [Tooltip("Synchronise Z-axis rotation (degrees).")]
+        [SerializeField] private bool _syncRotation = true;
+
+        [Tooltip("Synchronise linear velocity so remote bodies continue moving between packets.")]
+        [SerializeField] private bool _syncVelocity = true;
+
+        [Tooltip("Synchronise angular velocity (deg/s) so remote bodies continue spinning between packets.")]
+        [SerializeField] private bool _syncAngularVelocity = true;
+
+        [Tooltip("Synchronise sleep state so remote bodies idle when the owner body is asleep.")]
+        [SerializeField] private bool _syncSleepState = true;
+
+        // ── Inspector — Send thresholds ────────────────────────────────────────
+
+        [Header("Send Thresholds")]
+        [Tooltip("Minimum 2-D position change in world units since last send.")]
+        [SerializeField] private float _positionThreshold = 0.01f;
+
+        [Tooltip("Minimum rotation change in degrees since last send.")]
+        [SerializeField] private float _rotationThreshold = 0.1f;
+
+        [Tooltip("Minimum linear velocity change (magnitude) in units/second since last send.")]
+        [SerializeField] private float _velocityThreshold = 0.05f;
+
+        [Tooltip("Minimum angular velocity change in degrees/second since last send.")]
+        [SerializeField] private float _angularVelocityThreshold = 1.0f;
+
+        // ── Inspector — Remote body ────────────────────────────────────────────
+
+        [Header("Remote Body Behaviour")]
+        [Tooltip("When true, the Rigidbody2D on non-owner clients is set to kinematic on spawn.")]
+        [SerializeField] private bool _makeRemoteKinematic = false;
+
+        [Tooltip("Position error in world units above which the remote body snaps " +
+                 "immediately to the authoritative position.")]
+        [SerializeField] private float _snapThreshold = 3.0f;
+
+        [Tooltip("Speed at which the remote body lerps toward the authoritative position.")]
+        [SerializeField] [Range(1f, 50f)] private float _positionCorrectionSpeed = 10f;
+
+        [Tooltip("Speed at which the remote body lerps toward the authoritative rotation.")]
+        [SerializeField] [Range(1f, 50f)] private float _rotationCorrectionSpeed = 10f;
+
+        // ── Inspector — Dead reckoning ─────────────────────────────────────────
+
+        [Header("Dead Reckoning")]
+        [Tooltip("Extrapolate the remote body's position using the last received velocity " +
+                 "while no new packet has arrived.")]
+        [SerializeField] private bool _enableDeadReckoning = true;
+
+        [Tooltip("Seconds after the last packet after which dead reckoning stops.")]
+        [SerializeField] [Range(0.1f, 2.0f)] private float _deadReckoningTimeout = 0.5f;
+
+        // ── Inspector — Send rate ──────────────────────────────────────────────
+
+        [Header("Send Rate")]
+        [Tooltip("Physics-state updates sent per second by the owner client.")]
+        [SerializeField] [Range(1, 30)] private int _sendRateHz = 20;
+
+        // ── Runtime state ──────────────────────────────────────────────────────
+
+        private Rigidbody2D _rb;
+
+        // Owner side.
+        private PhysicsState2D _lastSentState;
+        private bool           _hasSentOnce;
+        private bool           _lastSleepState;
+        private float          _sendAccum;
+
+        // Non-owner side.
+        private PhysicsState2D _receivedState;
+        private float          _lastReceiveTime;
+        private bool           _hasReceivedState;
+
+        // ── Unity lifecycle ────────────────────────────────────────────────────
+
+        protected override void OnNetworkSpawn()
+        {
+            _rb = GetComponent<Rigidbody2D>();
+            if (_rb == null)
+            {
+                Debug.LogError("[RTMPE] NetworkRigidbody2D.OnNetworkSpawn: " +
+                               "no Rigidbody2D found on this GameObject.", this);
+                return;
+            }
+
+            if (!IsOwner && _makeRemoteKinematic)
+                _rb.bodyType = RigidbodyType2D.Kinematic;
+
+            if (IsOwner)
+            {
+                _lastSentState  = GetState();
+                _lastSleepState = _rb.IsSleeping();
+                _hasSentOnce    = false;
+            }
+
+            _sendAccum = 0f;
+        }
+
+        protected override void OnNetworkDespawn()
+        {
+            _hasReceivedState = false;
+            _hasSentOnce      = false;
+        }
+
+        private void FixedUpdate()
+        {
+            if (!IsSpawned || _rb == null) return;
+
+            if (IsOwner)
+                OwnerFixedUpdate();
+            else
+                RemoteFixedUpdate();
+        }
+
+        // ── Owner update ───────────────────────────────────────────────────────
+
+        private void OwnerFixedUpdate()
+        {
+            _sendAccum += Time.fixedDeltaTime;
+            float sendInterval = 1f / _sendRateHz;
+            if (_sendAccum < sendInterval) return;
+            _sendAccum -= sendInterval;
+
+            var  current  = GetState();
+            byte dataMask = BuildChangedMask(current);
+
+            if (!_hasSentOnce)
+            {
+                dataMask     = BuildFullMask();
+                _hasSentOnce = true;
+            }
+
+            if (dataMask == 0x00) return;
+
+            var manager = NetworkManager.Instance;
+            if (manager == null) return;
+
+            var payload = PhysicsPacketBuilder.Build2DPayload(NetworkObjectId, current, dataMask);
+            manager.SendStateSync(payload);
+
+            _lastSentState  = current;
+            _lastSleepState = current.IsSleeping;
+        }
+
+        private byte BuildChangedMask(PhysicsState2D current)
+        {
+            byte mask = 0;
+
+            if (_syncPosition &&
+                (current.Position - _lastSentState.Position).magnitude > _positionThreshold)
+                mask |= PhysicsPacketBuilder.ChangedPosition;
+
+            if (_syncRotation &&
+                Mathf.Abs(Mathf.DeltaAngle(current.Rotation, _lastSentState.Rotation)) > _rotationThreshold)
+                mask |= PhysicsPacketBuilder.ChangedRotation;
+
+            if (_syncVelocity &&
+                (current.Velocity - _lastSentState.Velocity).magnitude > _velocityThreshold)
+                mask |= PhysicsPacketBuilder.ChangedVelocity;
+
+            if (_syncAngularVelocity &&
+                Mathf.Abs(current.AngularVelocity - _lastSentState.AngularVelocity) > _angularVelocityThreshold)
+                mask |= PhysicsPacketBuilder.ChangedAngularVelocity;
+
+            if (_syncSleepState && current.IsSleeping != _lastSleepState)
+                mask |= PhysicsPacketBuilder.ChangedSleep;
+
+            return mask;
+        }
+
+        private byte BuildFullMask()
+        {
+            byte mask = 0;
+            if (_syncPosition)        mask |= PhysicsPacketBuilder.ChangedPosition;
+            if (_syncRotation)        mask |= PhysicsPacketBuilder.ChangedRotation;
+            if (_syncVelocity)        mask |= PhysicsPacketBuilder.ChangedVelocity;
+            if (_syncAngularVelocity) mask |= PhysicsPacketBuilder.ChangedAngularVelocity;
+            if (_syncSleepState)      mask |= PhysicsPacketBuilder.ChangedSleep;
+            return mask;
+        }
+
+        // ── Non-owner update ───────────────────────────────────────────────────
+
+        private void RemoteFixedUpdate()
+        {
+            if (!_hasReceivedState) return;
+
+            // ── Sleep handling ────────────────────────────────────────────────
+            if (_syncSleepState && _receivedState.IsSleeping)
+            {
+                if (!_rb.IsSleeping()) _rb.Sleep();
+                return;
+            }
+            if (_rb.IsSleeping()) _rb.WakeUp();
+
+            float timeSincePacket = Time.fixedTime - _lastReceiveTime;
+
+            // ── Dead reckoning ─────────────────────────────────────────────────
+            Vector2 targetPos = _receivedState.Position;
+            if (_enableDeadReckoning && timeSincePacket < _deadReckoningTimeout && _syncVelocity)
+                targetPos = _receivedState.Position + _receivedState.Velocity * timeSincePacket;
+
+            // ── Position correction ───────────────────────────────────────────
+            if (_syncPosition)
+            {
+                float posError = (targetPos - _rb.position).magnitude;
+                if (posError > _snapThreshold)
+                {
+                    if (_makeRemoteKinematic)
+                        _rb.position = targetPos;
+                    else
+                        _rb.MovePosition(targetPos);
+                }
+                else
+                {
+                    Vector2 corrected = Vector2.Lerp(
+                        _rb.position, targetPos,
+                        Time.fixedDeltaTime * _positionCorrectionSpeed);
+                    if (_makeRemoteKinematic)
+                        _rb.position = corrected;
+                    else
+                        _rb.MovePosition(corrected);
+                }
+            }
+
+            // ── Rotation correction ────────────────────────────────────────────
+            // Use Mathf.LerpAngle to take the shortest arc through zero degrees.
+            if (_syncRotation)
+            {
+                float correctedAngle = Mathf.LerpAngle(
+                    _rb.rotation, _receivedState.Rotation,
+                    Time.fixedDeltaTime * _rotationCorrectionSpeed);
+                if (_makeRemoteKinematic)
+                    _rb.rotation = correctedAngle;
+                else
+                    _rb.MoveRotation(correctedAngle);
+            }
+
+            // ── Velocity blending (non-kinematic only) ─────────────────────────
+            if (!_makeRemoteKinematic)
+            {
+                if (_syncVelocity)
+                    _rb.linearVelocity = Vector2.Lerp(
+                        _rb.linearVelocity, _receivedState.Velocity,
+                        Time.fixedDeltaTime * _positionCorrectionSpeed);
+
+                if (_syncAngularVelocity)
+                    _rb.angularVelocity = Mathf.Lerp(
+                        _rb.angularVelocity, _receivedState.AngularVelocity,
+                        Time.fixedDeltaTime * _rotationCorrectionSpeed);
+            }
+        }
+
+        // ── Internal API (called by NetworkManager) ────────────────────────────
+
+        /// <summary>
+        /// Apply an incoming 2-D physics-state update from a remote owner.
+        /// Called by <c>NetworkManager.HandlePhysicsSync2DPacket</c> on non-owner clients.
+        /// </summary>
+        internal void ApplyRemoteState(PhysicsState2D incoming, byte changedMask)
+        {
+            if ((changedMask & PhysicsPacketBuilder.ChangedPosition) != 0)
+                _receivedState.Position = incoming.Position;
+
+            if ((changedMask & PhysicsPacketBuilder.ChangedRotation) != 0)
+                _receivedState.Rotation = incoming.Rotation;
+
+            if ((changedMask & PhysicsPacketBuilder.ChangedVelocity) != 0)
+                _receivedState.Velocity = incoming.Velocity;
+
+            if ((changedMask & PhysicsPacketBuilder.ChangedAngularVelocity) != 0)
+                _receivedState.AngularVelocity = incoming.AngularVelocity;
+
+            if ((changedMask & PhysicsPacketBuilder.ChangedSleep) != 0)
+                _receivedState.IsSleeping = incoming.IsSleeping;
+
+            _lastReceiveTime  = Time.fixedTime;
+            _hasReceivedState = true;
+        }
+
+        /// <summary>
+        /// No-op reconciliation for the owner client (see <see cref="NetworkRigidbody"/>
+        /// for the rationale).
+        /// </summary>
+        internal void ApplyReconciliation(PhysicsState2D serverState, byte changedMask) { }
+
+        // ── Public API ─────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Capture the current <see cref="Rigidbody2D"/> state into a
+        /// <see cref="PhysicsState2D"/> snapshot.
+        /// </summary>
+        public PhysicsState2D GetState()
+        {
+            if (_rb == null)
+                return default;
+            return new PhysicsState2D
+            {
+                Position        = _rb.position,
+                Rotation        = _rb.rotation,
+                Velocity        = _rb.linearVelocity,
+                AngularVelocity = _rb.angularVelocity,
+                IsSleeping      = _rb.IsSleeping(),
+            };
+        }
+    }
+}

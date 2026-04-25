@@ -57,7 +57,7 @@ namespace RTMPE.Rooms
 
             WriteU16LE(buf, ref offset, (ushort)nameBytes.Length);
             WriteBytes(buf, ref offset, nameBytes);
-            buf[offset++] = ClampByte(options.MaxPlayers, 0, 16);
+            buf[offset++] = ClampByte(options.MaxPlayers, 0, 100);
             buf[offset++] = (byte)(options.IsPublic ? 1 : 0);
 
             return buf;

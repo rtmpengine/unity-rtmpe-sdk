@@ -815,11 +815,27 @@ namespace RTMPE.Core
         /// <see cref="NetworkState.Disconnected"/>.
         /// </para>
         /// <para>
-        /// The SDK uses <see cref="ReconnectBackoff"/> (Full-Jitter capped
-        /// exponential — industry-standard) for the inter-attempt delays.
-        /// On exhaustion the state transitions back to
-        /// <see cref="NetworkState.Disconnected"/>; the app MUST then fall back
-        /// to a full <see cref="Connect(string)"/> with credentials.
+        /// <b>Single-attempt API.</b>  This method schedules ONE reconnect
+        /// attempt and returns immediately.  The SDK does NOT auto-retry on
+        /// failure — the application owns the retry policy so it can be tied
+        /// to UI state (e.g. show a "reconnecting…" toast, expose a Cancel
+        /// button, time out after N attempts).
+        /// </para>
+        /// <para>
+        /// The recommended retry helper is <see cref="ReconnectBackoff"/>
+        /// (Full-Jitter capped exponential — industry-standard).  Drive it
+        /// from your reconnect coroutine:
+        /// <code>
+        /// var backoff = new ReconnectBackoff();
+        /// while (!nm.IsConnected &amp;&amp; backoff.Attempt &lt; 10)
+        /// {
+        ///     yield return new WaitForSeconds((float)backoff.NextDelay().TotalSeconds);
+        ///     if (!nm.Reconnect()) break; // CanReconnect went false → fall back to Connect()
+        /// }
+        /// if (nm.IsConnected) backoff.Reset();
+        /// </code>
+        /// On exhaustion the application MUST fall back to a full
+        /// <see cref="Connect(string)"/> with credentials.
         /// </para>
         /// </remarks>
         /// <returns>
@@ -868,7 +884,12 @@ namespace RTMPE.Core
         /// Gracefully disconnect from the gateway and reset all session state.
         /// No-op when already disconnected or a disconnect is already in progress.
         /// </summary>
-        public void Disconnect()
+        public void Disconnect() => DisconnectWithReason(DisconnectReason.ClientRequest);
+
+        // Shared teardown path used by both user-initiated and internal disconnects.
+        // reason is forwarded to OnDisconnected so callers can distinguish nonce
+        // exhaustion from a user-initiated or server-initiated disconnect.
+        private void DisconnectWithReason(DisconnectReason reason)
         {
             if (_state == NetworkState.Disconnected ||
                 _state == NetworkState.Disconnecting) return;
@@ -894,7 +915,7 @@ namespace RTMPE.Core
             _heartbeatManager?.Stop();
             _networkThread?.Stop();
             ClearSessionData();
-            TransitionTo(NetworkState.Disconnected, DisconnectReason.ClientRequest);
+            TransitionTo(NetworkState.Disconnected, reason);
         }
 
         /// <summary>
@@ -2020,7 +2041,7 @@ namespace RTMPE.Core
             {
                 Debug.LogError("[RTMPE] Outbound nonce counter exhausted after 2^32 packets. " +
                                "Session must be re-established with fresh session keys.");
-                Disconnect();
+                DisconnectWithReason(DisconnectReason.NonceExhausted);
                 return;
             }
 
@@ -2845,6 +2866,11 @@ namespace RTMPE.Core
         ServerRequest,
         Timeout,
         ConnectionLost,
-        Kicked
+        Kicked,
+        /// <summary>
+        /// The outbound nonce counter was exhausted after 2^32 packets.
+        /// The session must be re-established with a fresh handshake.
+        /// </summary>
+        NonceExhausted
     }
 }

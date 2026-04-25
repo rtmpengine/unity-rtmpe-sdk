@@ -590,5 +590,94 @@ namespace RTMPE.Tests.Runtime
             bool ok = PhysicsPacketParser.TryParsePhysicsState2D(payload, out _, out _, out _);
             Assert.IsFalse(ok, "2-D parser must reject a payload built by BuildPayload.");
         }
+
+        // ── NaN / Inf rejection (audit fix C2-004) ────────────────────────────
+        //
+        // Before this fix, the physics parser passed crafted IEEE 754 NaN/Inf
+        // bit patterns straight through to Rigidbody / Rigidbody2D, which
+        // silently destabilises PhysX and PhysX2D and can crash the engine.
+        // The 3-D and 2-D parsers must reject any non-finite float in any
+        // declared field.
+
+        [Test]
+        public void TryParsePhysicsState_NaNPosition_ReturnsFalse()
+        {
+            var state = new PhysicsState { Position = new Vector3(float.NaN, 0f, 0f), Rotation = Quaternion.identity };
+            var payload = PhysicsPacketBuilder.BuildPayload(1UL, state,
+                dataMask: PhysicsPacketBuilder.ChangedPosition);
+            bool ok = PhysicsPacketParser.TryParsePhysicsState(payload, out _, out _, out _);
+            Assert.IsFalse(ok, "3-D parser must reject NaN position.");
+        }
+
+        [Test]
+        public void TryParsePhysicsState_InfVelocity_ReturnsFalse()
+        {
+            var state = new PhysicsState
+            {
+                Velocity = new Vector3(float.PositiveInfinity, 0f, 0f),
+                Rotation = Quaternion.identity,
+            };
+            var payload = PhysicsPacketBuilder.BuildPayload(1UL, state,
+                dataMask: PhysicsPacketBuilder.ChangedVelocity);
+            bool ok = PhysicsPacketParser.TryParsePhysicsState(payload, out _, out _, out _);
+            Assert.IsFalse(ok, "3-D parser must reject +Inf velocity.");
+        }
+
+        [Test]
+        public void TryParsePhysicsState_NaNAngularVelocity_ReturnsFalse()
+        {
+            var state = new PhysicsState
+            {
+                AngularVelocity = new Vector3(0f, float.NaN, 0f),
+                Rotation        = Quaternion.identity,
+            };
+            var payload = PhysicsPacketBuilder.BuildPayload(1UL, state,
+                dataMask: PhysicsPacketBuilder.ChangedAngularVelocity);
+            bool ok = PhysicsPacketParser.TryParsePhysicsState(payload, out _, out _, out _);
+            Assert.IsFalse(ok, "3-D parser must reject NaN angular velocity.");
+        }
+
+        [Test]
+        public void TryParsePhysicsState_NonUnitQuaternion_ReturnsFalse()
+        {
+            var state = new PhysicsState
+            {
+                Rotation = new Quaternion(0f, 0f, 0f, 2f), // |q|² = 4 — well above 1.1
+            };
+            var payload = PhysicsPacketBuilder.BuildPayload(1UL, state,
+                dataMask: PhysicsPacketBuilder.ChangedRotation);
+            bool ok = PhysicsPacketParser.TryParsePhysicsState(payload, out _, out _, out _);
+            Assert.IsFalse(ok, "3-D parser must reject grossly non-unit quaternion.");
+        }
+
+        [Test]
+        public void TryParsePhysicsState2D_NaNPosition_ReturnsFalse()
+        {
+            var state = new PhysicsState2D { Position = new Vector2(float.NaN, 0f) };
+            var payload = PhysicsPacketBuilder.Build2DPayload(1UL, state,
+                dataMask: PhysicsPacketBuilder.ChangedPosition);
+            bool ok = PhysicsPacketParser.TryParsePhysicsState2D(payload, out _, out _, out _);
+            Assert.IsFalse(ok, "2-D parser must reject NaN position.");
+        }
+
+        [Test]
+        public void TryParsePhysicsState2D_InfRotation_ReturnsFalse()
+        {
+            var state = new PhysicsState2D { Rotation = float.NegativeInfinity };
+            var payload = PhysicsPacketBuilder.Build2DPayload(1UL, state,
+                dataMask: PhysicsPacketBuilder.ChangedRotation);
+            bool ok = PhysicsPacketParser.TryParsePhysicsState2D(payload, out _, out _, out _);
+            Assert.IsFalse(ok, "2-D parser must reject -Inf rotation.");
+        }
+
+        [Test]
+        public void TryParsePhysicsState2D_NaNAngularVelocity_ReturnsFalse()
+        {
+            var state = new PhysicsState2D { AngularVelocity = float.NaN };
+            var payload = PhysicsPacketBuilder.Build2DPayload(1UL, state,
+                dataMask: PhysicsPacketBuilder.ChangedAngularVelocity);
+            bool ok = PhysicsPacketParser.TryParsePhysicsState2D(payload, out _, out _, out _);
+            Assert.IsFalse(ok, "2-D parser must reject NaN angular velocity.");
+        }
     }
 }

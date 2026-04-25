@@ -122,12 +122,30 @@ namespace RTMPE.Protocol
         // ── Core builder ──────────────────────────────────────────────────────
 
         /// <summary>
+        /// Maximum payload length accepted by <see cref="Build"/>.  Matches the
+        /// parser-side cap in <see cref="PacketParser"/> (1 MiB) so a caller
+        /// that builds an oversized packet fails here — loudly and deterministic-
+        /// ally with an <see cref="ArgumentException"/> — rather than at the
+        /// socket layer where the diagnostic is "SocketException: Message too
+        /// long" with no breadcrumb back to the offending call site.
+        /// </summary>
+        public const int MaxPayloadBytes = 1 * 1024 * 1024;
+
+        /// <summary>
         /// Build a complete packet: 13-byte header + payload.
         /// The sequence number is atomically incremented per call.
         /// </summary>
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="payload"/> exceeds <see cref="MaxPayloadBytes"/>.
+        /// </exception>
         public byte[] Build(PacketType type, PacketFlags flags, byte[] payload)
         {
             if (payload == null) payload = Array.Empty<byte>();
+
+            if (payload.Length > MaxPayloadBytes)
+                throw new ArgumentException(
+                    $"payload length {payload.Length} exceeds PacketBuilder.MaxPayloadBytes ({MaxPayloadBytes})",
+                    nameof(payload));
 
             // Atomic increment — no Unsafe.As required; cast uint at write time.
             // Interlocked.Increment returns int; casting to uint handles wrap-around correctly.

@@ -264,5 +264,30 @@ namespace RTMPE.Tests
             Assert.Throws<ArgumentException>(() =>
                 _builder.BuildReconnectInit("tok", new byte[33]));
         }
+
+        // ── Payload size cap (audit fix C-015) ────────────────────────────────
+        //
+        // Oversized payloads previously made it to the socket where they
+        // surfaced as a generic SocketException with no link back to the call
+        // site.  The builder now rejects them up front with a clear
+        // ArgumentException referencing the cap constant.
+
+        [Test]
+        public void Build_PayloadEqualsCap_StillAccepted()
+        {
+            // Exactly MaxPayloadBytes must still be built (inclusive cap).
+            var payload = new byte[PacketBuilder.MaxPayloadBytes];
+            var pkt = _builder.Build(PacketType.Data, PacketFlags.None, payload);
+            Assert.AreEqual(PacketProtocol.HEADER_SIZE + payload.Length, pkt.Length);
+        }
+
+        [Test]
+        public void Build_PayloadOverCap_ThrowsArgumentException()
+        {
+            var payload = new byte[PacketBuilder.MaxPayloadBytes + 1];
+            var ex = Assert.Throws<ArgumentException>(() =>
+                _builder.Build(PacketType.Data, PacketFlags.None, payload));
+            StringAssert.Contains("MaxPayloadBytes", ex.Message);
+        }
     }
 }

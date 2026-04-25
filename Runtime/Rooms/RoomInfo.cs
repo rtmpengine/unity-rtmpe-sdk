@@ -30,7 +30,7 @@ namespace RTMPE.Rooms
         /// <summary>Current number of players in the room.</summary>
         public int PlayerCount { get; }
 
-        /// <summary>Maximum allowed players (1–16).</summary>
+        /// <summary>Maximum allowed players (1–100).</summary>
         public int MaxPlayers { get; }
 
         /// <summary>Whether the room is publicly listed.</summary>

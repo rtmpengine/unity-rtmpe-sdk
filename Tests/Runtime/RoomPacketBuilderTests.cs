@@ -45,13 +45,13 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        public void BuildCreateRoomPayload_MaxPlayersClamp_ClampedTo16()
+        public void BuildCreateRoomPayload_MaxPlayersClamp_ClampedTo100()
         {
-            var options = new CreateRoomOptions { MaxPlayers = 100 };
+            var options = new CreateRoomOptions { MaxPlayers = 200 };
             var payload = RoomPacketBuilder.BuildCreateRoomPayload(options);
 
             int nameLen = ReadU16LE(payload, 0);
-            Assert.AreEqual(16, payload[2 + nameLen], "max_players should be clamped to 16");
+            Assert.AreEqual(100, payload[2 + nameLen], "max_players should be clamped to 100");
         }
 
         [Test]

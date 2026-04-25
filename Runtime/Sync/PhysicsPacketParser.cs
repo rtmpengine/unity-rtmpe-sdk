@@ -124,6 +124,7 @@ namespace RTMPE.Sync
                 pos.x = ReadF32LE(payload, off); off += 4;
                 pos.y = ReadF32LE(payload, off); off += 4;
                 pos.z = ReadF32LE(payload, off); off += 4;
+                if (!IsFinite(pos.x) || !IsFinite(pos.y) || !IsFinite(pos.z)) return false;
             }
 
             // ── Rotation (4 × f32 LE, x y z w) ──────────────────────────────
@@ -134,6 +135,18 @@ namespace RTMPE.Sync
                 rot.y = ReadF32LE(payload, off); off += 4;
                 rot.z = ReadF32LE(payload, off); off += 4;
                 rot.w = ReadF32LE(payload, off); off += 4;
+                if (!IsFinite(rot.x) || !IsFinite(rot.y) || !IsFinite(rot.z) || !IsFinite(rot.w)) return false;
+
+                // Same magnitude / renormalisation discipline as
+                // TransformPacketParser: a non-unit quaternion fed to
+                // Rigidbody.MoveRotation destabilises PhysX integration.
+                float magSq = rot.x * rot.x + rot.y * rot.y + rot.z * rot.z + rot.w * rot.w;
+                if (magSq < 0.9f || magSq > 1.1f) return false;
+                float invMag = 1f / (float)System.Math.Sqrt(magSq);
+                rot.x *= invMag;
+                rot.y *= invMag;
+                rot.z *= invMag;
+                rot.w *= invMag;
             }
 
             // ── Velocity (3 × f32 LE) ─────────────────────────────────────────
@@ -143,6 +156,7 @@ namespace RTMPE.Sync
                 vel.x = ReadF32LE(payload, off); off += 4;
                 vel.y = ReadF32LE(payload, off); off += 4;
                 vel.z = ReadF32LE(payload, off); off += 4;
+                if (!IsFinite(vel.x) || !IsFinite(vel.y) || !IsFinite(vel.z)) return false;
             }
 
             // ── Angular velocity (3 × f32 LE) ─────────────────────────────────
@@ -152,6 +166,7 @@ namespace RTMPE.Sync
                 angVel.x = ReadF32LE(payload, off); off += 4;
                 angVel.y = ReadF32LE(payload, off); off += 4;
                 angVel.z = ReadF32LE(payload, off); off += 4;
+                if (!IsFinite(angVel.x) || !IsFinite(angVel.y) || !IsFinite(angVel.z)) return false;
             }
 
             // ── Sleep flag (u8) ───────────────────────────────────────────────
@@ -230,6 +245,7 @@ namespace RTMPE.Sync
                 if (off + 8 > payload.Length) return false;
                 pos.x = ReadF32LE(payload, off); off += 4;
                 pos.y = ReadF32LE(payload, off); off += 4;
+                if (!IsFinite(pos.x) || !IsFinite(pos.y)) return false;
             }
 
             // ── Rotation (1 × f32 LE, degrees) ───────────────────────────────
@@ -237,6 +253,7 @@ namespace RTMPE.Sync
             {
                 if (off + 4 > payload.Length) return false;
                 rot = ReadF32LE(payload, off); off += 4;
+                if (!IsFinite(rot)) return false;
             }
 
             // ── Velocity (2 × f32 LE) ─────────────────────────────────────────
@@ -245,6 +262,7 @@ namespace RTMPE.Sync
                 if (off + 8 > payload.Length) return false;
                 vel.x = ReadF32LE(payload, off); off += 4;
                 vel.y = ReadF32LE(payload, off); off += 4;
+                if (!IsFinite(vel.x) || !IsFinite(vel.y)) return false;
             }
 
             // ── Angular velocity (1 × f32 LE, deg/s) ─────────────────────────
@@ -252,6 +270,7 @@ namespace RTMPE.Sync
             {
                 if (off + 4 > payload.Length) return false;
                 angVel = ReadF32LE(payload, off); off += 4;
+                if (!IsFinite(angVel)) return false;
             }
 
             // ── Sleep flag (u8) ───────────────────────────────────────────────
@@ -272,7 +291,13 @@ namespace RTMPE.Sync
             return true;
         }
 
-        // ── Private read helpers ──────────────────────────────────────────────
+        // ── Private helpers ───────────────────────────────────────────────────
+
+        // IsFinite returns true when v is neither NaN nor ±Infinity.  Mirrors
+        // the discipline in TransformPacketParser: a NaN/Inf written into a
+        // Rigidbody silently destabilises PhysX and can crash the engine, so
+        // any malformed packet is rejected at parse time.
+        private static bool IsFinite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
 
         // ReadU64LE reads eight consecutive bytes as a little-endian u64.
         private static ulong ReadU64LE(byte[] buf, int off)

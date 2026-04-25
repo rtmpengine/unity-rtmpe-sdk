@@ -156,7 +156,13 @@ namespace RTMPE.Sync
             // a non-growable MemoryStream; we detect this and fall through
             // to a growable stream.  The slow path executes only for the
             // long-string edge case — ≈ 0 % of gameplay traffic.
+            //
+            // Hard cap: the wire format encodes the per-value length as a
+            // ushort, so any value longer than ushort.MaxValue would silently
+            // truncate and desync receiver state.  Detect and skip such
+            // values before writing anything to the outer writer.
             const int PoolBufferSize = 1024;
+            const int MaxValueLen = ushort.MaxValue;
             var pool = System.Buffers.ArrayPool<byte>.Shared;
             byte[] rented = pool.Rent(PoolBufferSize);
             bool overflowed = false;
@@ -175,10 +181,29 @@ namespace RTMPE.Sync
                     // below will be used instead.
                     overflowed = true;
                 }
+                catch (Exception ex)
+                {
+                    // A buggy custom Serialize() must not abort the entire
+                    // flush cycle for sibling NetworkVariables.  Skip this
+                    // value by writing a zero-length record.
+                    Debug.LogError(
+                        $"[RTMPE] NetworkVariable '{GetType().Name}': Serialize() threw " +
+                        $"{ex.GetType().Name}: {ex.Message}.  Variable will publish empty payload this tick.");
+                    writer.Write((ushort)0);
+                    return;
+                }
 
                 if (!overflowed)
                 {
                     int valueLen = (int)fast.Position;
+                    if (valueLen > MaxValueLen)
+                    {
+                        Debug.LogError(
+                            $"[RTMPE] NetworkVariable '{GetType().Name}': serialized " +
+                            $"size {valueLen} exceeds ushort wire cap ({MaxValueLen}).  Skipped.");
+                        writer.Write((ushort)0);
+                        return;
+                    }
                     writer.Write((ushort)valueLen);
                     writer.Write(rented, 0, valueLen);
                     return;
@@ -194,9 +219,28 @@ namespace RTMPE.Sync
             using (var growable = new MemoryStream(PoolBufferSize))
             using (var bw = new BinaryWriter(growable, Encoding.UTF8, leaveOpen: true))
             {
-                Serialize(bw);
-                bw.Flush();
+                try
+                {
+                    Serialize(bw);
+                    bw.Flush();
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError(
+                        $"[RTMPE] NetworkVariable '{GetType().Name}': Serialize() threw " +
+                        $"{ex.GetType().Name} on growable path: {ex.Message}.  Variable will publish empty payload this tick.");
+                    writer.Write((ushort)0);
+                    return;
+                }
                 int valueLen = (int)growable.Length;
+                if (valueLen > MaxValueLen)
+                {
+                    Debug.LogError(
+                        $"[RTMPE] NetworkVariable '{GetType().Name}': serialized " +
+                        $"size {valueLen} exceeds ushort wire cap ({MaxValueLen}).  Skipped.");
+                    writer.Write((ushort)0);
+                    return;
+                }
                 writer.Write((ushort)valueLen);
                 writer.Write(growable.GetBuffer(), 0, valueLen);
             }

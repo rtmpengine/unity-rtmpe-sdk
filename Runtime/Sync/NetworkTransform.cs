@@ -112,6 +112,20 @@ namespace RTMPE.Sync
         // without this guard the buffer would accumulate two entries per tick at 60 fps.
         private uint _lastInputTick = uint.MaxValue;
 
+        // Guards 0x43 input-batch transmission to exactly once per LocalTick.
+        // Phase 2.x (2026-04-25) — server-authoritative input pipeline.
+        // The batch is built fresh from the input buffer on each transmission
+        // and replays every unacknowledged frame, so a missed tick is recovered
+        // from the next batch — but a duplicate-per-frame send wastes bandwidth.
+        private uint _lastInputSendTick = uint.MaxValue;
+
+        // Reusable scratch array sized for the maximum batch.  Allocated once
+        // per NetworkTransform so SendInputBatch() does NOT allocate on the
+        // hot path — critical for staying inside the 33 ms tick budget when
+        // many transforms send concurrently.  The InputBuffer's Capacity is
+        // the upper bound on entries the buffer can ever hand out.
+        private readonly InputPayload[] _inputSendScratch = new InputPayload[InputBuffer.Capacity];
+
         // Lerp fraction per frame: blend 1/3 of the remaining error each of
         // the 3 frames so the correction is visually smooth.
         private const float ReconcileLerpFraction = 1f / 3f;
@@ -266,6 +280,19 @@ namespace RTMPE.Sync
                     _lastInputTick = nm.LocalTick;
                     var input = CollectInput(nm.LocalTick);
                     _inputBuffer.Push(input);
+
+                    // ── Server-authoritative input send (Phase 2.x) ─────────
+                    // Re-ship the unacknowledged buffer once per tick.  This
+                    // is gated on _enablePrediction because the input buffer
+                    // is only filled when prediction is on; sending an empty
+                    // batch every tick from non-predicting owners would just
+                    // burn bandwidth.  Each batch supersedes the prior, so a
+                    // dropped UDP packet costs at most one tick of latency.
+                    if (nm.LocalTick != _lastInputSendTick)
+                    {
+                        _lastInputSendTick = nm.LocalTick;
+                        SendInputBatch();
+                    }
                 }
             }
 
@@ -315,6 +342,32 @@ namespace RTMPE.Sync
 
             var payload = TransformPacketBuilder.BuildUpdatePayload(NetworkObjectId, GetState());
             manager.SendData(payload);
+        }
+
+        /// <summary>
+        /// Phase 2.x (2026-04-25) — server-authoritative input send.
+        ///
+        /// Snapshots the unacknowledged input ring buffer into the
+        /// pre-allocated scratch array, builds a 0x43 batch payload, and
+        /// hands it to <see cref="NetworkManager.SendInput"/> for unreliable
+        /// UDP transmission.  Called at most once per LocalTick from
+        /// <see cref="Update"/>.
+        ///
+        /// Bandwidth: at 30 Hz with the default 64-entry buffer, one full
+        /// batch is 2 + 13×64 = 834 bytes per object.  In steady state the
+        /// server acknowledges within 2-3 ticks, so the typical batch holds
+        /// 2-3 entries (~30-50 bytes).
+        /// </summary>
+        private void SendInputBatch()
+        {
+            var manager = NetworkManager.Instance;
+            if (manager == null) return;
+
+            int count = _inputBuffer.CopyUnacknowledgedTo(_inputSendScratch);
+            if (count == 0) return;
+
+            var payload = InputPacketBuilder.BuildBatchPayload(_inputSendScratch, count);
+            manager.SendInput(payload);
         }
     }
 }

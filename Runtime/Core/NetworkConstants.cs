@@ -152,6 +152,27 @@ namespace RTMPE.Core
         // MUST stay in sync with PacketType::PositionUpdate = 0x42 in
         // modules/gateway/src/packet/header.rs
         PositionUpdate    = 0x42,   // Client → Server: 2-D world position for interest-zone filtering
+        // ── Server-authoritative input batch (Phase 2.x — 2026-04-25) ─────
+        // Carries a batch of <see cref="InputPayload"/> frames captured by
+        // <see cref="NetworkBehaviour.GatherInput"/>.  The Sync Service consumes
+        // these from `rtmpe.input.{room_id}` and applies them in
+        // RoomTicker.tickRoom — the foundation for true server-side
+        // simulation, lag compensation, and anti-cheat.
+        //
+        // Payload (raw binary, little-endian):
+        //   [count: u16 LE][payload_1: 13 bytes]…[payload_N: 13 bytes]
+        //
+        // Per-frame layout matches InputPayload.WriteTo (13 B):
+        //   [tick: u32 LE][move_x: f32 LE][move_y: f32 LE][flags: u8]
+        //
+        // Player identity is NOT carried in the payload — the Sync Service
+        // resolves it from the gateway's NATS envelope (session_id →
+        // authoritative player_id) so a client cannot stamp another
+        // player's id on its own inputs.
+        //
+        // MUST stay in sync with PacketType::InputPayload = 0x43 in
+        // modules/gateway/src/packet/header.rs
+        InputPayload      = 0x43,   // Client → Server: server-authoritative input batch
         // ── RPC system ────────────────────────────────────────────────────────
         Rpc               = 0x50,   // Client → Server: RPC request (method_id dispatch)
         RpcResponse       = 0x51,   // Server → Client: RPC response (or broadcast)

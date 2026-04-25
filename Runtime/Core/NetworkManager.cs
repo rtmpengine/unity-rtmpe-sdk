@@ -2730,6 +2730,42 @@ namespace RTMPE.Core
         }
 
         /// <summary>
+        /// Wrap <paramref name="payload"/> in a <see cref="PacketType.InputPayload"/>
+        /// header (0x43) and transmit it as an unreliable UDP packet.
+        ///
+        /// <para>Called by <see cref="RTMPE.Sync.NetworkTransform"/> once per
+        /// 30 Hz tick to ship the unacknowledged-input ring buffer to the Sync
+        /// Service for server-authoritative simulation.  Built by
+        /// <see cref="RTMPE.Sync.InputPacketBuilder.BuildBatchPayload"/>.</para>
+        ///
+        /// <para>Player identity is intentionally NOT in the payload — the
+        /// gateway resolves session_id → authoritative player_id and embeds
+        /// both in the NATS envelope before the Sync Service ever sees the
+        /// bytes.  This eliminates the client-spoofing surface that would
+        /// exist if a client could stamp any player_id on its inputs.</para>
+        ///
+        /// <para>Unreliable on purpose: the next batch supersedes the prior
+        /// (the buffer holds every unacknowledged frame), so a dropped
+        /// packet costs at most one tick of latency until the next send.</para>
+        /// </summary>
+        /// <param name="payload">
+        /// Wire payload built by <c>InputPacketBuilder.BuildBatchPayload</c>.
+        /// A <see langword="null"/> or empty array is silently ignored.
+        /// </param>
+        internal void SendInput(byte[] payload)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+            if (payload == null || payload.Length == 0) return;
+
+            var packet = _packetBuilder.Build(
+                PacketType.InputPayload,
+                PacketFlags.None,
+                payload);
+
+            EncryptAndSend(packet);
+        }
+
+        /// <summary>
         /// Wrap <paramref name="payload"/> in a <see cref="PacketType.StateSync"/> header
         /// and transmit it as an unreliable UDP packet.
         ///

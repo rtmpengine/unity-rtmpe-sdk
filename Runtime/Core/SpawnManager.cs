@@ -180,10 +180,10 @@ namespace RTMPE.Core
                 ?? _networkManager.LocalPlayerStringId
                 ?? string.Empty;
 
-            // Send SpawnRequest to server for relay to other clients.
-            SendSpawnPacket(prefabId, objectId, owner, position, rotation);
-
-            return CreateLocal(prefabId, objectId, owner, position, rotation);
+            var nb = CreateLocal(prefabId, objectId, owner, position, rotation);
+            if (nb != null)
+                SendSpawnPacket(prefabId, objectId, owner, position, rotation);
+            return nb;
         }
 
         /// <summary>

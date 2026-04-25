@@ -62,8 +62,9 @@ namespace RTMPE.Rpc
 
         /// <summary>
         /// Returns the number of bytes needed to encode <paramref name="value"/>,
-        /// including the 1-byte type_id prefix.  Returns 0 for unsupported types.
+        /// including the 1-byte type_id prefix.
         /// </summary>
+        /// <exception cref="ArgumentException">Thrown for unsupported parameter types.</exception>
         public static int MeasureParam(object value)
         {
             if (value is int)        return 1 + 4;
@@ -75,7 +76,10 @@ namespace RTMPE.Rpc
             if (value is Vector3)    return 1 + 12;
             if (value is Color)      return 1 + 16;
             if (value is Quaternion) return 1 + 16;
-            return 0;
+            var type = value?.GetType();
+            throw new ArgumentException(
+                $"Unsupported RPC parameter type: {(type != null ? type.Name : "null")}",
+                nameof(value));
         }
 
         // ── Write ─────────────────────────────────────────────────────────────
@@ -191,32 +195,38 @@ namespace RTMPE.Rpc
 
             byte typeId = data[offset++];
 
+            // All bounds checks below use the form `data.Length - offset < N`
+            // rather than `offset + N > data.Length`.  The latter overflows in
+            // signed-int arithmetic when offset is near int.MaxValue and N is
+            // attacker-controlled (e.g. ushort strLen up to 65535), bypassing
+            // the bounds check.  Subtracting from the known-non-negative
+            // (offset >= 0 here, data.Length >= 0 always) cannot overflow.
             switch (typeId)
             {
                 case RpcTypeId.Int32:
-                    if (offset + 4 > data.Length) { offset = -1; return null; }
+                    if (data.Length - offset < 4) { offset = -1; return null; }
                     int i32 = ReadI32LE(data, offset); offset += 4;
                     return i32;
 
                 case RpcTypeId.Float32:
-                    if (offset + 4 > data.Length) { offset = -1; return null; }
+                    if (data.Length - offset < 4) { offset = -1; return null; }
                     float f32 = ReadF32LE(data, offset); offset += 4;
                     return f32;
 
                 case RpcTypeId.Bool:
-                    if (offset + 1 > data.Length) { offset = -1; return null; }
+                    if (data.Length - offset < 1) { offset = -1; return null; }
                     return data[offset++] != 0;
 
                 case RpcTypeId.UInt64:
-                    if (offset + 8 > data.Length) { offset = -1; return null; }
+                    if (data.Length - offset < 8) { offset = -1; return null; }
                     ulong u64 = ReadU64LE(data, offset); offset += 8;
                     return u64;
 
                 case RpcTypeId.String:
                 {
-                    if (offset + 2 > data.Length) { offset = -1; return null; }
+                    if (data.Length - offset < 2) { offset = -1; return null; }
                     ushort strLen = ReadU16LE(data, offset); offset += 2;
-                    if (offset + strLen > data.Length) { offset = -1; return null; }
+                    if (data.Length - offset < strLen) { offset = -1; return null; }
                     string str = Utf8.GetString(data, offset, strLen);
                     offset += strLen;
                     return str;
@@ -224,9 +234,9 @@ namespace RTMPE.Rpc
 
                 case RpcTypeId.Bytes:
                 {
-                    if (offset + 2 > data.Length) { offset = -1; return null; }
+                    if (data.Length - offset < 2) { offset = -1; return null; }
                     ushort bLen = ReadU16LE(data, offset); offset += 2;
-                    if (offset + bLen > data.Length) { offset = -1; return null; }
+                    if (data.Length - offset < bLen) { offset = -1; return null; }
                     byte[] byteArr = new byte[bLen];
                     Buffer.BlockCopy(data, offset, byteArr, 0, bLen);
                     offset += bLen;
@@ -235,7 +245,7 @@ namespace RTMPE.Rpc
 
                 case RpcTypeId.Vector3:
                 {
-                    if (offset + 12 > data.Length) { offset = -1; return null; }
+                    if (data.Length - offset < 12) { offset = -1; return null; }
                     float vx = ReadF32LE(data, offset); offset += 4;
                     float vy = ReadF32LE(data, offset); offset += 4;
                     float vz = ReadF32LE(data, offset); offset += 4;
@@ -244,7 +254,7 @@ namespace RTMPE.Rpc
 
                 case RpcTypeId.Color:
                 {
-                    if (offset + 16 > data.Length) { offset = -1; return null; }
+                    if (data.Length - offset < 16) { offset = -1; return null; }
                     float cr = ReadF32LE(data, offset); offset += 4;
                     float cg = ReadF32LE(data, offset); offset += 4;
                     float cb = ReadF32LE(data, offset); offset += 4;
@@ -254,7 +264,7 @@ namespace RTMPE.Rpc
 
                 case RpcTypeId.Quaternion:
                 {
-                    if (offset + 16 > data.Length) { offset = -1; return null; }
+                    if (data.Length - offset < 16) { offset = -1; return null; }
                     float qx = ReadF32LE(data, offset); offset += 4;
                     float qy = ReadF32LE(data, offset); offset += 4;
                     float qz = ReadF32LE(data, offset); offset += 4;

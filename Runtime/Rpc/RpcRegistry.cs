@@ -52,19 +52,78 @@ namespace RTMPE.Rpc
 
         private static readonly object _lock = new object();
 
+        [UnityEngine.RuntimeInitializeOnLoadMethod(
+            UnityEngine.RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetCache()
+        {
+            lock (_lock) { _cache.Clear(); }
+        }
+
         // ── Public API ────────────────────────────────────────────────────────
 
         /// <summary>
         /// Compute the FNV-1a 32-bit hash of <c>"TypeName.MethodName"</c>.
         /// This is the stable wire method ID used in Enhanced RPC packets.
         /// </summary>
+        /// <remarks>
+        /// Hot path: invoked from <see cref="TryGetMethodId"/> on every RPC
+        /// send.  We hash the two strings in-place via FNV-1a's left-to-right
+        /// definition, so the implementation is allocation-free — no
+        /// "Type.Method" concatenation, no UTF-8 byte buffer.  ASCII method
+        /// names hash identically to the previous Encoding.UTF8.GetBytes path
+        /// because every char ≤ 0x7F encodes to a single matching byte.
+        /// </remarks>
         public static uint ComputeMethodId(string typeName, string methodName)
         {
-            string key  = typeName + "." + methodName;
-            byte[] bytes = Encoding.UTF8.GetBytes(key);
-            uint hash   = FnvOffsetBasis;
-            foreach (byte b in bytes)
-                hash = (hash ^ b) * FnvPrime;
+            uint hash = FnvOffsetBasis;
+            hash = HashUtf8(hash, typeName);
+            hash = (hash ^ (byte)'.') * FnvPrime;
+            hash = HashUtf8(hash, methodName);
+            return hash;
+        }
+
+        // Folds <paramref name="s"/>'s UTF-8 byte sequence into FNV-1a without
+        // materialising an intermediate byte[].  ASCII chars (the only ones a
+        // valid C# identifier can contain) hash byte-for-byte identically to
+        // Encoding.UTF8.GetBytes, preserving every previously-issued method ID.
+        private static uint HashUtf8(uint hash, string s)
+        {
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c < 0x80)
+                {
+                    hash = (hash ^ c) * FnvPrime;
+                }
+                else if (c < 0x800)
+                {
+                    hash = (hash ^ (uint)(0xC0 | (c >> 6))) * FnvPrime;
+                    hash = (hash ^ (uint)(0x80 | (c & 0x3F))) * FnvPrime;
+                }
+                else if (!char.IsSurrogate(c))
+                {
+                    hash = (hash ^ (uint)(0xE0 | (c >> 12))) * FnvPrime;
+                    hash = (hash ^ (uint)(0x80 | ((c >> 6) & 0x3F))) * FnvPrime;
+                    hash = (hash ^ (uint)(0x80 | (c & 0x3F))) * FnvPrime;
+                }
+                else if (char.IsHighSurrogate(c) && i + 1 < s.Length && char.IsLowSurrogate(s[i + 1]))
+                {
+                    int cp = char.ConvertToUtf32(c, s[i + 1]);
+                    i++;
+                    hash = (hash ^ (uint)(0xF0 | (cp >> 18))) * FnvPrime;
+                    hash = (hash ^ (uint)(0x80 | ((cp >> 12) & 0x3F))) * FnvPrime;
+                    hash = (hash ^ (uint)(0x80 | ((cp >> 6) & 0x3F))) * FnvPrime;
+                    hash = (hash ^ (uint)(0x80 | (cp & 0x3F))) * FnvPrime;
+                }
+                else
+                {
+                    // Lone surrogate — encode as U+FFFD replacement char to match
+                    // Encoding.UTF8 fallback behaviour (3-byte sequence).
+                    hash = (hash ^ 0xEFu) * FnvPrime;
+                    hash = (hash ^ 0xBFu) * FnvPrime;
+                    hash = (hash ^ 0xBDu) * FnvPrime;
+                }
+            }
             return hash;
         }
 

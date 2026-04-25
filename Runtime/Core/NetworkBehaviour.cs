@@ -53,6 +53,10 @@ namespace RTMPE.Core
         // the main-thread invariant (all spawns happen on the Unity main thread).
         private static readonly HashSet<Type> _validatedTypes = new HashSet<Type>();
 
+        [UnityEngine.RuntimeInitializeOnLoadMethod(
+            UnityEngine.RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetValidatedTypes() => _validatedTypes.Clear();
+
         // ── Properties ─────────────────────────────────────────────────────────
 
         /// <summary>

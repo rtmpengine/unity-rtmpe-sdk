@@ -97,10 +97,6 @@ namespace RTMPE.Infrastructure.Compression
                 throw new InvalidOperationException(
                     $"LZ4: declared length {declaredLen} exceeds cap {MaxDecompressed}.");
 
-            if (declaredLen < MinCompressible)
-                throw new InvalidOperationException(
-                    $"LZ4: declared length {declaredLen} below minimum {MinCompressible}.");
-
             var output = new byte[(int)declaredLen];
             int produced = DecompressBlock(data, PrefixSize, data.Length - PrefixSize,
                                            output, 0, (int)declaredLen);
@@ -263,6 +259,14 @@ namespace RTMPE.Infrastructure.Compression
             int srcEnd = srcOff + srcLen;
             int dstStart = dstOff;
 
+            // Bounds checks below use the overflow-safe form
+            // `dstLen - dstOff < N` instead of `dstOff + N > dstLen`.
+            // Extended literal/match lengths are decoded from attacker-supplied
+            // 0xFF chains and can in theory grow large; the additive form would
+            // wrap to a negative int and bypass the check.  Subtraction from
+            // dstLen (which is bounded by MaxDecompressed) cannot overflow
+            // because dstOff is always in [0, dstLen].
+
             while (srcOff < srcEnd)
             {
                 // Read token.
@@ -274,11 +278,16 @@ namespace RTMPE.Infrastructure.Compression
                 if (litLen == 15)
                 {
                     int b;
-                    do { b = src[srcOff++]; litLen += b; } while (b == 255);
+                    do {
+                        if (srcOff >= srcEnd) return -1;
+                        b = src[srcOff++]; litLen += b;
+                        if (litLen < 0) return -1; // overflow guard on extended length
+                    } while (b == 255);
                 }
 
                 // Copy literals.
-                if (dstOff + litLen > dstLen) return -1; // overflow
+                if (litLen < 0 || dstLen - dstOff < litLen) return -1; // overflow / out-of-bounds
+                if (srcEnd - srcOff < litLen) return -1; // src truncated
                 Buffer.BlockCopy(src, srcOff, dst, dstOff, litLen);
                 srcOff += litLen;
                 dstOff += litLen;
@@ -286,7 +295,8 @@ namespace RTMPE.Infrastructure.Compression
                 // End-of-block: last sequence has no match.
                 if (srcOff >= srcEnd) break;
 
-                // Read match offset (u16 LE).
+                // Read match offset (u16 LE) — need exactly 2 bytes remaining.
+                if (srcEnd - srcOff < 2) return -1;
                 int matchOffset = src[srcOff] | (src[srcOff + 1] << 8);
                 srcOff += 2;
                 if (matchOffset == 0) return -1; // invalid
@@ -298,10 +308,14 @@ namespace RTMPE.Infrastructure.Compression
                 if (matchExtra == 15)
                 {
                     int b;
-                    do { b = src[srcOff++]; matchLen += b; } while (b == 255);
+                    do {
+                        if (srcOff >= srcEnd) return -1;
+                        b = src[srcOff++]; matchLen += b;
+                        if (matchLen < 0) return -1; // overflow guard on extended length
+                    } while (b == 255);
                 }
 
-                if (dstOff + matchLen > dstLen) return -1;
+                if (matchLen < 0 || dstLen - dstOff < matchLen) return -1;
 
                 // Copy match (may overlap — byte-by-byte to handle RLE correctly).
                 for (int i = 0; i < matchLen; i++)

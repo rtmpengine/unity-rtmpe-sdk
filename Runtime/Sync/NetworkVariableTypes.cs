@@ -195,13 +195,49 @@ namespace RTMPE.Sync
         }
 
         /// <inheritdoc/>
+        /// <remarks>
+        /// Defensive validation against malicious or corrupted payloads:
+        /// <list type="bullet">
+        ///   <item>NaN/Inf components are rejected (would propagate into
+        ///   <c>transform.rotation</c> via game code and break physics).</item>
+        ///   <item>Magnitude must lie in [0.9, 1.1] — a legitimate sender may
+        ///   accumulate small rounding error, but anything outside that band
+        ///   is either a bug or a hostile client trying to inject a non-rotation.</item>
+        ///   <item>In-band quaternions are renormalised to unit length before
+        ///   exposure so consumers always observe a valid rotation.</item>
+        /// </list>
+        /// On rejection the prior value is preserved (no <c>OnValueChanged</c>
+        /// fires) and a Unity warning is logged to aid investigation.
+        /// </remarks>
         public override void Deserialize(BinaryReader reader)
         {
-            SetValueWithoutNotify(new Quaternion(
-                reader.ReadSingle(),
-                reader.ReadSingle(),
-                reader.ReadSingle(),
-                reader.ReadSingle()));
+            float x = reader.ReadSingle();
+            float y = reader.ReadSingle();
+            float z = reader.ReadSingle();
+            float w = reader.ReadSingle();
+
+            if (!IsFinite(x) || !IsFinite(y) || !IsFinite(z) || !IsFinite(w))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] NetworkVariableQuaternion.Deserialize: rejected non-finite " +
+                    $"quaternion ({x},{y},{z},{w}) — keeping prior value.");
+                return;
+            }
+
+            float magSq = x * x + y * y + z * z + w * w;
+            if (magSq < 0.81f || magSq > 1.21f) // [0.9², 1.1²]
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] NetworkVariableQuaternion.Deserialize: rejected non-unit " +
+                    $"quaternion (magSq={magSq:F4}, expected ≈1) — keeping prior value.");
+                return;
+            }
+
+            // Renormalise small rounding error so consumers always read a unit quaternion.
+            float invMag = 1f / Mathf.Sqrt(magSq);
+            SetValueWithoutNotify(new Quaternion(x * invMag, y * invMag, z * invMag, w * invMag));
         }
+
+        private static bool IsFinite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
     }
 }

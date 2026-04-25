@@ -108,11 +108,15 @@ namespace RTMPE.Crypto
 
             // Pinning check: if the developer has pinned the server public key,
             // reject the connection if the embedded key doesn't match.
+            //
+            // Constant-time comparison: although both keys are technically public,
+            // an early-exit byte-by-byte compare leaks the prefix of the pinned
+            // key via response-time timing.  Using a constant-time accumulator
+            // closes that side-channel at zero perf cost (32 iterations).
             if (pinnedServerStaticPub != null)
             {
                 if (pinnedServerStaticPub.Length != 32) return false;
-                for (int i = 0; i < 32; i++)
-                    if (pinnedServerStaticPub[i] != staticPub[i]) return false;
+                if (!ConstantTimeEquals(pinnedServerStaticPub, staticPub)) return false;
             }
 
             // Verify the Ed25519 signature of the ephemeral key.
@@ -151,8 +155,11 @@ namespace RTMPE.Crypto
             var sharedSecret = Curve25519.SharedSecret(_clientPrivateKey, _serverEphemeralPub);
             if (sharedSecret == null) return null; // degenerate key — reject
 
-            SessionKeys result;
-            byte[] prk = null;
+            SessionKeys result = null;
+            byte[] prk      = null;
+            byte[] keyInit  = null;
+            byte[] keyResp  = null;
+            bool   committed = false;
             try
             {
                 // Determine which side is the "initiator" (smaller public key).
@@ -178,12 +185,12 @@ namespace RTMPE.Crypto
                 var infoInit = new byte[info.Length + 1];
                 Buffer.BlockCopy(info, 0, infoInit, 0, info.Length);
                 infoInit[info.Length] = 0x00;
-                var keyInit = HkdfSha256.Expand(prk, infoInit, 32);
+                keyInit = HkdfSha256.Expand(prk, infoInit, 32);
 
                 var infoResp = new byte[info.Length + 1];
                 Buffer.BlockCopy(info, 0, infoResp, 0, info.Length);
                 infoResp[info.Length] = 0x01;
-                var keyResp = HkdfSha256.Expand(prk, infoResp, 32);
+                keyResp = HkdfSha256.Expand(prk, infoResp, 32);
 
                 var infoMig = new byte[info.Length + 1];
                 Buffer.BlockCopy(info, 0, infoMig, 0, info.Length);
@@ -191,14 +198,33 @@ namespace RTMPE.Crypto
                 ipMigrationKey = HkdfSha256.Expand(prk, infoMig, 32);
 
                 // Assign encrypt/decrypt based on initiator role (mirrors the Rust gateway logic).
+                // SessionKeys takes ownership of the two 32-byte arrays at this
+                // point — set `committed` so the failure-path in `finally`
+                // doesn't zero arrays the caller now owns.
                 result = iAmInitiator
                     ? new SessionKeys(encryptKey: keyInit, decryptKey: keyResp)
                     : new SessionKeys(encryptKey: keyResp, decryptKey: keyInit);
+                committed = true;
             }
             finally
             {
                 Array.Clear(sharedSecret, 0, sharedSecret.Length);
                 if (prk != null) Array.Clear(prk, 0, prk.Length);
+                // If an exception interrupted derivation after one or more
+                // directional keys were expanded, the caller never received
+                // them and they must be wiped from memory.  Once `committed`
+                // flips (handing ownership to SessionKeys), SessionKeys.Dispose
+                // is responsible for clearing the backing arrays.
+                if (!committed)
+                {
+                    if (keyInit != null) Array.Clear(keyInit, 0, keyInit.Length);
+                    if (keyResp != null) Array.Clear(keyResp, 0, keyResp.Length);
+                    if (ipMigrationKey != null)
+                    {
+                        Array.Clear(ipMigrationKey, 0, ipMigrationKey.Length);
+                        ipMigrationKey = null;
+                    }
+                }
             }
             return result;
         }
@@ -208,6 +234,8 @@ namespace RTMPE.Crypto
         /// <summary>
         /// Lexicographic comparison of two 32-byte public keys.
         /// Returns negative if a &lt; b, zero if equal, positive if a &gt; b.
+        /// Used only for HKDF role assignment — both inputs are public, so
+        /// non-constant-time is acceptable here.
         /// </summary>
         private static int ComparePublicKeys(byte[] a, byte[] b)
         {
@@ -217,6 +245,28 @@ namespace RTMPE.Crypto
                 if (diff != 0) return diff;
             }
             return 0;
+        }
+
+        /// <summary>
+        /// Constant-time equality of two equal-length byte arrays.
+        /// Returns true iff every byte matches, taking the same number of
+        /// operations regardless of where (or whether) a difference exists.
+        /// </summary>
+        /// <remarks>
+        /// Used for the pinned server public key check.  Even though pinned
+        /// public keys are not secret in the cryptographic sense, an early-exit
+        /// compare leaks the matched prefix length via timing — a passive
+        /// observer learning "first byte differs" vs. "first 16 bytes match"
+        /// could brute-force the pinned key offline.  Constant-time closes
+        /// that side-channel.
+        /// </remarks>
+        internal static bool ConstantTimeEquals(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) return false;
+            int diff = 0;
+            for (int i = 0; i < a.Length; i++)
+                diff |= a[i] ^ b[i];
+            return diff == 0;
         }
 
         // ── IDisposable ───────────────────────────────────────────────────────

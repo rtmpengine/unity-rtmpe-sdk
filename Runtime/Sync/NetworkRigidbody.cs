@@ -135,6 +135,23 @@ namespace RTMPE.Sync
         [Tooltip("Speed at which the remote body slerps toward the authoritative rotation.")]
         [SerializeField] [Range(1f, 50f)] private float _rotationCorrectionSpeed = 10f;
 
+        // ── Inspector — Owner reconciliation ───────────────────────────────────
+
+        [Header("Owner Reconciliation")]
+        [Tooltip("When true, the OWNER reconciles its local physics against the server-broadcast " +
+                 "state.  Defensive snap-on-divergence: when the local position diverges from the " +
+                 "server-confirmed position by more than _ownerReconcileSnapThreshold, the body " +
+                 "snaps to the server position.  Below the threshold the local prediction is kept " +
+                 "(no visual pop).  Disable for trusted-client deployments where the owner is fully " +
+                 "authoritative; enable when an authoritative server simulates physics and emits " +
+                 "corrections.")]
+        [SerializeField] private bool _enableOwnerReconciliation = false;
+
+        [Tooltip("Position error threshold (world units) above which the owner snaps to the " +
+                 "server-confirmed position.  Set high enough to avoid fighting normal " +
+                 "client-side prediction noise.")]
+        [SerializeField] [Range(0.5f, 20f)] private float _ownerReconcileSnapThreshold = 3.0f;
+
         // ── Inspector — Dead reckoning ─────────────────────────────────────────
 
         [Header("Dead Reckoning")]
@@ -404,11 +421,69 @@ namespace RTMPE.Sync
         /// <summary>
         /// Called by <c>NetworkManager</c> when the Sync Engine broadcasts the
         /// owner's own physics state back to all room members.
-        /// Currently a no-op: the owner's local physics simulation is authoritative
-        /// and does not require correction from the server.  Override in a subclass
-        /// to implement server-reconciled physics if needed.
+        ///
+        /// <para>When <see cref="_enableOwnerReconciliation"/> is <c>true</c>,
+        /// applies a defensive snap if the local body has diverged from the
+        /// server-confirmed position by more than
+        /// <see cref="_ownerReconcileSnapThreshold"/> world units.  Below the
+        /// threshold the local prediction is kept intact, avoiding visual pops
+        /// from normal physics noise.</para>
+        ///
+        /// <para>When <see cref="_enableOwnerReconciliation"/> is <c>false</c>
+        /// (the default), this is a no-op — the owner's local physics
+        /// simulation is treated as authoritative.  Set to true when an
+        /// authoritative server simulates physics (anti-cheat / competitive
+        /// modes) and broadcasts corrections back.</para>
+        ///
+        /// <para>Defensively rejects NaN/Inf positions and non-unit quaternions
+        /// from the server payload — a bug or hostile signal will not be
+        /// allowed to corrupt local <c>Rigidbody</c> state.</para>
         /// </summary>
-        internal void ApplyReconciliation(PhysicsState serverState, byte changedMask) { }
+        internal void ApplyReconciliation(PhysicsState serverState, byte changedMask)
+        {
+            if (!_enableOwnerReconciliation || _rb == null || !IsOwner) return;
+
+            // Position snap on large divergence.
+            if (_syncPosition && (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0)
+            {
+                Vector3 sp = serverState.Position;
+                if (!IsFiniteVector(sp))
+                {
+                    Debug.LogWarning(
+                        "[RTMPE] NetworkRigidbody.ApplyReconciliation: rejected non-finite " +
+                        $"server position {sp} — keeping local state.", this);
+                    return;
+                }
+
+                float err = Vector3.Distance(_rb.position, sp);
+                if (err > _ownerReconcileSnapThreshold)
+                {
+                    if (_makeRemoteKinematic) _rb.position = sp;
+                    else                      _rb.MovePosition(sp);
+                }
+            }
+
+            // Rotation snap on large divergence (uses the same snap threshold as
+            // position, scaled to degrees via Quaternion.Angle).
+            if (_syncRotation && (changedMask & PhysicsPacketBuilder.ChangedRotation) != 0)
+            {
+                Quaternion sr = serverState.Rotation;
+                float magSq = sr.x * sr.x + sr.y * sr.y + sr.z * sr.z + sr.w * sr.w;
+                if (magSq < 0.81f || magSq > 1.21f) return; // [0.9², 1.1²] band
+
+                float angleErr = Quaternion.Angle(_rb.rotation, sr);
+                if (angleErr > 30f) // 30° divergence → snap
+                {
+                    if (_makeRemoteKinematic) _rb.rotation = sr;
+                    else                      _rb.MoveRotation(sr);
+                }
+            }
+        }
+
+        private static bool IsFiniteVector(Vector3 v)
+            => !float.IsNaN(v.x) && !float.IsInfinity(v.x)
+            && !float.IsNaN(v.y) && !float.IsInfinity(v.y)
+            && !float.IsNaN(v.z) && !float.IsInfinity(v.z);
 
         // ── Public API ─────────────────────────────────────────────────────────
 

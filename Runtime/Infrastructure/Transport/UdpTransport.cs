@@ -256,9 +256,19 @@ namespace RTMPE.Transport
                 return _socket.ReceiveFrom(buffer, ref ep);
             }
             catch (SocketException ex)
-                when (ex.SocketErrorCode == SocketError.WouldBlock       // No data ready (Linux / macOS)
-                   || ex.SocketErrorCode == SocketError.ConnectionReset) // ICMP port-unreachable (Windows)
+                when (ex.SocketErrorCode == SocketError.WouldBlock          // No data ready (Linux / macOS)
+                   || ex.SocketErrorCode == SocketError.ConnectionReset     // ICMP port-unreachable (Windows)
+                   || ex.SocketErrorCode == SocketError.ConnectionRefused   // ICMP port-unreachable (Linux)
+                   || ex.SocketErrorCode == SocketError.MessageSize         // Oversized datagram — drop, keep receiving
+                   || ex.SocketErrorCode == SocketError.NetworkReset        // Transient route change
+                   || ex.SocketErrorCode == SocketError.HostUnreachable     // ICMP host-unreachable
+                   || ex.SocketErrorCode == SocketError.NetworkUnreachable) // ICMP network-unreachable
             {
+                // All of these are benign / transient at the UDP layer: we
+                // lose one datagram but the receive loop must keep running.
+                // On Linux, ConnectionRefused (ECONNREFUSED) is the canonical
+                // ICMP-unreachable signal; on Windows it's ConnectionReset.
+                // Catching both keeps the transport cross-platform uniform.
                 return 0;
             }
         }

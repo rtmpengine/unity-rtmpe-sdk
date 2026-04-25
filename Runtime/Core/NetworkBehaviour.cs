@@ -47,6 +47,12 @@ namespace RTMPE.Core
         private readonly List<NetworkVariableBase> _trackedVariables =
             new List<NetworkVariableBase>();
 
+        // RPC-collision validation cache.  Each concrete NetworkBehaviour subclass
+        // is checked exactly once on first spawn; subsequent spawns of the same
+        // type skip the reflection scan.  HashSet<Type> reads are lock-free under
+        // the main-thread invariant (all spawns happen on the Unity main thread).
+        private static readonly HashSet<Type> _validatedTypes = new HashSet<Type>();
+
         // ── Properties ─────────────────────────────────────────────────────────
 
         /// <summary>
@@ -142,6 +148,48 @@ namespace RTMPE.Core
                 return;
             }
 
+            // Validate the deserialized argument vector against the method
+            // signature BEFORE invoking.  MethodBase.Invoke would otherwise
+            // throw TargetParameterCountException / ArgumentException with a
+            // generic message that gives the operator no clue which RPC the
+            // server-supplied payload failed to satisfy.  A stale registry on
+            // the client (e.g. running an older build than the server) is the
+            // most common cause of this mismatch in practice.
+            var parameters = method.GetParameters();
+            int suppliedCount = args == null ? 0 : args.Length;
+            if (suppliedCount != parameters.Length)
+            {
+                Debug.LogError(
+                    $"[RTMPE] RPC '{GetType().Name}.{method.Name}' arg count mismatch: " +
+                    $"server sent {suppliedCount}, method expects {parameters.Length}. " +
+                    "Likely cause: client and server SDK are out of sync.");
+                return;
+            }
+            for (int i = 0; i < parameters.Length; i++)
+            {
+                object value = args[i];
+                Type expected = parameters[i].ParameterType;
+                if (value == null)
+                {
+                    // Reference / nullable types accept null; value types do not.
+                    if (expected.IsValueType && Nullable.GetUnderlyingType(expected) == null)
+                    {
+                        Debug.LogError(
+                            $"[RTMPE] RPC '{GetType().Name}.{method.Name}' arg #{i} is null " +
+                            $"but parameter '{parameters[i].Name}' is non-nullable {expected.Name}.");
+                        return;
+                    }
+                    continue;
+                }
+                if (!expected.IsInstanceOfType(value))
+                {
+                    Debug.LogError(
+                        $"[RTMPE] RPC '{GetType().Name}.{method.Name}' arg #{i} type mismatch: " +
+                        $"got {value.GetType().Name}, parameter '{parameters[i].Name}' expects {expected.Name}.");
+                    return;
+                }
+            }
+
             try
             {
                 method.Invoke(this, args);
@@ -215,12 +263,40 @@ namespace RTMPE.Core
             if (spawned && !_isSpawned)
             {
                 _isSpawned = true;
+                ValidateRpcMethodsOnce();
                 OnNetworkSpawn();
             }
             else if (!spawned && _isSpawned)
             {
                 _isSpawned = false;
                 OnNetworkDespawn();
+            }
+        }
+
+        /// <summary>
+        /// Run <see cref="RpcRegistry.Validate"/> exactly once per concrete
+        /// subclass.  RPC ID collisions are a programming error that must be
+        /// fixed before shipping; the runtime logs them as a Unity error so
+        /// they are visible in the Editor console and in player logs.
+        /// </summary>
+        /// <remarks>
+        /// We log + swallow rather than throw, because a single misbehaving
+        /// prefab should not abort the spawn pipeline for other (correctly
+        /// authored) objects.  Tests and editor tooling that want a hard
+        /// failure should call <see cref="RpcRegistry.Validate"/> directly.
+        /// </remarks>
+        private void ValidateRpcMethodsOnce()
+        {
+            var type = GetType();
+            if (_validatedTypes.Contains(type)) return;
+            _validatedTypes.Add(type);
+            try
+            {
+                RpcRegistry.Validate(type);
+            }
+            catch (InvalidOperationException ex)
+            {
+                Debug.LogError(ex.Message, this);
             }
         }
 

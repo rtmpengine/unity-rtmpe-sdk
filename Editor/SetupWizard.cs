@@ -137,7 +137,7 @@ namespace RTMPE.Editor
         private void DrawStepGameType()
         {
             EditorGUILayout.LabelField("Game Type Defaults", EditorStyles.boldLabel);
-            _maxPlayers = EditorGUILayout.IntSlider("Max Players", _maxPlayers, 1, 16);
+            _maxPlayers = EditorGUILayout.IntSlider("Max Players", _maxPlayers, 1, 100);
             _tickRate   = EditorGUILayout.IntSlider("Tick Rate (Hz)", _tickRate, 10, 60);
 
             EditorGUILayout.HelpBox(

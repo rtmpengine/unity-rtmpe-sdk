@@ -110,14 +110,33 @@ namespace RTMPE.Rpc
         /// Validate all [RtmpeRpc] methods on <paramref name="type"/> for hash
         /// collisions with reserved IDs or with each other.  Called automatically
         /// from <c>NetworkBehaviour.OnNetworkSpawn</c> for early error detection.
-        /// Logs a Unity error for each violation found; does not throw.
         /// </summary>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when one or more [RtmpeRpc] methods on <paramref name="type"/>
+        /// produce an FNV-1a hash that collides with a reserved
+        /// <see cref="RpcMethodId"/> constant or with another method on the same
+        /// type.  The exception message lists every conflicting method so the
+        /// developer can rename them in a single pass.
+        /// </exception>
         public static void Validate(Type type)
         {
-            var map = GetOrBuild(type);
-            // The build step already checked collisions — the map is clean if we
-            // reach here without an error log from BuildMap().  No extra work needed.
-            _ = map;
+            if (type == null) throw new ArgumentNullException(nameof(type));
+            var collisions = CollectCollisions(type);
+            if (collisions.Count == 0) return;
+
+            var sb = new StringBuilder();
+            sb.Append("[RTMPE] RpcRegistry.Validate: ");
+            sb.Append(collisions.Count);
+            sb.Append(" RPC method ID collision(s) detected on type '");
+            sb.Append(type.Name);
+            sb.Append("':");
+            foreach (var c in collisions)
+            {
+                sb.Append("\n  • ");
+                sb.Append(c);
+            }
+            sb.Append("\nRename the conflicting [RtmpeRpc] methods to resolve.");
+            throw new InvalidOperationException(sb.ToString());
         }
 
         // ── Private helpers ───────────────────────────────────────────────────
@@ -179,6 +198,55 @@ namespace RTMPE.Rpc
             }
 
             return map;
+        }
+
+        /// <summary>
+        /// Re-scans <paramref name="type"/> from scratch (independent of the
+        /// per-type cache built by <see cref="BuildMap"/>) and returns the list
+        /// of collision descriptions.  Empty list ⇒ no collisions.
+        /// </summary>
+        /// <remarks>
+        /// We deliberately do NOT consult <see cref="GetOrBuild"/> here:
+        /// <see cref="BuildMap"/> drops collided methods and only logs them, so
+        /// the cached map is not authoritative for collision detection.
+        /// Re-scanning is O(methods) and runs once per type at first
+        /// <see cref="OnNetworkSpawn"/> — negligible.
+        /// </remarks>
+        private static List<string> CollectCollisions(Type type)
+        {
+            var collisions = new List<string>();
+            var seen       = new Dictionary<uint, string>();
+
+            var methods = type.GetMethods(
+                BindingFlags.Instance |
+                BindingFlags.Public   |
+                BindingFlags.DeclaredOnly);
+
+            foreach (var mi in methods)
+            {
+                var attr = mi.GetCustomAttribute<RtmpeRpcAttribute>(inherit: false);
+                if (attr == null) continue;
+
+                uint id = ComputeMethodId(type.Name, mi.Name);
+
+                if (ReservedIds.Contains(id))
+                {
+                    collisions.Add(
+                        $"'{type.Name}.{mi.Name}' (FNV-1a 0x{id:X8}) collides with reserved RpcMethodId");
+                    continue;
+                }
+
+                if (seen.TryGetValue(id, out var prior))
+                {
+                    collisions.Add(
+                        $"'{type.Name}.{mi.Name}' (FNV-1a 0x{id:X8}) collides with prior '{prior}'");
+                    continue;
+                }
+
+                seen[id] = mi.Name;
+            }
+
+            return collisions;
         }
     }
 }

@@ -136,6 +136,7 @@ namespace RTMPE.Sync
                 pos.x = ReadF32LE(payload, off);     off += 4;
                 pos.y = ReadF32LE(payload, off);     off += 4;
                 pos.z = ReadF32LE(payload, off);     off += 4;
+                if (!IsFinite(pos.x) || !IsFinite(pos.y) || !IsFinite(pos.z)) return false;
             }
 
             // Rotation (4 × f32 LE, x y z w) — conditional on bit 0x02
@@ -146,6 +147,24 @@ namespace RTMPE.Sync
                 rot.y = ReadF32LE(payload, off);     off += 4;
                 rot.z = ReadF32LE(payload, off);     off += 4;
                 rot.w = ReadF32LE(payload, off);     off += 4;
+                if (!IsFinite(rot.x) || !IsFinite(rot.y) || !IsFinite(rot.z) || !IsFinite(rot.w)) return false;
+
+                // Quaternions applied to transform.rotation or fed into physics
+                // MUST be unit-length; a non-unit quaternion silently skews
+                // interpolation, breaks Quaternion.Slerp, and — in extreme
+                // cases — destabilises PhysX.  We reject clearly malformed
+                // (|q|² outside a generous ±0.1 band) to catch corruption /
+                // protocol bugs, then renormalise to erase benign FP drift so
+                // downstream math (Slerp, inverse, multiplication) stays sane.
+                float magSq = rot.x * rot.x + rot.y * rot.y + rot.z * rot.z + rot.w * rot.w;
+                if (magSq < 0.9f || magSq > 1.1f) return false;
+                // magSq ∈ [0.9, 1.1] here — guaranteed > 0, so sqrt and the
+                // reciprocal are safe without an extra zero-guard.
+                float invMag = 1f / (float)System.Math.Sqrt(magSq);
+                rot.x *= invMag;
+                rot.y *= invMag;
+                rot.z *= invMag;
+                rot.w *= invMag;
             }
 
             // Scale (3 × f32 LE) — conditional on bit 0x04
@@ -155,13 +174,21 @@ namespace RTMPE.Sync
                 scale.x = ReadF32LE(payload, off);   off += 4;
                 scale.y = ReadF32LE(payload, off);   off += 4;
                 scale.z = ReadF32LE(payload, off);   off += 4;
+                if (!IsFinite(scale.x) || !IsFinite(scale.y) || !IsFinite(scale.z)) return false;
             }
 
             state = new TransformState { Position = pos, Rotation = rot, Scale = scale };
             return true;
         }
 
-        // ── Private read helpers ───────────────────────────────────────────────
+        // ── Private helpers ────────────────────────────────────────────────────
+
+        // IsFinite returns true when v is neither NaN nor ±Infinity.
+        // Malformed server packets can encode IEEE 754 bit patterns that
+        // BitConverter.Int32BitsToSingle decodes as NaN or Inf; applying
+        // such values directly to a Unity transform causes undefined physics
+        // behaviour and can crash the engine.
+        private static bool IsFinite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
 
         // ReadU64LE reads eight consecutive bytes as a little-endian u64.
         private static ulong ReadU64LE(byte[] buf, int off)

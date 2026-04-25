@@ -101,9 +101,11 @@ namespace RTMPE.Sync
         private readonly InputBuffer _inputBuffer = new InputBuffer();
 
         // Reconciliation lerp target and remaining-frames counter.
-        // When _reconcileFramesLeft > 0, Update() blends toward _reconciledTarget.
-        private Vector3 _reconciledTarget;
-        private int     _reconcileFramesLeft;
+        // When _reconcileFramesLeft > 0, Update() blends toward _reconciledTarget
+        // (position) and _reconciledRotationTarget (rotation, if _syncRotation is on).
+        private Vector3    _reconciledTarget;
+        private Quaternion _reconciledRotationTarget;
+        private int        _reconcileFramesLeft;
 
         // Guards input collection to exactly one push per LocalTick.
         // Update() runs at frame rate (e.g. 60 Hz) but LocalTick advances at 30 Hz;
@@ -195,6 +197,10 @@ namespace RTMPE.Sync
 
             float error = Vector3.Distance(serverState.Position, transform.position);
 
+            // NaN/Inf positions (crafted packet or physics explosion) must not
+            // corrupt transform.position through the reconciliation lerp path.
+            if (float.IsNaN(error) || float.IsInfinity(error)) { MarkClean(); return; }
+
             if (error <= _lerpThreshold)
             {
                 // Prediction was close enough — accept it, no visual correction.
@@ -214,8 +220,11 @@ namespace RTMPE.Sync
             }
 
             // Medium error — smooth lerp over 3 frames.
-            _reconciledTarget    = serverState.Position;
-            _reconcileFramesLeft = 3;
+            // Rotation is captured here so the per-frame lerp in Update() can
+            // slerp toward the server-authoritative orientation alongside position.
+            _reconciledTarget         = serverState.Position;
+            _reconciledRotationTarget = serverState.Rotation;
+            _reconcileFramesLeft      = 3;
         }
 
         // ── Unity lifecycle ────────────────────────────────────────────────────
@@ -229,8 +238,9 @@ namespace RTMPE.Sync
         {
             MarkClean();
             _inputBuffer.Clear();
-            _reconcileFramesLeft = 0;
-            _lastInputTick       = uint.MaxValue;
+            _reconcileFramesLeft      = 0;
+            _reconciledRotationTarget = transform.rotation;
+            _lastInputTick            = uint.MaxValue;
         }
 
         /// <summary>
@@ -267,13 +277,32 @@ namespace RTMPE.Sync
             }
 
             // ── Reconciliation lerp ───────────────────────────────────────────
+            // Blend BOTH position and rotation toward the server-authoritative
+            // values so a partial mid-air rotation correction does not get left
+            // behind when only the position lerp completes.
             if (_reconcileFramesLeft > 0)
             {
-                transform.position = Vector3.Lerp(
-                    transform.position,
-                    _reconciledTarget,
-                    ReconcileLerpFraction);
+                if (_syncPosition)
+                {
+                    transform.position = Vector3.Lerp(
+                        transform.position,
+                        _reconciledTarget,
+                        ReconcileLerpFraction);
+                }
+                if (_syncRotation)
+                {
+                    transform.rotation = Quaternion.Slerp(
+                        transform.rotation,
+                        _reconciledRotationTarget,
+                        ReconcileLerpFraction);
+                }
                 _reconcileFramesLeft--;
+                if (_reconcileFramesLeft == 0)
+                {
+                    // Sync completes — refresh the baseline so the next frame
+                    // does not echo the lerped state back to the server.
+                    MarkClean();
+                }
             }
         }
 

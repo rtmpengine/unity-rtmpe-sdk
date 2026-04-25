@@ -149,7 +149,7 @@ namespace RTMPE.Infrastructure.Compression
                 table[h] = srcOff;
 
                 // Check if a match exists and is within the 64KB distance limit.
-                if (matchPos >= 0 && srcOff - matchPos < 65536 && matchPos >= 0)
+                if (matchPos >= 0 && srcOff - matchPos < 65536)
                 {
                     // Verify the 4-byte match.
                     if (src[matchPos]     == src[srcOff]     &&

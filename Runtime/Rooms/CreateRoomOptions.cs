@@ -13,7 +13,7 @@ namespace RTMPE.Rooms
         /// <summary>Display name for the room (max 64 chars). Empty = server default.</summary>
         public string Name { get; set; } = string.Empty;
 
-        /// <summary>Maximum players allowed (1–16). Zero = server default (16).</summary>
+        /// <summary>Maximum players allowed (1–100). Zero = server default (100).</summary>
         public int MaxPlayers { get; set; }
 
         /// <summary>Whether the room appears in ListRooms results.</summary>

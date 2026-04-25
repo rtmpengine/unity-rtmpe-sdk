@@ -100,6 +100,21 @@ namespace RTMPE.Sync
         [Tooltip("Speed at which the remote body lerps toward the authoritative rotation.")]
         [SerializeField] [Range(1f, 50f)] private float _rotationCorrectionSpeed = 10f;
 
+        // ── Inspector — Owner reconciliation ───────────────────────────────────
+
+        [Header("Owner Reconciliation")]
+        [Tooltip("Enable defensive owner-side reconciliation against the server-broadcast state. " +
+                 "When the local position diverges from the server-confirmed position by more than " +
+                 "_ownerReconcileSnapThreshold, the body snaps to the server position.  Below the " +
+                 "threshold the local prediction is preserved (no visual pop).  Disable for " +
+                 "trusted-client modes; enable when an authoritative server simulates physics.")]
+        [SerializeField] private bool _enableOwnerReconciliation = false;
+
+        [Tooltip("Position error threshold (world units) above which the owner snaps to the " +
+                 "server-confirmed position.  Set high enough to avoid fighting normal " +
+                 "client-side prediction noise.")]
+        [SerializeField] [Range(0.5f, 20f)] private float _ownerReconcileSnapThreshold = 3.0f;
+
         // ── Inspector — Dead reckoning ─────────────────────────────────────────
 
         [Header("Dead Reckoning")]
@@ -339,10 +354,49 @@ namespace RTMPE.Sync
         }
 
         /// <summary>
-        /// No-op reconciliation for the owner client (see <see cref="NetworkRigidbody"/>
-        /// for the rationale).
+        /// Defensive 2-D owner reconciliation.  Mirrors
+        /// <see cref="NetworkRigidbody.ApplyReconciliation"/>: applies a snap
+        /// when the local position diverges from the server-confirmed position
+        /// beyond <see cref="_ownerReconcileSnapThreshold"/>, and rejects
+        /// non-finite payloads.
         /// </summary>
-        internal void ApplyReconciliation(PhysicsState2D serverState, byte changedMask) { }
+        internal void ApplyReconciliation(PhysicsState2D serverState, byte changedMask)
+        {
+            if (!_enableOwnerReconciliation || _rb == null || !IsOwner) return;
+
+            if (_syncPosition && (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0)
+            {
+                Vector2 sp = serverState.Position;
+                if (float.IsNaN(sp.x) || float.IsInfinity(sp.x) ||
+                    float.IsNaN(sp.y) || float.IsInfinity(sp.y))
+                {
+                    Debug.LogWarning(
+                        "[RTMPE] NetworkRigidbody2D.ApplyReconciliation: rejected non-finite " +
+                        $"server position {sp} — keeping local state.", this);
+                    return;
+                }
+
+                float err = Vector2.Distance(_rb.position, sp);
+                if (err > _ownerReconcileSnapThreshold)
+                {
+                    if (_makeRemoteKinematic) _rb.position = sp;
+                    else                      _rb.MovePosition(sp);
+                }
+            }
+
+            if (_syncRotation && (changedMask & PhysicsPacketBuilder.ChangedRotation) != 0)
+            {
+                float sr = serverState.Rotation;
+                if (float.IsNaN(sr) || float.IsInfinity(sr)) return;
+
+                float angleErr = Mathf.Abs(Mathf.DeltaAngle(_rb.rotation, sr));
+                if (angleErr > 30f)
+                {
+                    if (_makeRemoteKinematic) _rb.rotation = sr;
+                    else                      _rb.MoveRotation(sr);
+                }
+            }
+        }
 
         // ── Public API ─────────────────────────────────────────────────────────
 

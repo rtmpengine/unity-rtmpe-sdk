@@ -684,5 +684,111 @@ namespace RTMPE.Tests
             using var hmac = new System.Security.Cryptography.HMACSHA256(key);
             return hmac.ComputeHash(message);
         }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ConstantTimeEquals — pinned-key compare side-channel hardening
+        // ══════════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Equal arrays return true.  Sanity check for the happy path.
+        /// </summary>
+        [Test]
+        [Category("ConstantTime")]
+        public void ConstantTimeEquals_EqualArrays_ReturnsTrue()
+        {
+            var a = new byte[32];
+            var b = new byte[32];
+            for (int i = 0; i < 32; i++) { a[i] = (byte)i; b[i] = (byte)i; }
+            Assert.IsTrue(HandshakeHandler.ConstantTimeEquals(a, b));
+        }
+
+        /// <summary>
+        /// A single-byte difference anywhere in the array returns false.
+        /// Covers prefix, middle, and suffix positions to ensure no early-exit.
+        /// </summary>
+        [Test]
+        [Category("ConstantTime")]
+        public void ConstantTimeEquals_OneByteDiff_ReturnsFalse(
+            [Values(0, 7, 15, 23, 31)] int diffIndex)
+        {
+            var a = new byte[32];
+            var b = new byte[32];
+            for (int i = 0; i < 32; i++) { a[i] = 0x42; b[i] = 0x42; }
+            b[diffIndex] ^= 0x01;
+            Assert.IsFalse(HandshakeHandler.ConstantTimeEquals(a, b),
+                $"diff at index {diffIndex} must be detected");
+        }
+
+        /// <summary>
+        /// Length mismatch returns false (no IndexOutOfRange).
+        /// </summary>
+        [Test]
+        [Category("ConstantTime")]
+        public void ConstantTimeEquals_LengthMismatch_ReturnsFalse()
+        {
+            var a = new byte[32];
+            var b = new byte[31];
+            Assert.IsFalse(HandshakeHandler.ConstantTimeEquals(a, b));
+            Assert.IsFalse(HandshakeHandler.ConstantTimeEquals(b, a));
+        }
+
+        /// <summary>
+        /// Null inputs return false (defensive — never throw NRE).
+        /// </summary>
+        [Test]
+        [Category("ConstantTime")]
+        public void ConstantTimeEquals_NullInputs_ReturnsFalse()
+        {
+            var a = new byte[32];
+            Assert.IsFalse(HandshakeHandler.ConstantTimeEquals(null, a));
+            Assert.IsFalse(HandshakeHandler.ConstantTimeEquals(a, null));
+            Assert.IsFalse(HandshakeHandler.ConstantTimeEquals(null, null));
+        }
+
+        /// <summary>
+        /// Compare-time independence regression: differences at position 0 vs.
+        /// position 31 must take roughly the same wall-clock time.  We sample
+        /// many iterations and assert the timing variance stays inside a
+        /// generous window.  The point is to catch a regression to the prior
+        /// early-exit loop (which leaks the matched-prefix length).
+        /// </summary>
+        [Test]
+        [Category("ConstantTime")]
+        public void ConstantTimeEquals_TimingIsBalanced_AcrossDiffPositions()
+        {
+            const int Iters = 200_000;
+
+            var pinned = new byte[32];
+            for (int i = 0; i < 32; i++) pinned[i] = 0x42;
+
+            var diffAt0  = (byte[])pinned.Clone();  diffAt0[0]  ^= 0x01;
+            var diffAt31 = (byte[])pinned.Clone();  diffAt31[31] ^= 0x01;
+
+            // Warm-up
+            for (int i = 0; i < 1000; i++)
+            {
+                HandshakeHandler.ConstantTimeEquals(pinned, diffAt0);
+                HandshakeHandler.ConstantTimeEquals(pinned, diffAt31);
+            }
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < Iters; i++)
+                HandshakeHandler.ConstantTimeEquals(pinned, diffAt0);
+            sw.Stop();
+            long t0 = sw.ElapsedTicks;
+
+            sw.Restart();
+            for (int i = 0; i < Iters; i++)
+                HandshakeHandler.ConstantTimeEquals(pinned, diffAt31);
+            sw.Stop();
+            long t31 = sw.ElapsedTicks;
+
+            // Generous bound: a non-constant-time loop with early-exit at 0
+            // would be ~32× faster than the full-loop case.  Asserting <3×
+            // catches that regression while tolerating CI/JIT noise.
+            double ratio = (double)Math.Max(t0, t31) / Math.Min(t0, t31);
+            Assert.Less(ratio, 3.0,
+                $"Timing ratio {ratio:F2} suggests early-exit (t0={t0}, t31={t31})");
+        }
     }
 }

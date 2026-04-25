@@ -636,6 +636,127 @@ namespace RTMPE.Tests
             Assert.AreEqual(16L, ms.Length, "Quaternion must occupy exactly 16 bytes.");
         }
 
+        // ── Defensive deserialization — reject hostile / corrupt quaternions ──
+
+        /// <summary>
+        /// A unit quaternion (identity rotation) deserialises cleanly and the
+        /// new value is observable via Value.
+        /// </summary>
+        [Test]
+        [Description("NetworkVariableQuaternion.Deserialize accepts a well-formed unit quaternion.")]
+        public void NetworkVariableQuaternion_Deserialize_AcceptsUnit()
+        {
+            var v   = new NetworkVariableQuaternion(_owner, 0, Quaternion.identity);
+            var bytes = SerializeQuaternion(0.0f, 0.0f, 0.0f, 1.0f); // identity
+
+            using var ms     = new MemoryStream(bytes);
+            using var reader = new BinaryReader(ms);
+            v.Deserialize(reader);
+
+            Assert.AreEqual(1.0f, v.Value.w, 1e-5f);
+        }
+
+        /// <summary>
+        /// A non-unit quaternion outside the [0.9, 1.1] magnitude band is
+        /// rejected and the prior value is preserved.  Without this guard a
+        /// hostile client could inject arbitrary non-rotations that would
+        /// later corrupt transform.rotation in consumer code.
+        /// </summary>
+        [Test]
+        [Description("NetworkVariableQuaternion.Deserialize rejects non-unit quaternions; prior value preserved.")]
+        public void NetworkVariableQuaternion_Deserialize_RejectsNonUnit()
+        {
+            var prior = new Quaternion(0f, 0f, 0f, 1f); // identity
+            var v     = new NetworkVariableQuaternion(_owner, 0, prior);
+
+            // Magnitude squared = 4 — far outside [0.81, 1.21].
+            var bytes = SerializeQuaternion(2.0f, 0.0f, 0.0f, 0.0f);
+
+            using var ms     = new MemoryStream(bytes);
+            using var reader = new BinaryReader(ms);
+            v.Deserialize(reader);
+
+            Assert.AreEqual(prior, v.Value,
+                "non-unit quaternion must NOT be applied; prior value must be preserved");
+        }
+
+        /// <summary>
+        /// NaN components are rejected.  A NaN quaternion would silently
+        /// propagate into transform.rotation and break downstream physics /
+        /// rendering.
+        /// </summary>
+        [Test]
+        [Description("NetworkVariableQuaternion.Deserialize rejects NaN components.")]
+        public void NetworkVariableQuaternion_Deserialize_RejectsNaN()
+        {
+            var prior = Quaternion.identity;
+            var v     = new NetworkVariableQuaternion(_owner, 0, prior);
+
+            var bytes = SerializeQuaternion(float.NaN, 0f, 0f, 1f);
+
+            using var ms     = new MemoryStream(bytes);
+            using var reader = new BinaryReader(ms);
+            v.Deserialize(reader);
+
+            Assert.AreEqual(prior, v.Value, "NaN quaternion must NOT be applied");
+        }
+
+        /// <summary>
+        /// Infinity components are rejected.
+        /// </summary>
+        [Test]
+        [Description("NetworkVariableQuaternion.Deserialize rejects infinite components.")]
+        public void NetworkVariableQuaternion_Deserialize_RejectsInfinity()
+        {
+            var prior = Quaternion.identity;
+            var v     = new NetworkVariableQuaternion(_owner, 0, prior);
+
+            var bytes = SerializeQuaternion(0f, float.PositiveInfinity, 0f, 1f);
+
+            using var ms     = new MemoryStream(bytes);
+            using var reader = new BinaryReader(ms);
+            v.Deserialize(reader);
+
+            Assert.AreEqual(prior, v.Value, "Infinity quaternion must NOT be applied");
+        }
+
+        /// <summary>
+        /// A quaternion with small accumulated rounding error (magnitude
+        /// slightly off-unit but inside the tolerance band) is accepted and
+        /// renormalised to exact unit length on read.
+        /// </summary>
+        [Test]
+        [Description("NetworkVariableQuaternion.Deserialize renormalises near-unit quaternions.")]
+        public void NetworkVariableQuaternion_Deserialize_RenormalisesNearUnit()
+        {
+            var v = new NetworkVariableQuaternion(_owner, 0, Quaternion.identity);
+
+            // magSq = 1.05² + 0² + 0² + 0² = 1.1025 — inside [0.81, 1.21]
+            var bytes = SerializeQuaternion(1.05f, 0f, 0f, 0f);
+
+            using var ms     = new MemoryStream(bytes);
+            using var reader = new BinaryReader(ms);
+            v.Deserialize(reader);
+
+            float magSq = v.Value.x * v.Value.x + v.Value.y * v.Value.y
+                        + v.Value.z * v.Value.z + v.Value.w * v.Value.w;
+            Assert.AreEqual(1.0f, magSq, 1e-4f,
+                "near-unit quaternion must be renormalised to exact unit length on deserialise");
+        }
+
+        // Helper: little-endian 16-byte quaternion payload (matches Serialize wire format).
+        private static byte[] SerializeQuaternion(float x, float y, float z, float w)
+        {
+            using var ms     = new MemoryStream(16);
+            using var writer = new BinaryWriter(ms);
+            writer.Write(x);
+            writer.Write(y);
+            writer.Write(z);
+            writer.Write(w);
+            writer.Flush();
+            return ms.ToArray();
+        }
+
         // ── 14: SerializeWithId — wire layout for int ─────────────────────────
 
         [Test]

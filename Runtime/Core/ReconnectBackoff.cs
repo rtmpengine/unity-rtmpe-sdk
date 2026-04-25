@@ -71,7 +71,12 @@ namespace RTMPE.Core
         /// </param>
         /// <param name="seed">
         /// Optional RNG seed.  Pass a fixed seed in deterministic tests; leave
-        /// null in production so the RNG is seeded from the system clock.
+        /// null in production so the RNG is seeded from a high-entropy source
+        /// (cryptographic RNG-derived) instead of the system clock — many
+        /// clients reconnecting in the same millisecond after a server outage
+        /// would otherwise share a Random seed and produce correlated jitter,
+        /// recreating the very reconnect-storm pattern Full Jitter is meant
+        /// to prevent.
         /// </param>
         public ReconnectBackoff(
             int baseDelayMs = DefaultBaseDelayMs,
@@ -87,8 +92,23 @@ namespace RTMPE.Core
 
             _baseDelayMs = baseDelayMs;
             _maxDelayMs  = maxDelayMs;
-            _rng         = seed.HasValue ? new Random(seed.Value) : new Random();
+            _rng         = seed.HasValue ? new Random(seed.Value) : new Random(NewEntropySeed());
             _attempt     = 0;
+        }
+
+        // High-entropy seed for the per-instance Random.  Avoids the
+        // System.Clock-derived default seed of `new Random()`, which
+        // collides across instances created within the same tick — the
+        // reconnect-storm scenario described in the constructor docs.
+        // Uses a 4-byte CSPRNG draw and folds it into an int.
+        private static int NewEntropySeed()
+        {
+            var buf = new byte[4];
+            using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+            {
+                rng.GetBytes(buf);
+            }
+            return BitConverter.ToInt32(buf, 0);
         }
 
         /// <summary>

@@ -34,7 +34,6 @@ namespace RTMPE.Core
         private bool    _running;
         private long    _lastSendTick;    // Stopwatch ticks at the time of the most-recent send (for interval tracking)
         private long    _pendingSendTick; // Stopwatch ticks at the time of the FIRST send for the current heartbeat cycle (for RTT)
-        private long    _lastAckTick;     // Stopwatch ticks at the time of the last Ack
         private int     _missedAcks;
         private bool    _awaitingAck;
 

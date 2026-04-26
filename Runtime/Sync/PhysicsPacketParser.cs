@@ -111,11 +111,12 @@ namespace RTMPE.Sync
             byte dataOnly = (byte)(changedMask & ~PhysicsPacketBuilder.TypeMarker3D);
             if ((dataOnly & ~PhysicsPacketBuilder.DataFieldMask) != 0) return false;
 
-            var  pos    = Vector3.zero;
-            var  rot    = new Quaternion(0f, 0f, 0f, 0f); // raw zero — caller checks mask
-            var  vel    = Vector3.zero;
-            var  angVel = Vector3.zero;
-            bool sleep  = false;
+            var  pos        = Vector3.zero;
+            var  rot        = new Quaternion(0f, 0f, 0f, 0f); // raw zero — caller checks mask
+            var  vel        = Vector3.zero;
+            var  angVel     = Vector3.zero;
+            bool sleep      = false;
+            byte constraint = 0;
 
             // ── Position (3 × f32 LE) ─────────────────────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedPosition) != 0)
@@ -176,6 +177,13 @@ namespace RTMPE.Sync
                 sleep = payload[off++] != 0x00;
             }
 
+            // ── Constraint mask (u8) ──────────────────────────────────────────
+            if ((changedMask & PhysicsPacketBuilder.ChangedConstraints) != 0)
+            {
+                if (off + 1 > payload.Length) return false;
+                constraint = payload[off++];
+            }
+
             state = new PhysicsState
             {
                 Position        = pos,
@@ -183,6 +191,7 @@ namespace RTMPE.Sync
                 Velocity        = vel,
                 AngularVelocity = angVel,
                 IsSleeping      = sleep,
+                ConstraintMask  = constraint,
             };
             return true;
         }
@@ -233,11 +242,12 @@ namespace RTMPE.Sync
             byte dataOnly = (byte)(changedMask & ~PhysicsPacketBuilder.TypeMarker2D);
             if ((dataOnly & ~PhysicsPacketBuilder.DataFieldMask) != 0) return false;
 
-            var  pos    = Vector2.zero;
-            float rot   = 0f;
-            var  vel    = Vector2.zero;
-            float angVel = 0f;
-            bool sleep  = false;
+            var  pos        = Vector2.zero;
+            float rot       = 0f;
+            var  vel        = Vector2.zero;
+            float angVel    = 0f;
+            bool sleep      = false;
+            byte constraint = 0;
 
             // ── Position (2 × f32 LE) ─────────────────────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedPosition) != 0)
@@ -280,6 +290,13 @@ namespace RTMPE.Sync
                 sleep = payload[off++] != 0x00;
             }
 
+            // ── Constraint mask (u8) ──────────────────────────────────────────
+            if ((changedMask & PhysicsPacketBuilder.ChangedConstraints) != 0)
+            {
+                if (off + 1 > payload.Length) return false;
+                constraint = payload[off++];
+            }
+
             state = new PhysicsState2D
             {
                 Position        = pos,
@@ -287,6 +304,7 @@ namespace RTMPE.Sync
                 Velocity        = vel,
                 AngularVelocity = angVel,
                 IsSleeping      = sleep,
+                ConstraintMask  = constraint,
             };
             return true;
         }

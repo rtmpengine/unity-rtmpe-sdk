@@ -4,15 +4,18 @@
 // network by NetworkRigidbody.
 //
 // Design decisions:
-//   • Mirrors TransformState but adds Velocity, AngularVelocity, and IsSleeping
-//     for Rigidbody-driven objects.  Position and Rotation are included so the
-//     physics component is self-contained and does not require a co-located
-//     NetworkTransform.
+//   • Mirrors TransformState but adds Velocity, AngularVelocity, IsSleeping,
+//     and ConstraintMask for Rigidbody-driven objects.  Position and Rotation
+//     are included so the physics component is self-contained and does not
+//     require a co-located NetworkTransform.
 //   • Uses UnityEngine types directly — no intermediate conversion type.
 //   • IsSleeping enables remote Rigidbodies to enter sleep state when the owner
 //     physics engine idles the body, eliminating micro-movement from floating-
 //     point noise on stationary objects.
 //   • AngularVelocity is in radians/second (Unity's native Rigidbody unit).
+//   • ConstraintMask mirrors RigidbodyConstraints (Unity's bitmask) so that
+//     runtime constraint changes (e.g. freezing axes mid-flight) are preserved
+//     across the network rather than relying on inspector-set defaults.
 
 using UnityEngine;
 
@@ -39,5 +42,14 @@ namespace RTMPE.Sync
 
         /// <summary>True when the physics body is in the sleep state.</summary>
         public bool IsSleeping;
+
+        /// <summary>
+        /// Bitmask of active <see cref="UnityEngine.RigidbodyConstraints"/> on
+        /// the owner's Rigidbody at the time of serialisation.  Applied on the
+        /// receiving end so that runtime constraint changes (e.g. locking an
+        /// axis after a ragdoll lands) are preserved without a separate message.
+        /// A value of 0 means no constraints (RigidbodyConstraints.None).
+        /// </summary>
+        public byte ConstraintMask;
     }
 }

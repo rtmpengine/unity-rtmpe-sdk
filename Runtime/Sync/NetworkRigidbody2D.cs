@@ -69,6 +69,10 @@ namespace RTMPE.Sync
         [Tooltip("Synchronise sleep state so remote bodies idle when the owner body is asleep.")]
         [SerializeField] private bool _syncSleepState = true;
 
+        [Tooltip("Synchronise the RigidbodyConstraints2D bitmask so runtime constraint changes " +
+                 "(e.g. freezing the X axis during a 2-D climb) propagate to remote bodies.")]
+        [SerializeField] private bool _syncConstraints = true;
+
         // ── Inspector — Send thresholds ────────────────────────────────────────
 
         [Header("Send Thresholds")]
@@ -139,12 +143,15 @@ namespace RTMPE.Sync
         private PhysicsState2D _lastSentState;
         private bool           _hasSentOnce;
         private bool           _lastSleepState;
+        private byte           _lastSentConstraints;
         private float          _sendAccum;
 
         // Non-owner side.
         private PhysicsState2D _receivedState;
         private float          _lastReceiveTime;
         private bool           _hasReceivedState;
+        private byte           _appliedConstraints;
+        private bool           _hasReceivedConstraints;
 
         // ── Unity lifecycle ────────────────────────────────────────────────────
 
@@ -163,10 +170,14 @@ namespace RTMPE.Sync
 
             if (IsOwner)
             {
-                _lastSentState  = GetState();
-                _lastSleepState = _rb.IsSleeping();
-                _hasSentOnce    = false;
+                _lastSentState       = GetState();
+                _lastSleepState      = _rb.IsSleeping();
+                _lastSentConstraints = _lastSentState.ConstraintMask;
+                _hasSentOnce         = false;
             }
+
+            _appliedConstraints     = (byte)(int)_rb.constraints;
+            _hasReceivedConstraints = false;
 
             _sendAccum = 0f;
         }
@@ -213,8 +224,9 @@ namespace RTMPE.Sync
             var payload = PhysicsPacketBuilder.Build2DPayload(NetworkObjectId, current, dataMask);
             manager.SendStateSync(payload);
 
-            _lastSentState  = current;
-            _lastSleepState = current.IsSleeping;
+            _lastSentState       = current;
+            _lastSleepState      = current.IsSleeping;
+            _lastSentConstraints = current.ConstraintMask;
         }
 
         private byte BuildChangedMask(PhysicsState2D current)
@@ -240,6 +252,9 @@ namespace RTMPE.Sync
             if (_syncSleepState && current.IsSleeping != _lastSleepState)
                 mask |= PhysicsPacketBuilder.ChangedSleep;
 
+            if (_syncConstraints && current.ConstraintMask != _lastSentConstraints)
+                mask |= PhysicsPacketBuilder.ChangedConstraints;
+
             return mask;
         }
 
@@ -251,6 +266,7 @@ namespace RTMPE.Sync
             if (_syncVelocity)        mask |= PhysicsPacketBuilder.ChangedVelocity;
             if (_syncAngularVelocity) mask |= PhysicsPacketBuilder.ChangedAngularVelocity;
             if (_syncSleepState)      mask |= PhysicsPacketBuilder.ChangedSleep;
+            if (_syncConstraints)     mask |= PhysicsPacketBuilder.ChangedConstraints;
             return mask;
         }
 
@@ -259,6 +275,15 @@ namespace RTMPE.Sync
         private void RemoteFixedUpdate()
         {
             if (!_hasReceivedState) return;
+
+            // ── Constraint application ────────────────────────────────────────
+            // Apply the authoritative constraint bitmask once per change.
+            if (_syncConstraints && _hasReceivedConstraints
+                && _receivedState.ConstraintMask != _appliedConstraints)
+            {
+                _rb.constraints     = (RigidbodyConstraints2D)_receivedState.ConstraintMask;
+                _appliedConstraints = _receivedState.ConstraintMask;
+            }
 
             // ── Sleep handling ────────────────────────────────────────────────
             if (_syncSleepState && _receivedState.IsSleeping)
@@ -349,6 +374,12 @@ namespace RTMPE.Sync
             if ((changedMask & PhysicsPacketBuilder.ChangedSleep) != 0)
                 _receivedState.IsSleeping = incoming.IsSleeping;
 
+            if ((changedMask & PhysicsPacketBuilder.ChangedConstraints) != 0)
+            {
+                _receivedState.ConstraintMask = incoming.ConstraintMask;
+                _hasReceivedConstraints       = true;
+            }
+
             _lastReceiveTime  = Time.fixedTime;
             _hasReceivedState = true;
         }
@@ -415,6 +446,7 @@ namespace RTMPE.Sync
                 Velocity        = _rb.linearVelocity,
                 AngularVelocity = _rb.angularVelocity,
                 IsSleeping      = _rb.IsSleeping(),
+                ConstraintMask  = (byte)(int)_rb.constraints,
             };
         }
     }

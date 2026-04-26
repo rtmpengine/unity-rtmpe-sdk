@@ -47,6 +47,44 @@ namespace RTMPE.Core
         private readonly List<NetworkVariableBase> _trackedVariables =
             new List<NetworkVariableBase>();
 
+        // Per-type cache of (field/property → NetworkVariableAttribute) maps.
+        // Built lazily once per concrete NetworkBehaviour subclass on first
+        // TrackVariable() invocation; reused for every subsequent spawn of the
+        // same type so the reflection scan is amortised across the whole
+        // application lifetime.  HashSet<Type> reads are lock-free under the
+        // main-thread invariant, and Dictionary<Type, …> follows the same
+        // single-thread access pattern.
+        private static readonly Dictionary<Type, IReadOnlyList<NetworkVariableMetadata>>
+            _variableMetadataCache =
+                new Dictionary<Type, IReadOnlyList<NetworkVariableMetadata>>();
+
+        // Cached reflection result for a single field or property carrying a
+        // NetworkVariableAttribute.  Stored once per declaring type and matched
+        // to instance variables by reading the field/property value.
+        private readonly struct NetworkVariableMetadata
+        {
+            public readonly FieldInfo    Field;     // null when the source is a property
+            public readonly PropertyInfo Property;  // null when the source is a field
+            public readonly float        SendRateHz;
+
+            public NetworkVariableMetadata(FieldInfo field, float sendRateHz)
+            {
+                Field      = field;
+                Property   = null;
+                SendRateHz = sendRateHz;
+            }
+
+            public NetworkVariableMetadata(PropertyInfo property, float sendRateHz)
+            {
+                Field      = null;
+                Property   = property;
+                SendRateHz = sendRateHz;
+            }
+
+            public object ReadValue(object instance) =>
+                Field != null ? Field.GetValue(instance) : Property.GetValue(instance);
+        }
+
         // RPC-collision validation cache.  Each concrete NetworkBehaviour subclass
         // is checked exactly once on first spawn; subsequent spawns of the same
         // type skip the reflection scan.  HashSet<Type> reads are lock-free under
@@ -55,7 +93,11 @@ namespace RTMPE.Core
 
         [UnityEngine.RuntimeInitializeOnLoadMethod(
             UnityEngine.RuntimeInitializeLoadType.SubsystemRegistration)]
-        private static void ResetValidatedTypes() => _validatedTypes.Clear();
+        private static void ResetValidatedTypes()
+        {
+            _validatedTypes.Clear();
+            _variableMetadataCache.Clear();
+        }
 
         // ── Properties ─────────────────────────────────────────────────────────
 
@@ -318,6 +360,18 @@ namespace RTMPE.Core
 
             var previous   = _ownerPlayerId;
             _ownerPlayerId = normalized;
+
+            // Reset per-variable throttle state on every ownership transfer so
+            // the new owner's first flush is not gated behind a stale
+            // LastFlushTimeUnscaled inherited from the previous owner's
+            // bookkeeping.  Cheap (one float assignment per variable) and
+            // correctness-critical for variables with low SendRateHz where the
+            // throttle interval can exceed the gap between ownership handoffs.
+            for (int i = 0; i < _trackedVariables.Count; i++)
+            {
+                _trackedVariables[i].ResetThrottleState();
+            }
+
             OnOwnershipChanged(previous, _ownerPlayerId);
         }
 
@@ -329,10 +383,114 @@ namespace RTMPE.Core
         /// Called automatically by the <c>NetworkVariableBase</c> constructor —
         /// user code should never call this directly.
         /// </summary>
+        /// <summary>
+        /// Read-only snapshot of every <see cref="NetworkVariableBase"/>
+        /// registered with this behaviour.  Used by Editor tooling (Network
+        /// Debugger window) to enumerate the live variable set without
+        /// duplicating the bookkeeping that lives on the SDK side.
+        ///
+        /// <para>The returned list is the live tracking list — do not mutate
+        /// it.  Callers must inspect on the Unity main thread.</para>
+        /// </summary>
+        public IReadOnlyList<NetworkVariableBase> TrackedVariables => _trackedVariables;
+
         internal void TrackVariable(NetworkVariableBase variable)
         {
             if (variable == null) throw new ArgumentNullException(nameof(variable));
             _trackedVariables.Add(variable);
+
+            // Apply [NetworkVariable(SendRateHz = …)] declaratively, matching
+            // attribute declarations to the variable instance by reading the
+            // field/property value.  Handled inline so dynamically created
+            // NetworkVariable instances (e.g. via TrackVariable from a
+            // non-attributed source) keep their default 0 (use global cadence).
+            ApplyVariableAttributesIfAny(variable);
+        }
+
+        /// <summary>
+        /// Match <see cref="NetworkVariableAttribute"/> declarations on this
+        /// behaviour's type to <paramref name="variable"/> by reading each
+        /// candidate field/property and comparing the value reference against
+        /// <paramref name="variable"/>.  When a match is found the attribute's
+        /// <see cref="NetworkVariableAttribute.SendRateHz"/> is copied onto the
+        /// variable instance so the per-tick flush loop can throttle it.
+        ///
+        /// <para>The reflection scan is performed at most once per concrete
+        /// subclass; subsequent spawns reuse the cached metadata list.</para>
+        /// </summary>
+        private void ApplyVariableAttributesIfAny(NetworkVariableBase variable)
+        {
+            var type     = GetType();
+            var metadata = GetOrBuildMetadata(type);
+            if (metadata.Count == 0) return;
+
+            for (int i = 0; i < metadata.Count; i++)
+            {
+                var entry = metadata[i];
+                object held;
+                try { held = entry.ReadValue(this); }
+                catch (Exception ex)
+                {
+                    // A property-getter throwing should not abort registration of
+                    // a sibling variable — log once and move on.
+                    Debug.LogWarning(
+                        $"[RTMPE] NetworkVariable attribute scan: reading " +
+                        $"{type.Name}.{(entry.Field?.Name ?? entry.Property?.Name)} threw " +
+                        $"{ex.GetType().Name}: {ex.Message}.  Skipping this declaration.");
+                    continue;
+                }
+
+                if (!ReferenceEquals(held, variable)) continue;
+
+                variable.SendRateHz = entry.SendRateHz;
+                return; // a single field/property declares a single variable
+            }
+        }
+
+        /// <summary>
+        /// Build (and cache) the list of <see cref="NetworkVariableAttribute"/>
+        /// declarations for <paramref name="type"/>.  Declared fields/properties
+        /// up the inheritance chain are included; static members are skipped.
+        /// </summary>
+        private static IReadOnlyList<NetworkVariableMetadata> GetOrBuildMetadata(Type type)
+        {
+            if (_variableMetadataCache.TryGetValue(type, out var cached)) return cached;
+
+            var list = new List<NetworkVariableMetadata>();
+
+            // Walk the inheritance chain so attributes declared on a base
+            // class are honoured for subclasses too.  Stop at NetworkBehaviour
+            // because anything above it (MonoBehaviour, Component, Object)
+            // cannot legally hold NetworkVariable fields.
+            const BindingFlags flags =
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic |
+                BindingFlags.DeclaredOnly;
+
+            for (Type t = type; t != null && t != typeof(NetworkBehaviour); t = t.BaseType)
+            {
+                foreach (var f in t.GetFields(flags))
+                {
+                    if (!typeof(NetworkVariableBase).IsAssignableFrom(f.FieldType)) continue;
+                    var attr = f.GetCustomAttribute<NetworkVariableAttribute>(inherit: true);
+                    if (attr == null) continue;
+                    list.Add(new NetworkVariableMetadata(f, attr.SendRateHz));
+                }
+
+                foreach (var p in t.GetProperties(flags))
+                {
+                    if (!p.CanRead) continue;
+                    if (!typeof(NetworkVariableBase).IsAssignableFrom(p.PropertyType)) continue;
+                    var attr = p.GetCustomAttribute<NetworkVariableAttribute>(inherit: true);
+                    if (attr == null) continue;
+                    // Indexer properties are not supported (they require an index argument).
+                    if (p.GetIndexParameters().Length != 0) continue;
+                    list.Add(new NetworkVariableMetadata(p, attr.SendRateHz));
+                }
+            }
+
+            IReadOnlyList<NetworkVariableMetadata> result = list;
+            _variableMetadataCache[type] = result;
+            return result;
         }
 
         /// <summary>
@@ -349,13 +507,27 @@ namespace RTMPE.Core
         {
             if (!IsOwner || !IsSpawned || _trackedVariables.Count == 0) return;
 
-            // Fast path: skip allocation when nothing is dirty.
-            bool hasDirty = false;
-            foreach (var v in _trackedVariables)
+            // ── Fast path: skip allocation when nothing is dirty AND eligible.
+            //
+            // A variable is "eligible to flush this tick" when:
+            //   • IsDirty == true, AND
+            //   • either SendRateHz <= 0 (use global cadence; always eligible
+            //     while dirty), OR (now - LastFlushTimeUnscaled) >= 1/SendRateHz.
+            //
+            // Throttled-but-dirty variables remain dirty until the next eligible
+            // tick — the dirty flag is preserved across skipped flushes so the
+            // most recent value is sent on the first allowed window.
+            float now = UnityEngine.Time.unscaledTime;
+            bool hasEligibleDirty = false;
+            for (int i = 0; i < _trackedVariables.Count; i++)
             {
-                if (v.IsDirty) { hasDirty = true; break; }
+                var v = _trackedVariables[i];
+                if (!v.IsDirty) continue;
+                if (!IsThrottleEligible(v, now)) continue;
+                hasEligibleDirty = true;
+                break;
             }
-            if (!hasDirty) return;
+            if (!hasEligibleDirty) return;
 
             // Use a growable MemoryStream so that long NetworkVariableString values
             // (or many simultaneously dirty variables) never throw the
@@ -374,12 +546,27 @@ namespace RTMPE.Core
             writer.Write((byte)0);
 
             byte count = 0;
-            foreach (var v in _trackedVariables)
+            for (int i = 0; i < _trackedVariables.Count; i++)
             {
+                var v = _trackedVariables[i];
                 if (!v.IsDirty) continue;
+
+                // Per-variable throttle: skip serialisation when the
+                // configured send-rate window has not yet elapsed.  The dirty
+                // flag is intentionally NOT cleared so the next eligible tick
+                // still flushes the most recent value.
+                if (!IsThrottleEligible(v, now)) continue;
+
                 v.SerializeWithId(writer);
                 v.MarkClean();
+                v.LastFlushTimeUnscaled = now;
                 count++;
+
+                // VariableUpdate uses a single-byte count prefix; ensure we
+                // never overflow it.  Any remaining dirty variables stay
+                // dirty and are sent on the next tick.  This is a hard wire
+                // limit; the alternative would be silent data corruption.
+                if (count == byte.MaxValue) break;
             }
 
             // Flush the BinaryWriter so its internal buffer is fully committed to ms
@@ -423,10 +610,47 @@ namespace RTMPE.Core
             // NetworkVariableBase.IsDirty setter is protected, so we use
             // the public MarkDirtyForResync hook below that each variable
             // exposes through its own public API via a new internal method.
+            //
+            // Resetting the per-variable throttle state alongside the dirty
+            // flag is intentional: a late joiner must see the full snapshot
+            // on the next eligible tick, not be blocked behind a stale
+            // throttle window inherited from an earlier private send.
             foreach (var v in _trackedVariables)
             {
                 v.MarkDirtyForResync();
+                v.ResetThrottleState();
             }
+        }
+
+        /// <summary>
+        /// Returns <see langword="true"/> if <paramref name="variable"/>'s
+        /// configured per-variable send-rate cap permits a flush at
+        /// <paramref name="nowUnscaled"/>.  A non-positive
+        /// <see cref="NetworkVariableBase.SendRateHz"/> always returns true
+        /// (the global flush cadence is the only gate).
+        /// </summary>
+        private static bool IsThrottleEligible(NetworkVariableBase variable, float nowUnscaled)
+        {
+            float rate = variable.SendRateHz;
+            if (rate <= 0f) return true;
+
+            float interval = 1f / rate;
+            float since    = nowUnscaled - variable.LastFlushTimeUnscaled;
+
+            // LastFlushTimeUnscaled == 0 covers two cases:
+            //   • freshly registered (never flushed),
+            //   • explicitly reset on ownership change / disconnect.
+            // In both cases we want to flush immediately rather than wait out
+            // a phantom interval against unscaled-time = 0.
+            if (variable.LastFlushTimeUnscaled <= 0f) return true;
+
+            // Use ">= interval - epsilon" so that when the global flush tick
+            // and the per-variable interval line up exactly (e.g. SendRateHz
+            // == 30 == global rate), we don't lose a tick to floating-point
+            // jitter.  A 0.5 ms tolerance is well below any actual gameplay
+            // tick rate (1/30 ≈ 33 ms) so it cannot cause double-fires.
+            const float Epsilon = 0.0005f;
+            return since >= interval - Epsilon;
         }
 
         // ── Client-Side Prediction hook ───────────────────────────────────────

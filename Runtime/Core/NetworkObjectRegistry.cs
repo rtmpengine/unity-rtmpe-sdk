@@ -32,6 +32,13 @@ namespace RTMPE.Core
 
         private readonly object _lock = new object();
 
+        // Reusable buffer for GetAll() — re-populated each call to avoid
+        // allocating a fresh List in the 30Hz variable-flush hot path.
+        // Main-thread only (matches the rest of this class), so it's safe to
+        // share a single instance.
+        private readonly List<NetworkBehaviour> _getAllBuffer =
+            new List<NetworkBehaviour>(64);
+
         // ── Mutation ───────────────────────────────────────────────────────────
 
         /// <summary>
@@ -97,22 +104,27 @@ namespace RTMPE.Core
         }
 
         /// <summary>
-        /// Return a snapshot of all currently registered objects, excluding
-        /// any entries whose <c>GameObject</c> has been destroyed externally.
-        /// The returned list is a defensive copy; safe to iterate while the
-        /// registry is modified by other calls.
+        /// Return all currently registered objects, excluding any entries
+        /// whose <c>GameObject</c> has been destroyed externally.  The returned
+        /// list is a SHARED, re-used buffer — callers must finish iterating
+        /// before the next <see cref="GetAll"/> call (single-threaded contract).
+        /// This avoids a 30Hz allocation in the variable-flush hot path.
         /// </summary>
         public IReadOnlyList<NetworkBehaviour> GetAll()
         {
             lock (_lock)
             {
-                var result = new List<NetworkBehaviour>(_objects.Count);
+                _getAllBuffer.Clear();
+                if (_getAllBuffer.Capacity < _objects.Count)
+                {
+                    _getAllBuffer.Capacity = _objects.Count;
+                }
                 foreach (var obj in _objects.Values)
                 {
                     // Unity null check: skip destroyed-but-not-unregistered entries.
-                    if (obj != null) result.Add(obj);
+                    if (obj != null) _getAllBuffer.Add(obj);
                 }
-                return result;
+                return _getAllBuffer;
             }
         }
 

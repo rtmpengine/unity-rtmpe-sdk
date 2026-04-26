@@ -27,8 +27,8 @@
 //     3. When the server broadcasts back an authoritative StateDelta for this
 //        object, ApplyReconciliation() fires (routed by NetworkManager):
 //          • Error > _snapThreshold  →  snap directly to server position.
-//          • Error > _lerpThreshold  →  start a 3-frame smooth lerp toward
-//            the server position (_reconcileFramesLeft drives the blend).
+//          • Error > _lerpThreshold  →  start a 100 ms smooth lerp toward
+//            the server position (_reconcileTimeLeft drives the blend).
 //          • Error <= _lerpThreshold →  accept prediction as-is (no visual pop).
 //     4. AcknowledgeUpTo(LocalTick - 1) trims the buffer each reconciliation.
 //
@@ -100,12 +100,22 @@ namespace RTMPE.Sync
         // Input ring buffer: stores unacknowledged InputPayloads for rollback.
         private readonly InputBuffer _inputBuffer = new InputBuffer();
 
-        // Reconciliation lerp target and remaining-frames counter.
-        // When _reconcileFramesLeft > 0, Update() blends toward _reconciledTarget
-        // (position) and _reconciledRotationTarget (rotation, if _syncRotation is on).
+        // Reconciliation lerp target, start (captured once at schedule time),
+        // and remaining-time accumulator.
+        //
+        // Why both start-pose and time accumulator: true linear interpolation
+        // requires a fixed start position so each frame's blend is
+        //   pos = Lerp(_reconcileStart, _reconciledTarget, elapsed / duration)
+        // — not a recursive Lerp(transform.position, target, dt/timeLeft) which
+        // is mathematically an exponential ease-out and only reaches the target
+        // because of the explicit end-frame snap.  Capturing the start pose at
+        // schedule time fixes the blend and keeps it framerate-independent at
+        // 30 / 60 / 120 / 144 fps.
         private Vector3    _reconciledTarget;
         private Quaternion _reconciledRotationTarget;
-        private int        _reconcileFramesLeft;
+        private Vector3    _reconcileStart;
+        private Quaternion _reconcileStartRotation;
+        private float      _reconcileTimeLeft;
 
         // Guards input collection to exactly one push per LocalTick.
         // Update() runs at frame rate (e.g. 60 Hz) but LocalTick advances at 30 Hz;
@@ -126,9 +136,10 @@ namespace RTMPE.Sync
         // the upper bound on entries the buffer can ever hand out.
         private readonly InputPayload[] _inputSendScratch = new InputPayload[InputBuffer.Capacity];
 
-        // Lerp fraction per frame: blend 1/3 of the remaining error each of
-        // the 3 frames so the correction is visually smooth.
-        private const float ReconcileLerpFraction = 1f / 3f;
+        // Total wall-clock time (seconds) allowed for a medium-error reconciliation
+        // lerp.  100 ms (3 ticks at 30 Hz) matches the previous 3-frame window at
+        // 30 fps while remaining framerate-independent at 60/120/144 fps.
+        private const float ReconcileDuration = 0.1f;
 
         // ── Change-detection properties ────────────────────────────────────────
 
@@ -226,19 +237,26 @@ namespace RTMPE.Sync
                 // Large error — snap immediately to avoid sustained visual drift.
                 if (_syncPosition) transform.position = serverState.Position;
                 if (_syncRotation) transform.rotation = serverState.Rotation;
-                _reconcileFramesLeft = 0;
+                _reconcileTimeLeft = 0f;
                 // Update baseline so the next frame does not register a spurious
                 // threshold violation and send the snapped position back to the server.
                 MarkClean();
                 return;
             }
 
-            // Medium error — smooth lerp over 3 frames.
-            // Rotation is captured here so the per-frame lerp in Update() can
-            // slerp toward the server-authoritative orientation alongside position.
+            // Medium error — smooth linear lerp over ReconcileDuration seconds.
+            //
+            // Capture the CURRENT pose as the lerp start so the per-frame blend
+            // computes a true linear interpolation (Lerp(start, target, t)) with
+            // t = elapsed / duration, instead of a recursive Lerp from the
+            // moving transform.position which produces an exponential ease-out.
+            // Rotation is captured here so the per-frame slerp in Update() can
+            // align toward the server-authoritative orientation alongside position.
             _reconciledTarget         = serverState.Position;
             _reconciledRotationTarget = serverState.Rotation;
-            _reconcileFramesLeft      = 3;
+            _reconcileStart           = transform.position;
+            _reconcileStartRotation   = transform.rotation;
+            _reconcileTimeLeft        = ReconcileDuration;
         }
 
         // ── Unity lifecycle ────────────────────────────────────────────────────
@@ -252,7 +270,7 @@ namespace RTMPE.Sync
         {
             MarkClean();
             _inputBuffer.Clear();
-            _reconcileFramesLeft      = 0;
+            _reconcileTimeLeft        = 0f;
             _reconciledRotationTarget = transform.rotation;
             _lastInputTick            = uint.MaxValue;
         }
@@ -304,30 +322,41 @@ namespace RTMPE.Sync
             }
 
             // ── Reconciliation lerp ───────────────────────────────────────────
-            // Blend BOTH position and rotation toward the server-authoritative
-            // values so a partial mid-air rotation correction does not get left
-            // behind when only the position lerp completes.
-            if (_reconcileFramesLeft > 0)
+            // True linear interpolation from the captured start pose to the
+            // server target, parameterised by elapsed wall-clock time over
+            // ReconcileDuration.  Framerate-independent at 30 / 60 / 120 / 144 fps
+            // because the same elapsed value produces the same blend factor.
+            //
+            // Blend BOTH position and rotation so a partial mid-air rotation
+            // correction does not get left behind when the position lerp
+            // completes first.
+            if (_reconcileTimeLeft > 0f)
             {
+                _reconcileTimeLeft -= Time.deltaTime;
+                float elapsed = ReconcileDuration - _reconcileTimeLeft;
+                float t       = Mathf.Clamp01(elapsed / ReconcileDuration);
+
                 if (_syncPosition)
                 {
                     transform.position = Vector3.Lerp(
-                        transform.position,
+                        _reconcileStart,
                         _reconciledTarget,
-                        ReconcileLerpFraction);
+                        t);
                 }
                 if (_syncRotation)
                 {
                     transform.rotation = Quaternion.Slerp(
-                        transform.rotation,
+                        _reconcileStartRotation,
                         _reconciledRotationTarget,
-                        ReconcileLerpFraction);
+                        t);
                 }
-                _reconcileFramesLeft--;
-                if (_reconcileFramesLeft == 0)
+                if (_reconcileTimeLeft <= 0f)
                 {
-                    // Sync completes — refresh the baseline so the next frame
-                    // does not echo the lerped state back to the server.
+                    // Snap to exact target on completion, then refresh baseline
+                    // so the next frame does not echo the corrected state back.
+                    if (_syncPosition) transform.position = _reconciledTarget;
+                    if (_syncRotation) transform.rotation = _reconciledRotationTarget;
+                    _reconcileTimeLeft = 0f;
                     MarkClean();
                 }
             }

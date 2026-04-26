@@ -2,10 +2,6 @@
 //
 // Determines which clients receive an Enhanced RPC call.
 // Used by the [RtmpeRpc] attribute and EnhancedRpcPacketBuilder.
-//
-// Phase 1 targets only.  AllBuffered and OthersBuffered require Buffered Events
-// (Phase 2.2) and MasterClient requires Master Client infrastructure (Phase 2.1)
-// — those are intentionally absent here.
 
 namespace RTMPE.Rpc
 {
@@ -33,10 +29,10 @@ namespace RTMPE.Rpc
 
         /// <summary>
         /// All clients in the room receive the RPC AND the event is stored in the
-        /// server-side buffer for late joiners.  Late joiners receive all buffered
-        /// events in order via <see cref="RTMPE.Core.PacketType.RpcBufferReplay"/> (0x52)
-        /// immediately after joining the room.
-        /// Requires Buffered Events infrastructure (Phase 5).
+        /// server-side buffer (table: room_event_buffer, max 1000 events/room).
+        /// Late joiners automatically receive all buffered events in order via
+        /// <see cref="RTMPE.Core.PacketType.RpcBufferReplay"/> (0x52) immediately
+        /// after joining the room.  Fully implemented end-to-end.
         /// </summary>
         AllBuffered = 0x03,
     }

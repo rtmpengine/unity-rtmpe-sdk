@@ -17,6 +17,13 @@
 //   0x07  Color     16 bytes  r:f32 g:f32 b:f32 a:f32 LE
 //   0x08  ulong      8 bytes  unsigned LE
 //   0x09  Quaternion 16 bytes  x:f32 y:f32 z:f32 w:f32 LE
+//   0x0A  INetworkSerializable
+//                    [type_name_len:2 LE][type_name UTF-8][payload_len:2 LE][payload bytes]
+//                    The receiver looks up the concrete Type via
+//                    RpcTypeRegistry, instantiates it, and calls
+//                    NetworkDeserialize against an IRtmpeReader scoped to the
+//                    payload bytes — unknown type names skip cleanly using
+//                    payload_len so subsequent parameters parse correctly.
 
 using System;
 using System.Runtime.InteropServices;
@@ -28,15 +35,16 @@ namespace RTMPE.Rpc
     /// <summary>Type discriminator constants for the Enhanced RPC wire format.</summary>
     internal static class RpcTypeId
     {
-        public const byte Int32      = 0x01;
-        public const byte Float32    = 0x02;
-        public const byte Bool       = 0x03;
-        public const byte String     = 0x04;
-        public const byte Bytes      = 0x05;
-        public const byte Vector3    = 0x06;
-        public const byte Color      = 0x07;
-        public const byte UInt64     = 0x08;
-        public const byte Quaternion = 0x09;
+        public const byte Int32                = 0x01;
+        public const byte Float32              = 0x02;
+        public const byte Bool                 = 0x03;
+        public const byte String               = 0x04;
+        public const byte Bytes                = 0x05;
+        public const byte Vector3              = 0x06;
+        public const byte Color                = 0x07;
+        public const byte UInt64               = 0x08;
+        public const byte Quaternion           = 0x09;
+        public const byte INetworkSerializable = 0x0A;
     }
 
     /// <summary>
@@ -76,6 +84,28 @@ namespace RTMPE.Rpc
             if (value is Vector3)    return 1 + 12;
             if (value is Color)      return 1 + 16;
             if (value is Quaternion) return 1 + 16;
+            if (value is INetworkSerializable ns)
+            {
+                // tag(1) + type_name_len(2) + type_name(N UTF-8) + payload_len(2) + payload(M)
+                string typeName = ns.GetType().FullName ?? string.Empty;
+                int typeNameLen = Utf8.GetByteCount(typeName);
+                if (typeNameLen > ushort.MaxValue)
+                    throw new ArgumentException(
+                        $"INetworkSerializable type name '{typeName}' is {typeNameLen} bytes — " +
+                        $"exceeds {ushort.MaxValue}-byte wire limit.",
+                        nameof(value));
+
+                var measurer = new RtmpeBinaryMeasurer();
+                ns.NetworkSerialize(measurer);
+                int payloadLen = measurer.Bytes;
+                if (payloadLen > ushort.MaxValue)
+                    throw new ArgumentException(
+                        $"INetworkSerializable '{typeName}' serializes to {payloadLen} bytes — " +
+                        $"exceeds {ushort.MaxValue}-byte wire limit.",
+                        nameof(value));
+
+                return 1 + 2 + typeNameLen + 2 + payloadLen;
+            }
             var type = value?.GetType();
             throw new ArgumentException(
                 $"Unsupported RPC parameter type: {(type != null ? type.Name : "null")}",
@@ -167,6 +197,46 @@ namespace RTMPE.Rpc
                 WriteF32LE(buf, offset, q.z); offset += 4;
                 WriteF32LE(buf, offset, q.w);
                 return 1 + 16;
+            }
+            if (value is INetworkSerializable ns)
+            {
+                // [tag:1][type_name_len:2 LE][type_name UTF-8][payload_len:2 LE][payload]
+                int startOffset = offset;
+                buf[offset++] = RpcTypeId.INetworkSerializable;
+
+                string typeName = ns.GetType().FullName ?? string.Empty;
+                byte[] nameBytes = Utf8.GetBytes(typeName);
+                if (nameBytes.Length > ushort.MaxValue)
+                    throw new ArgumentException(
+                        $"INetworkSerializable type name '{typeName}' is {nameBytes.Length} bytes — " +
+                        $"exceeds {ushort.MaxValue}-byte wire limit.",
+                        nameof(value));
+
+                WriteU16LE(buf, offset, (ushort)nameBytes.Length); offset += 2;
+                if (nameBytes.Length > 0)
+                {
+                    Buffer.BlockCopy(nameBytes, 0, buf, offset, nameBytes.Length);
+                    offset += nameBytes.Length;
+                }
+
+                // Reserve 2 bytes for payload_len; back-patched after writing.
+                int payloadLenOffset = offset;
+                offset += 2;
+
+                int payloadStart = offset;
+                var writer = new RtmpeBinaryWriter(buf, offset);
+                ns.NetworkSerialize(writer);
+                int payloadLen = writer.Position - payloadStart;
+                if (payloadLen > ushort.MaxValue)
+                    throw new ArgumentException(
+                        $"INetworkSerializable '{typeName}' serializes to {payloadLen} bytes — " +
+                        $"exceeds {ushort.MaxValue}-byte wire limit.",
+                        nameof(value));
+
+                WriteU16LE(buf, payloadLenOffset, (ushort)payloadLen);
+                offset = writer.Position;
+
+                return offset - startOffset;
             }
 
             throw new ArgumentException(
@@ -270,6 +340,86 @@ namespace RTMPE.Rpc
                     float qz = ReadF32LE(data, offset); offset += 4;
                     float qw = ReadF32LE(data, offset); offset += 4;
                     return new Quaternion(qx, qy, qz, qw);
+                }
+
+                case RpcTypeId.INetworkSerializable:
+                {
+                    // [type_name_len:2 LE][type_name][payload_len:2 LE][payload]
+                    if (data.Length - offset < 2) { offset = -1; return null; }
+                    ushort nameLen = ReadU16LE(data, offset); offset += 2;
+                    if (data.Length - offset < nameLen) { offset = -1; return null; }
+                    string typeName = nameLen == 0
+                        ? string.Empty
+                        : Utf8.GetString(data, offset, nameLen);
+                    offset += nameLen;
+
+                    if (data.Length - offset < 2) { offset = -1; return null; }
+                    ushort payloadLen = ReadU16LE(data, offset); offset += 2;
+                    if (data.Length - offset < payloadLen) { offset = -1; return null; }
+
+                    int payloadStart = offset;
+                    offset += payloadLen; // ALWAYS advance past payload, even on failure
+
+                    Type concrete = RpcTypeRegistry.Resolve(typeName);
+                    if (concrete == null)
+                    {
+                        Debug.LogWarning(
+                            $"[RTMPE] RpcSerializer: unknown INetworkSerializable type " +
+                            $"'{typeName}'.  Returning null parameter.  Register the type " +
+                            "via RpcTypeRegistry.Register<T>() or ensure its assembly is loaded.");
+                        return null;
+                    }
+
+                    // Preserve type identity even on failure so the eventual
+                    // MethodInfo.Invoke does not throw a value-type-binding
+                    // error on a null argument when the receiver's parameter
+                    // is a struct.  For reference types we still return a
+                    // default-constructed instance — the caller can detect
+                    // that the deserialize was partial via the warning log.
+                    object instance;
+                    try
+                    {
+                        instance = Activator.CreateInstance(concrete);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning(
+                            $"[RTMPE] RpcSerializer: failed to instantiate '{typeName}' " +
+                            $"({ex.GetType().Name}: {ex.Message}).  Returning null parameter — " +
+                            "RPC dispatch may fail if the receiver's parameter is a value type. " +
+                            "Ensure the type has a public parameterless constructor.");
+                        return null;
+                    }
+
+                    if (!(instance is INetworkSerializable ns))
+                    {
+                        Debug.LogWarning(
+                            $"[RTMPE] RpcSerializer: type '{typeName}' resolved but does not " +
+                            "implement INetworkSerializable.  Returning null parameter.");
+                        return null;
+                    }
+
+                    var reader = new RtmpeBinaryReader(data, payloadStart, payloadLen);
+                    try
+                    {
+                        ns.NetworkDeserialize(reader);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning(
+                            $"[RTMPE] RpcSerializer: NetworkDeserialize for '{typeName}' threw " +
+                            $"{ex.GetType().Name}: {ex.Message}.  Returning default-valued instance.");
+                        return concrete.IsValueType ? Activator.CreateInstance(concrete) : null;
+                    }
+
+                    if (reader.HasFailed)
+                    {
+                        Debug.LogWarning(
+                            $"[RTMPE] RpcSerializer: payload for '{typeName}' was truncated " +
+                            "during NetworkDeserialize.  Returning partially-populated instance.");
+                    }
+
+                    return ns;
                 }
 
                 default:

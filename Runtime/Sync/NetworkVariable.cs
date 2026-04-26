@@ -76,6 +76,57 @@ namespace RTMPE.Sync
         /// </summary>
         public bool IsDirty { get; protected set; }
 
+        // ── Per-variable throttling (Feature: NetworkVariableAttribute) ────────
+
+        /// <summary>
+        /// Per-variable send-rate cap in Hz.  Zero means "use the global flush
+        /// cadence" (currently 30 Hz, set by <c>NetworkManager.VariableFlushInterval</c>).
+        /// Positive values throttle this specific variable independently of its
+        /// siblings; the dirty flag is preserved across skipped flushes so the
+        /// next eligible window picks up the most recent value.
+        ///
+        /// <para>Configured declaratively via
+        /// <see cref="NetworkVariableAttribute.SendRateHz"/> on the owning
+        /// field/property and applied by <see cref="NetworkBehaviour"/> when
+        /// the variable is registered.  May also be assigned manually for
+        /// dynamic throttling (e.g. raise the rate during a boss fight, lower
+        /// it while idle).</para>
+        ///
+        /// <para>Negative assignments are clamped to <c>0</c>.</para>
+        /// </summary>
+        public float SendRateHz
+        {
+            get => _sendRateHz;
+            set => _sendRateHz = value < 0f ? 0f : value;
+        }
+        private float _sendRateHz;
+
+        /// <summary>
+        /// Wall-clock timestamp of the last successful flush, sampled from
+        /// <c>Time.unscaledTime</c>.  Updated by the flush loop after the
+        /// variable's bytes have been appended to the outbound packet.
+        ///
+        /// <para>Reset to <c>0f</c> on ownership change and on disconnect so a
+        /// freshly owning client can flush its first value immediately rather
+        /// than waiting out a stale throttle window inherited from the
+        /// previous owner.</para>
+        ///
+        /// <para>Internal — only the flush path and the
+        /// ownership-reset hook should mutate this field.</para>
+        /// </summary>
+        internal float LastFlushTimeUnscaled { get; set; }
+
+        /// <summary>
+        /// Reset the per-variable throttle book-keeping.  Called when ownership
+        /// changes hands or the local session disconnects so that
+        /// <see cref="LastFlushTimeUnscaled"/> does not gate the first flush on
+        /// the new owner with a phantom send-time inherited from the old owner.
+        /// </summary>
+        internal void ResetThrottleState()
+        {
+            LastFlushTimeUnscaled = 0f;
+        }
+
         // ── Constructor ────────────────────────────────────────────────────────
 
         /// <summary>
@@ -118,7 +169,7 @@ namespace RTMPE.Sync
         /// the send-queue state is reset.  Safe to call multiple times.
         /// </para>
         /// </summary>
-        internal void MarkDirtyForResync() => IsDirty = true;
+        internal virtual void MarkDirtyForResync() => IsDirty = true;
 
         /// <summary>
         /// Write the current value to <paramref name="writer"/> in a format

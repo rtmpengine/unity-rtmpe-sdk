@@ -14,6 +14,7 @@
 
 using System;
 using UnityEngine;
+using RTMPE.Core;
 
 namespace RTMPE.Rooms
 {
@@ -86,8 +87,9 @@ namespace RTMPE.Rooms
         /// <summary>
         /// Instruct the server (via the Custom Properties pipeline) that the
         /// room should transition to <paramref name="sceneName"/>.  Only the
-        /// master client may call this; non-host callers are silently
-        /// rejected downstream.
+        /// master client may call this; non-master callers log an error and
+        /// return immediately so the bug is surfaced to the developer rather
+        /// than producing a silent server-side no-op.
         /// </summary>
         /// <param name="sceneName">Scene name or path, as passed to
         /// <c>SceneManager.LoadSceneAsync</c>.  Must not be null or empty.</param>
@@ -100,6 +102,15 @@ namespace RTMPE.Rooms
             if (_rooms == null || !_rooms.IsInRoom)
             {
                 Debug.LogWarning("[RTMPE] NetworkSceneManager.LoadScene: must be in a room.");
+                return;
+            }
+            // Only the master client may instruct the room to change scene.
+            // Non-master callers are rejected here rather than letting the server
+            // silently discard the property update, giving developers immediate
+            // feedback instead of a silent no-op that is hard to diagnose.
+            if (NetworkManager.Instance == null || !NetworkManager.Instance.IsMasterClient)
+            {
+                Debug.LogError("[RTMPE] NetworkSceneManager.LoadScene: only the master client may change the scene.");
                 return;
             }
 

@@ -69,10 +69,14 @@ Import samples from **Window → Package Manager → RTMPE SDK → Samples**:
 
 | Sample          | Description                                       |
 | --------------- | ------------------------------------------------- |
-| BasicConnection | Minimal connect / disconnect loop                 |
+| BasicConnection | Minimal connect / disconnect loop (UPM-importable via the Package Manager → Samples panel) |
 
-Additional runnable samples ship in the companion repository
-(`Samples/BasicMovement`, `Samples/SimpleFPS`) — see the top-level README for
+Two additional, **larger demos** live alongside the SDK in the
+**repository root** (not inside the package, so they are *not* shown in
+the Package Manager Samples panel):
+`clients/unity-sdk/Samples/BasicMovement/` and
+`clients/unity-sdk/Samples/SimpleFPS/`.  Open them as standalone Unity
+projects (or import them manually) — see the top-level README for
 setup instructions.
 
 ## Documentation

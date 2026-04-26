@@ -21,9 +21,10 @@
 //             bit 0x04 = velocity        (3 × f32 LE = 12 bytes)
 //             bit 0x08 = angular_velocity(3 × f32 LE = 12 bytes)
 //             bit 0x10 = is_sleeping     (u8: 0x00 = awake, 0x01 = sleeping)
+//             bit 0x20 = constraint_mask (u8: bitmask of UnityEngine.RigidbodyConstraints)
 //             bit 0x40 = TYPE MARKER     (always set; causes transform parser reject)
 //   [9+]    conditional fields in the bit-order listed above
-//   Min: 9 bytes (header only).  Max: 9 + 12 + 16 + 12 + 12 + 1 = 62 bytes.
+//   Min: 9 bytes (header only).  Max: 9 + 12 + 16 + 12 + 12 + 1 + 1 = 63 bytes.
 //
 // ── 2-D Physics wire format ───────────────────────────────────────────────────
 //
@@ -34,9 +35,10 @@
 //             bit 0x04 = velocity        (2 × f32 LE = 8 bytes)
 //             bit 0x08 = angular_velocity(1 × f32 LE = 4 bytes, deg/s)
 //             bit 0x10 = is_sleeping     (u8: 0x00 = awake, 0x01 = sleeping)
+//             bit 0x20 = constraint_mask (u8: bitmask of UnityEngine.RigidbodyConstraints2D)
 //             bit 0x80 = TYPE MARKER     (always set; also discriminates from 3-D)
 //   [9+]    conditional fields in the bit-order listed above
-//   Min: 9 bytes.  Max: 9 + 8 + 4 + 8 + 4 + 1 = 34 bytes.
+//   Min: 9 bytes.  Max: 9 + 8 + 4 + 8 + 4 + 1 + 1 = 35 bytes.
 //
 // ── Security ──────────────────────────────────────────────────────────────────
 //
@@ -89,6 +91,15 @@ namespace RTMPE.Sync
         public const byte ChangedSleep = 0x10;
 
         /// <summary>
+        /// Bit indicating ConstraintMask is present (u8: bitmask of
+        /// <see cref="UnityEngine.RigidbodyConstraints"/> for 3-D, or
+        /// <see cref="UnityEngine.RigidbodyConstraints2D"/> for 2-D).
+        /// Sent only when the constraint set changes — owners with static
+        /// constraint configurations pay zero per-tick bandwidth.
+        /// </summary>
+        public const byte ChangedConstraints = 0x20;
+
+        /// <summary>
         /// Type-marker bit that is ALWAYS set in 3-D physics payloads.
         /// <para>
         /// Because <see cref="TransformPacketParser"/> rejects any changed_mask byte
@@ -107,10 +118,11 @@ namespace RTMPE.Sync
         public const byte TypeMarker2D = 0x80;
 
         /// <summary>
-        /// All known data-field bits (shared by 3-D and 2-D parsers).
+        /// All known data-field bits (shared by 3-D and 2-D parsers):
+        /// 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 = 0x3F.
         /// Bits outside this range (excluding type markers) indicate unknown fields.
         /// </summary>
-        public const byte DataFieldMask = 0x1F;
+        public const byte DataFieldMask = 0x3F;
 
         /// <summary>
         /// Minimum valid payload size in bytes: object_id(8) + changed_mask(1).
@@ -146,6 +158,7 @@ namespace RTMPE.Sync
             if ((changedMask & ChangedVelocity)        != 0) size += 12;
             if ((changedMask & ChangedAngularVelocity) != 0) size += 12;
             if ((changedMask & ChangedSleep)           != 0) size +=  1;
+            if ((changedMask & ChangedConstraints)     != 0) size +=  1;
 
             var buf = new byte[size];
             int off = 0;
@@ -185,6 +198,10 @@ namespace RTMPE.Sync
                 buf[off] = state.IsSleeping ? (byte)0x01 : (byte)0x00;
                 off++;
             }
+            if ((changedMask & ChangedConstraints) != 0)
+            {
+                buf[off++] = state.ConstraintMask;
+            }
 
             // Defensive: assert the offset matches the computed size.
             // In a correct implementation this never fires; kept for diagnostics.
@@ -218,6 +235,7 @@ namespace RTMPE.Sync
             if ((changedMask & ChangedVelocity)        != 0) size +=  8;
             if ((changedMask & ChangedAngularVelocity) != 0) size +=  4;
             if ((changedMask & ChangedSleep)           != 0) size +=  1;
+            if ((changedMask & ChangedConstraints)     != 0) size +=  1;
 
             var buf = new byte[size];
             int off = 0;
@@ -247,6 +265,10 @@ namespace RTMPE.Sync
             {
                 buf[off] = state.IsSleeping ? (byte)0x01 : (byte)0x00;
                 off++;
+            }
+            if ((changedMask & ChangedConstraints) != 0)
+            {
+                buf[off++] = state.ConstraintMask;
             }
 
             UnityEngine.Debug.Assert(off == size,

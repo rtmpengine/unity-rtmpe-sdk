@@ -37,5 +37,14 @@ namespace RTMPE.Sync
 
         /// <summary>True when the physics body is in the sleep state.</summary>
         public bool IsSleeping;
+
+        /// <summary>
+        /// Bitmask of active <see cref="UnityEngine.RigidbodyConstraints2D"/> on
+        /// the owner's Rigidbody2D at the time of serialisation.  Applied on the
+        /// receiving end so that runtime constraint changes (e.g. freezing the
+        /// X axis after a 2-D character lands) are preserved without a separate
+        /// message.  A value of 0 means no constraints (RigidbodyConstraints2D.None).
+        /// </summary>
+        public byte ConstraintMask;
     }
 }

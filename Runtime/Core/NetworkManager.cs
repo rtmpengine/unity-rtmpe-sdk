@@ -266,6 +266,25 @@ namespace RTMPE.Core
         private float _variableFlushAccum;
         private const float VariableFlushInterval = 1f / 30f;
 
+        // ── Telemetry counters (Feature: Network Debugger window) ──────────────
+        //
+        // Atomic 64-bit counters incremented on every wire-level send and receive.
+        // Reads on 64-bit platforms (the only platforms Unity supports for
+        // dedicated multiplayer titles in 2026) are atomic by construction; we
+        // additionally use Interlocked.Read in the public accessors for ARM64
+        // where some implementations historically had relaxed ordering on
+        // unaligned long reads.  The increment cost is a single LOCK XADD —
+        // measured under 5 ns on commodity x64, well below any per-packet
+        // budget.  No allocations.
+        //
+        // The counters are read by the Editor-only Network Debugger window
+        // and (optionally) by user telemetry sinks; they are not part of any
+        // wire protocol.
+        private long _packetsOut;
+        private long _bytesOut;
+        private long _packetsIn;
+        private long _bytesIn;
+
         // ── Properties ─────────────────────────────────────────────────────────
 
         /// <summary>Current network state.</summary>
@@ -286,6 +305,29 @@ namespace RTMPE.Core
 
         /// <summary>Current room ID — valid after RoomJoin.</summary>
         public ulong CurrentRoomId => _currentRoomId;
+
+        // ── Telemetry counters (read-only) ─────────────────────────────────────
+        //
+        // Snapshot accessors return the current counter value.  Subtract two
+        // sampled values across a known interval to compute a rate.  The
+        // Network Debugger Editor window does this at ~250 ms cadence to
+        // render packets-per-second / bytes-per-second.
+
+        /// <summary>Total wire-level packets sent since process start.</summary>
+        public long PacketsOutCounter =>
+            System.Threading.Interlocked.Read(ref _packetsOut);
+
+        /// <summary>Total wire-level bytes sent since process start.</summary>
+        public long BytesOutCounter =>
+            System.Threading.Interlocked.Read(ref _bytesOut);
+
+        /// <summary>Total wire-level packets received since process start.</summary>
+        public long PacketsInCounter =>
+            System.Threading.Interlocked.Read(ref _packetsIn);
+
+        /// <summary>Total wire-level bytes received since process start.</summary>
+        public long BytesInCounter =>
+            System.Threading.Interlocked.Read(ref _bytesIn);
 
         /// <summary>
         /// Local player's room-level UUID — set by RoomManager when JoinRoom succeeds.
@@ -747,6 +789,16 @@ namespace RTMPE.Core
             // Recreate Room/Spawn managers with the fresh PacketBuilder.
             RecreateRoomAndSpawnManagers();
 
+            // Defensive disposal: the state machine guarantees we are in
+            // Disconnected (which always traverses Cleanup), but a future
+            // refactor could legitimately call Connect from a different
+            // path.  Disposing here is a no-op when the field is already
+            // null, and prevents an X25519 ephemeral private key from
+            // surviving in heap memory across reconnect attempts.
+            _handshakeHandler?.Dispose();
+            _sessionKeys?.Dispose();
+            _sessionKeys = null;
+
             // Create a fresh handshake handler (generates a new X25519 ephemeral keypair).
             _handshakeHandler = new HandshakeHandler();
 
@@ -867,6 +919,15 @@ namespace RTMPE.Core
 
             // Recreate Room/Spawn managers with identical event wiring to Connect().
             RecreateRoomAndSpawnManagers();
+
+            // Defensive disposal — same rationale as Connect(): the state
+            // machine guarantees Cleanup ran before reaching Disconnected,
+            // but disposing here is a no-op when the fields are null and
+            // protects ephemeral key material against a future state-flow
+            // refactor that misses Cleanup on one of the paths.
+            _handshakeHandler?.Dispose();
+            _sessionKeys?.Dispose();
+            _sessionKeys = null;
 
             _handshakeHandler = new HandshakeHandler();
 
@@ -1009,7 +1070,40 @@ namespace RTMPE.Core
 
         private void HandlePacketReceived(byte[] data)
         {
+            // Telemetry — count wire-level inbound packets / bytes BEFORE
+            // dispatching to the main thread so the metrics reflect the raw
+            // socket-level traffic regardless of any decryption / decompression
+            // applied later in ProcessPacket.  Interlocked.Add is lock-free
+            // and safe to call from the network thread.
+            if (data != null)
+            {
+                System.Threading.Interlocked.Increment(ref _packetsIn);
+                System.Threading.Interlocked.Add(ref _bytesIn, data.Length);
+            }
+
             _dispatcher?.Enqueue(() => ProcessPacket(data));
+        }
+
+        /// <summary>
+        /// Single funnel for every wire-level outbound packet.  Increments the
+        /// <c>_packetsOut</c> / <c>_bytesOut</c> telemetry counters and
+        /// forwards to <see cref="NetworkThread.SendOwned"/>.  All historical
+        /// call sites that previously called <c>_networkThread.SendOwned</c>
+        /// directly route through this helper so the Network Debugger sees a
+        /// complete picture of outbound traffic.
+        ///
+        /// <para>The packet must be owned by the caller (defensive copies are
+        /// the caller's responsibility, matching the original SendOwned
+        /// contract).</para>
+        /// </summary>
+        private void SendToWire(byte[] packet)
+        {
+            if (_networkThread == null || packet == null) return;
+
+            System.Threading.Interlocked.Increment(ref _packetsOut);
+            System.Threading.Interlocked.Add(ref _bytesOut, packet.Length);
+
+            _networkThread.SendOwned(packet);
         }
 
         private void ProcessPacket(byte[] data)
@@ -1223,7 +1317,7 @@ namespace RTMPE.Core
             // Use SendOwned — response is a freshly allocated array that
             // will not be reused, so the extra copy inside Send() is unnecessary.
             var response = _packetBuilder.BuildHandshakeResponse(_handshakeHandler.ClientPublicKey);
-            _networkThread.SendOwned(response);
+            SendToWire(response);
             LogDebug("Sent HandshakeResponse — awaiting SessionAck.");
         }
 
@@ -1847,7 +1941,7 @@ namespace RTMPE.Core
             // Use SendOwned — packet is a freshly built array; the caller
             // does not retain a reference after this call.
             var packet = _packetBuilder.BuildHandshakeInit(encryptedPayload);
-            _networkThread.SendOwned(packet);
+            SendToWire(packet);
             LogDebug($"HandshakeInit sent ({packet.Length} B).");
         }
 
@@ -1906,7 +2000,7 @@ namespace RTMPE.Core
                 return;
             }
 
-            _networkThread.SendOwned(packet);
+            SendToWire(packet);
             LogDebug($"ReconnectInit sent ({packet.Length} B, proof={proof != null}).");
         }
 
@@ -2022,7 +2116,7 @@ namespace RTMPE.Core
             // Pre-session: HandshakeInit and HandshakeResponse travel in plaintext.
             if (_sessionKeys == null)
             {
-                _networkThread.SendOwned(packet);
+                SendToWire(packet);
                 return;
             }
 
@@ -2144,7 +2238,7 @@ namespace RTMPE.Core
             Buffer.BlockCopy(ciphertext, 0, result,
                              PacketProtocol.HEADER_SIZE, ciphertext.Length);
 
-            _networkThread.SendOwned(result);
+            SendToWire(result);
         }
 
         /// <summary>
@@ -2344,6 +2438,38 @@ namespace RTMPE.Core
                 var nb = _spawnManager.Registry.Get(objectId);
                 if (nb == null) return;
 
+                // ── Receive-side interest filter ──────────────────────────────
+                // When an InterestManager is active with a non-zero radius,
+                // discard state updates for objects outside that radius.
+                // The owning client's objects are always processed regardless of
+                // distance (the owner needs reconciliation data).
+                // This is a secondary client-side guard; the gateway already
+                // performs the primary spatial cull before sending the packet.
+                //
+                // Filter against the INCOMING position when the packet carries
+                // one — falling back to the live transform only when the delta
+                // omits a position field.  Filtering against transform.position
+                // alone would lag one tick behind: a fast-moving object entering
+                // the radius would be discarded for one tick before we accept it.
+                if (!nb.IsOwner && InterestManager.IsReceiveFilterActive)
+                {
+                    var (lh1, lh2)  = InterestManager.LocalPosition;
+                    float radius     = InterestManager.LocalReceiveRadius;
+                    Vector3 objPos;
+                    if ((changedMask & TransformPacketParser.ChangedPosition) != 0)
+                        objPos = state.Position;
+                    else
+                        objPos = nb.transform.position;
+                    // Pick the matching horizontal axis: XZ for 3-D games
+                    // (default), XY for 2-D / top-down games.  Without this
+                    // dispatch the filter compares an XY-stored local position
+                    // against the unused vertical axis of the remote object
+                    // and silently rejects every packet for top-down games.
+                    float dx = objPos.x - lh1;
+                    float dh2 = (InterestManager.LocalUsesXzPlane ? objPos.z : objPos.y) - lh2;
+                    if (dx * dx + dh2 * dh2 > radius * radius) return;
+                }
+
                 // Build a blended state: merge only the fields present in the delta.
                 // Fields absent from the delta keep zero-initialised values in `state`
                 // which would clobber the current transform — fall back to the live
@@ -2401,6 +2527,21 @@ namespace RTMPE.Core
             var nb = _spawnManager?.Registry.Get(objectId);
             if (nb == null) return;
 
+            // Receive-side interest filter — mirrors the transform-packet filter in
+            // HandleStateSyncPacket.  Owners receive reconciliation unconditionally;
+            // non-owners are dropped when the object lies outside the interest radius.
+            if (!nb.IsOwner && InterestManager.IsReceiveFilterActive)
+            {
+                var (lh1, lh2) = InterestManager.LocalPosition;
+                float radius   = InterestManager.LocalReceiveRadius;
+                Vector3 objPos = (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
+                                 ? state.Position
+                                 : nb.transform.position;
+                float dx  = objPos.x - lh1;
+                float dh2 = (InterestManager.LocalUsesXzPlane ? objPos.z : objPos.y) - lh2;
+                if (dx * dx + dh2 * dh2 > radius * radius) return;
+            }
+
             if (nb.IsOwner)
             {
                 nb.GetComponent<NetworkRigidbody>()?.ApplyReconciliation(state, changedMask);
@@ -2422,6 +2563,22 @@ namespace RTMPE.Core
 
             var nb = _spawnManager?.Registry.Get(objectId);
             if (nb == null) return;
+
+            // Receive-side interest filter — 2-D variant.
+            // PhysicsState2D.Position is Vector2 (x/y world plane), which aligns with
+            // InterestManager when UseXzPlane == false (standard for 2-D games).
+            if (!nb.IsOwner && InterestManager.IsReceiveFilterActive)
+            {
+                var (lh1, lh2) = InterestManager.LocalPosition;
+                float radius   = InterestManager.LocalReceiveRadius;
+                float ox = (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
+                           ? state.Position.x : nb.transform.position.x;
+                float oy = (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
+                           ? state.Position.y : nb.transform.position.y;
+                float dx  = ox - lh1;
+                float dh2 = oy - lh2;
+                if (dx * dx + dh2 * dh2 > radius * radius) return;
+            }
 
             if (nb.IsOwner)
             {

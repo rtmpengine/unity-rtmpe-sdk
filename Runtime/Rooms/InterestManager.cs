@@ -76,11 +76,84 @@ namespace RTMPE.Rooms
                  "Disable for 2-D or top-down games that use X/Y coordinates.")]
         public bool UseXzPlane = true;
 
+        /// <summary>
+        /// Radius (world units) used for receive-side interest filtering in
+        /// <see cref="RTMPE.Core.NetworkManager"/>.  State-sync packets for
+        /// objects whose last known position is further away than this radius
+        /// are silently discarded before being applied to the scene.
+        ///
+        /// <para>Set to 0 (default) to disable receive-side filtering entirely.
+        /// The gateway already performs server-side culling; this filter is a
+        /// secondary defence for games that need tighter client-side control,
+        /// e.g. a large open world where many objects are technically
+        /// "in the room" but irrelevant to nearby players.</para>
+        ///
+        /// <para>Typical value: 75 m (1.5× the default 50 m cell size), which
+        /// matches the 3×3 neighbourhood covered by the spatial grid.</para>
+        /// </summary>
+        [Tooltip("Receive-side interest radius in world units. " +
+                 "0 = disabled (gateway culling only).  Typical: 75 m.")]
+        [Min(0f)]
+        public float ReceiveFilterRadius = 0f;
+
+        // ── Static local-position accessor (used by NetworkManager) ───────────
+
+        // Active component instance (singleton invariant enforced via OnEnable /
+        // OnDisable below).  Exposed so NetworkManager can read the live
+        // ReceiveFilterRadius and last-sent position without a component
+        // reference on the hot path.  null when no manager is active.
+        private static InterestManager s_active;
+
+        /// <summary>
+        /// The last world-space position reported to the gateway by the
+        /// active <see cref="InterestManager"/>, expressed as a pair of
+        /// horizontal coordinates.  In XZ mode (3-D, default) the tuple is
+        /// (worldX, worldZ); in XY mode (2-D / top-down) it is (worldX,
+        /// worldY).  Callers that need to compare against an object's
+        /// position must consult <see cref="LocalUsesXzPlane"/> to pick the
+        /// matching axis on the remote object.
+        /// Returns (0, 0) when no manager is active.
+        /// </summary>
+        internal static (float h1, float h2) LocalPosition
+            => s_active == null ? (0f, 0f) : (s_active._lastSentX, s_active._lastSentY);
+
+        /// <summary>
+        /// True when the active <see cref="InterestManager"/> reports
+        /// positions on the XZ plane (Y vertical — 3-D default), false when
+        /// it reports on the XY plane (top-down / 2-D games).  Returns true
+        /// when no manager is active so callers default to the 3-D
+        /// interpretation, matching the historical receive-filter behavior.
+        /// </summary>
+        internal static bool LocalUsesXzPlane
+            => s_active == null ? true : s_active.UseXzPlane;
+
+        /// <summary>
+        /// Receive-side interest radius exposed by the active
+        /// <see cref="InterestManager"/>.  Zero when filtering is disabled or
+        /// no manager is active.  Read fresh from the Inspector field every
+        /// call so a runtime toggle of <see cref="ReceiveFilterRadius"/> takes
+        /// effect on the very next packet — no 100 ms hysteresis.
+        /// </summary>
+        internal static float LocalReceiveRadius
+            => s_active == null ? 0f : Mathf.Max(0f, s_active.ReceiveFilterRadius);
+
+        /// <summary>
+        /// True while an <see cref="InterestManager"/> instance is active,
+        /// <see cref="ReceiveFilterRadius"/> is greater than zero, AND a
+        /// position has actually been reported (so the (0, 0) origin is not
+        /// used as a default that would silently reject every remote object).
+        /// </summary>
+        internal static bool IsReceiveFilterActive
+            => s_active != null
+               && s_active._hasSentOnce
+               && s_active.ReceiveFilterRadius > 0f;
+
         // ── Private state ──────────────────────────────────────────────────────
 
         private float _accumulator;
         private float _lastSentX;
         private float _lastSentY;
+        private bool  _hasSentOnce;
         private bool  _tracking = true;
 
         // ── Public API ─────────────────────────────────────────────────────────
@@ -119,33 +192,49 @@ namespace RTMPE.Rooms
 
         // ── Internal ───────────────────────────────────────────────────────────
 
+        private void OnEnable()
+        {
+            // Singleton invariant: the most recently enabled InterestManager
+            // wins.  A second leftover instance from a scene transition will
+            // overwrite the previous one, but never disturb it via an out-of-
+            // order OnDisable (see below).
+            s_active = this;
+        }
+
+        private void OnDisable()
+        {
+            // Only clear if WE are the active instance.  Without this guard,
+            // disabling a second manager (left over from a scene transition)
+            // would wipe coordinates owned by the live one.
+            if (s_active == this)
+                s_active = null;
+        }
+
         private void SendCurrentPosition(NetworkManager nm)
         {
-            float x, y;
+            // Without a tracked transform there is no authoritative source for
+            // the local player's position.  Skip the send — and skip recording
+            // _hasSentOnce — so the receive filter stays inactive (defaulting
+            // to "deliver everything") instead of using (0, 0) as a trap that
+            // would silently discard every remote object far from world origin.
+            if (TrackedTransform == null) return;
 
-            if (TrackedTransform != null)
+            var pos = TrackedTransform.position;
+            float x, y;
+            if (UseXzPlane)
             {
-                var pos = TrackedTransform.position;
-                if (UseXzPlane)
-                {
-                    x = pos.x;
-                    y = pos.z;
-                }
-                else
-                {
-                    x = pos.x;
-                    y = pos.y;
-                }
-                _lastSentX = x;
-                _lastSentY = y;
+                x = pos.x;
+                y = pos.z;
             }
             else
             {
-                // No transform assigned — re-send the last known position so
-                // the gateway keeps a valid interest zone for this client.
-                x = _lastSentX;
-                y = _lastSentY;
+                x = pos.x;
+                y = pos.y;
             }
+
+            _lastSentX   = x;
+            _lastSentY   = y;
+            _hasSentOnce = true;
 
             nm.SendPositionUpdate(x, y);
         }

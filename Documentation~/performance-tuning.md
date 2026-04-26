@@ -14,13 +14,13 @@ Mono backend, 30 Hz tick rate, 10 `NetworkVariable` instances per object).
 The tick rate controls how often the server flushes state to clients. Lower
 values reduce CPU and bandwidth at the cost of update latency.
 
-| Game type                    | Recommended tick rate | Rationale                              |
-|------------------------------|-----------------------|----------------------------------------|
-| FPS / action                 | 30 Hz (default)       | Lowest perceptible latency             |
+| Game type                    | Recommended tick rate | Rationale                               |
+|------------------------------|-----------------------|-----------------------------------------|
+| FPS / action                 | 30 Hz (default)       | Lowest perceptible latency              |
 | Platformer / MOBA            | 20 Hz                 | Good balance of responsiveness and load |
-| MMO / many rooms             | 10 Hz                 | Scales to large room counts            |
-| Turn-based                   | 1–2 Hz                | Sync only on turn change               |
-| Mobile (battery-sensitive)   | 10–15 Hz              | Reduces CPU and radio wake cycles      |
+| MMO / many rooms             | 10 Hz                 | Scales to large room counts             |
+| Turn-based                   | 1–2 Hz                | Sync only on turn change                |
+| Mobile (battery-sensitive)   | 10–15 Hz              | Reduces CPU and radio wake cycles       |
 
 Set `NetworkSettings.tickRate` on the `RTMPESettings` asset **before** calling
 `Connect`. Changing it mid-session has no effect until the next reconnect.
@@ -33,13 +33,13 @@ Each `NetworkVariable<T>` adds to the per-tick payload. Measured wire sizes
 per variable (value-only; the outer `VariableUpdate` packet adds 8 bytes for
 `object_id` + 1 byte for `var_count` + 4 bytes of `[var_id][value_len]` per entry):
 
-| Type                         | Value bytes         |
-|------------------------------|---------------------|
-| `NetworkVariableInt`         | 4                   |
-| `NetworkVariableFloat`       | 4                   |
-| `NetworkVariableBool`        | 1                   |
-| `NetworkVariableVector3`     | 12                  |
-| `NetworkVariableQuaternion`  | 16                  |
+| Type                         | Value bytes          |
+|------------------------------|----------------------|
+| `NetworkVariableInt`         | 4                    |
+| `NetworkVariableFloat`       | 4                    |
+| `NetworkVariableBool`        | 1                    |
+| `NetworkVariableVector3`     | 12                   |
+| `NetworkVariableQuaternion`  | 16                   |
 | `NetworkVariableString`      | 2 + UTF-8 byte count |
 
 **Target budget:** ≤ 50 KB/s per player at 30 Hz.
@@ -95,7 +95,7 @@ snapping for fast-moving objects.
 | Source                                                  | Allocations / tick | GC pressure |
 |---------------------------------------------------------|--------------------|-------------|
 | `NetworkVariable.SerializeWithId` — pool path (≤ 1 KiB) | 0                  | 0           |
-| `NetworkBehaviour.FlushDirtyVariables` (growable stream fallback, rare) | 1 | ~256 B      |
+| `NetworkBehaviour.FlushDirtyVariables` (growable stream fallback, rare) | 1  | ~256 B      |
 | Inbound packet copy (`NetworkThread.TryReceive`)        | 1                  | up to 8 KiB per received packet |
 | `PacketBuilder.Build` result array                      | 1 per send         | sized to payload |
 | **Typical steady-state**                                | **~10 / tick**     | **~1–2 KiB / tick** |
@@ -145,9 +145,9 @@ for a minimal pool implementation.
 
 ### Expected impact
 
-| Scenario                          | Without pool       | With pool          |
-|-----------------------------------|--------------------|--------------------|
-| 20 bullets/sec spawn + despawn    | ~40 GC allocs/sec  | ~0 GC allocs/sec after warm-up |
+| Scenario                          | Without pool          | With pool          |
+|-----------------------------------|-----------------------|--------------------|
+| 20 bullets/sec spawn + despawn    | ~40 GC allocs/sec     | ~0 GC allocs/sec after warm-up |
 | Frame-time variance under combat  | 1–3 ms spikes from GC | steady             |
 
 The pool MUST reactivate the GameObject on `Acquire` and should deactivate it
@@ -159,9 +159,9 @@ on `Release`. `SpawnManager` defensively calls `SetActive(true)` after a pool
 ## Scripting backend comparison
 
 | Backend | Build time | Runtime CPU       | Memory    | Recommendation |
-|---------|-----------|-------------------|-----------|----------------|
-| Mono    | Fast      | +5–10 % vs IL2CPP | +10 %     | Development only |
-| IL2CPP  | Slower    | Baseline          | Baseline  | Required for iOS; recommended for Android / PC release |
+|---------|------------|-------------------|-----------|----------------|
+| Mono    | Fast       | +5–10 % vs IL2CPP | +10 %     | Development only |
+| IL2CPP  | Slower     | Baseline          | Baseline  | Required for iOS; recommended for Android / PC release |
 
 ### IL2CPP considerations
 

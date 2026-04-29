@@ -7,38 +7,38 @@
 // Wire formats (all little-endian):
 //
 // ── RoomCreate Response (0x20) Server → Client ─────────────────────────────
-//   [ok:1]
-//   if ok=1: [room_id_len:2 LE][room_id:N][room_code_len:2 LE][room_code:N][max_players:1]
-//            [local_player_id_len:2 LE][local_player_id:N]   ← appended (v3.1+)
-//   if ok=0: [error_len:2 LE][error:N]
+//  [ok:1]
+//  if ok=1: [room_id_len:2 LE][room_id:N][room_code_len:2 LE][room_code:N][max_players:1]
+//           [local_player_id_len:2 LE][local_player_id:N]   ← appended (v3.1+)
+//  if ok=0: [error_len:2 LE][error:N]
 //
 // ── RoomJoin Response (0x21, msg_kind=0x00) Server → Client ────────────────
-//   [msg_kind:1=0x00][ok:1]
-//   if ok=1: [room_id_len:2][room_id:N][room_code_len:2][room_code:N]
-//            [name_len:2][name:N][player_count:1][max_players:1][is_public:1]
-//            for each player:
-//              [player_id_len:2][player_id:N][display_name_len:2][display_name:N]
-//              [is_host:1][is_ready:1]
-//            [local_player_id_len:2][local_player_id:N]       ← appended (v3.1+)
-//   if ok=0: [error_len:2][error:N]
+//  [msg_kind:1=0x00][ok:1]
+//  if ok=1: [room_id_len:2][room_id:N][room_code_len:2][room_code:N]
+//           [name_len:2][name:N][player_count:1][max_players:1][is_public:1]
+//           for each player:
+//             [player_id_len:2][player_id:N][display_name_len:2][display_name:N]
+//             [is_host:1][is_ready:1]
+//           [local_player_id_len:2][local_player_id:N]       ← appended (v3.1+)
+//  if ok=0: [error_len:2][error:N]
 //
 // ── PlayerJoined Notification (0x21, msg_kind=0x01) Server → Client ────────
-//   [msg_kind:1=0x01]
-//   [player_id_len:2][player_id:N][display_name_len:2][display_name:N]
-//   [is_host:1][is_ready:1]
+//  [msg_kind:1=0x01]
+//  [player_id_len:2][player_id:N][display_name_len:2][display_name:N]
+//  [is_host:1][is_ready:1]
 //
 // ── RoomLeave Response (0x22, msg_kind=0x00) Server → Client ───────────────
-//   [msg_kind:1=0x00][ok:1]
+//  [msg_kind:1=0x00][ok:1]
 //
 // ── PlayerLeft Notification (0x22, msg_kind=0x01) Server → Client ──────────
-//   [msg_kind:1=0x01][player_id_len:2][player_id:N]
+//  [msg_kind:1=0x01][player_id_len:2][player_id:N]
 //
 // ── RoomList Response (0x23) Server → Client ───────────────────────────────
-//   [room_count:2 LE]
-//   for each room:
-//     [room_id_len:2][room_id:N][room_code_len:2][room_code:N]
-//     [name_len:2][name:N][state_len:2][state:N]
-//     [player_count:1][max_players:1][is_public:1]
+//  [room_count:2 LE]
+//  for each room:
+//    [room_id_len:2][room_id:N][room_code_len:2][room_code:N]
+//    [name_len:2][name:N][state_len:2][state:N]
+//    [player_count:1][max_players:1][is_public:1]
 
 using System;
 using System.Text;
@@ -339,7 +339,7 @@ namespace RTMPE.Rooms
         /// <summary>
         /// Read a PlayerInfo record from the buffer.
         /// Layout: [player_id_len:2][player_id:N][display_name_len:2][display_name:N]
-        ///         [is_host:1][is_ready:1]
+        ///        [is_host:1][is_ready:1]
         /// </summary>
         internal static bool TryReadPlayerInfo(byte[] buf, ref int offset, out PlayerInfo player)
         {

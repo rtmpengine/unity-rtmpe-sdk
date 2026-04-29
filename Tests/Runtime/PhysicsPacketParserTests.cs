@@ -2,12 +2,12 @@
 //
 // NUnit tests for PhysicsPacketParser.
 // Verifies:
-//   • IsPhysics3D / IsPhysics2D type discrimination
-//   • TryParsePhysicsState (3-D): guard cases, type-marker enforcement, unknown-
-//     bit rejection, truncation detection, header-only, per-field and full
-//     roundtrips, and objectId LE decoding
-//   • TryParsePhysicsState2D: equivalent coverage for 2-D packets
-//   • Disambiguation: each parser rejects payloads produced by the other builder
+//  • IsPhysics3D / IsPhysics2D type discrimination
+//  • TryParsePhysicsState (3-D): guard cases, type-marker enforcement, unknown-
+//    bit rejection, truncation detection, header-only, per-field and full
+//    roundtrips, and objectId LE decoding
+//  • TryParsePhysicsState2D: equivalent coverage for 2-D packets
+//  • Disambiguation: each parser rejects payloads produced by the other builder
 //
 // Roundtrip tests build payloads via PhysicsPacketBuilder so that the parser
 // is verified against the canonical wire-format writer rather than hand-crafted
@@ -593,7 +593,7 @@ namespace RTMPE.Tests.Runtime
 
         // ── NaN / Inf rejection (audit fix C2-004) ────────────────────────────
         //
-        // Before this fix, the physics parser passed crafted IEEE 754 NaN/Inf
+       // Before this fix, the physics parser passed crafted IEEE 754 NaN/Inf
         // bit patterns straight through to Rigidbody / Rigidbody2D, which
         // silently destabilises PhysX and PhysX2D and can crash the engine.
         // The 3-D and 2-D parsers must reject any non-finite float in any

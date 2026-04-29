@@ -88,8 +88,8 @@ namespace RTMPE.Tests
         public void ParseJoinRoomResponse_Success_ParsesRoomAndPlayers()
         {
             // Build: [msg_kind=0x00][ok=1]
-            //   [room_id][room_code][name][player_count:1][max_players:1][is_public:1]
-            //   for each player: [player_id][display_name][is_host:1][is_ready:1]
+            //  [room_id][room_code][name][player_count:1][max_players:1][is_public:1]
+            //  for each player: [player_id][display_name][is_host:1][is_ready:1]
 
             var ms = new TestStream();
             ms.WriteByte(0x00); // msg_kind = Response

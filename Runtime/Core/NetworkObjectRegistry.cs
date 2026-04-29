@@ -3,17 +3,17 @@
 // Central registry of all live networked objects.
 //
 // Design decisions:
-//   • All methods are main-thread only (Unity objects must be accessed from
-//     the main thread). The lock is retained for defensive safety in case of
-//     future async operations, but callers should treat this as single-threaded.
-//   • Get() performs a Unity null check (op_Equality override) to detect
-//     destroyed GameObjects and auto-evicts them, preventing stale references.
-//   • Clear() despawns all objects before clearing so that OnNetworkDespawn()
-//     fires and _isSpawned is set to false for every registered object.
-//     Despawning happens OUTSIDE the lock to prevent re-entrance deadlocks if
-//     an OnNetworkDespawn callback calls registry methods.
-//   • GetAll() returns a defensive snapshot (IReadOnlyList) so callers
-//     iterating the list can't observe concurrent modifications.
+//  • All methods are main-thread only (Unity objects must be accessed from
+//    the main thread). The lock is retained for defensive safety in case of
+//    future async operations, but callers should treat this as single-threaded.
+//  • Get() performs a Unity null check (op_Equality override) to detect
+//    destroyed GameObjects and auto-evicts them, preventing stale references.
+//  • Clear() despawns all objects before clearing so that OnNetworkDespawn()
+//    fires and _isSpawned is set to false for every registered object.
+//    Despawning happens OUTSIDE the lock to prevent re-entrance deadlocks if
+//    an OnNetworkDespawn callback calls registry methods.
+//  • GetAll() returns a defensive snapshot (IReadOnlyList) so callers
+//    iterating the list can't observe concurrent modifications.
 
 using System;
 using System.Collections.Generic;
@@ -31,13 +31,6 @@ namespace RTMPE.Core
             new Dictionary<ulong, NetworkBehaviour>();
 
         private readonly object _lock = new object();
-
-        // Reusable buffer for GetAll() — re-populated each call to avoid
-        // allocating a fresh List in the 30Hz variable-flush hot path.
-        // Main-thread only (matches the rest of this class), so it's safe to
-        // share a single instance.
-        private readonly List<NetworkBehaviour> _getAllBuffer =
-            new List<NetworkBehaviour>(64);
 
         // ── Mutation ───────────────────────────────────────────────────────────
 
@@ -73,6 +66,10 @@ namespace RTMPE.Core
             {
                 _objects.Remove(objectId);
             }
+            // Drop hysteresis state so a future spawn that re-uses the id
+            // starts hidden, matching the "first contact" semantics of the
+            // interest filter.
+            Rooms.InterestManager.ForgetObject(objectId);
         }
 
         // ── Query ──────────────────────────────────────────────────────────────
@@ -80,7 +77,7 @@ namespace RTMPE.Core
         /// <summary>
         /// Look up a networked object by its ID.
         ///
-        /// Performs a Unity null-equality check: if a <c>GameObject</c> was
+       /// Performs a Unity null-equality check: if a <c>GameObject</c> was
         /// destroyed externally (<c>Object.Destroy</c>) without calling
         /// <see cref="Unregister"/>, the stale entry is evicted automatically
         /// and <see langword="null"/> is returned.
@@ -96,6 +93,7 @@ namespace RTMPE.Core
                 if (obj == null)
                 {
                     _objects.Remove(objectId);
+                    Rooms.InterestManager.ForgetObject(objectId);
                     return null;
                 }
 
@@ -105,26 +103,59 @@ namespace RTMPE.Core
 
         /// <summary>
         /// Return all currently registered objects, excluding any entries
-        /// whose <c>GameObject</c> has been destroyed externally.  The returned
-        /// list is a SHARED, re-used buffer — callers must finish iterating
-        /// before the next <see cref="GetAll"/> call (single-threaded contract).
-        /// This avoids a 30Hz allocation in the variable-flush hot path.
+        /// whose <c>GameObject</c> has been destroyed externally.
+        ///
+        /// <para><b>Buffer ownership contract:</b> every call returns a
+        /// freshly-allocated <see cref="List{T}"/>.  Sharing a re-used
+        /// buffer across calls — even with a depth counter — is unsafe
+        /// when the consumer dispatches into user code mid-walk: a
+        /// sibling main-thread call observes a depth that does not
+        /// reflect the buffer's in-use status (the buffer is consumed
+        /// outside the lock that produced it) and silently clobbers the
+        /// outer walker's view of the registry.  Allocating a fresh list
+        /// here is the only correctness-preserving option.</para>
+        ///
+        /// <para>Hot paths that dispatch user callbacks during caller-side
+        /// iteration should prefer <see cref="GetAllSnapshot"/> with a
+        /// pre-allocated caller-owned list — that pattern avoids the
+        /// per-call allocation while still being safe under nesting.</para>
         /// </summary>
         public IReadOnlyList<NetworkBehaviour> GetAll()
         {
             lock (_lock)
             {
-                _getAllBuffer.Clear();
-                if (_getAllBuffer.Capacity < _objects.Count)
-                {
-                    _getAllBuffer.Capacity = _objects.Count;
-                }
+                // Always return a fresh copy.  The caller may dispatch into
+                // arbitrary user code while iterating the result; any
+                // shared-buffer optimisation would let a nested or sibling
+                // GetAll call mutate the outer walker's view mid-iteration.
+                var snapshot = new List<NetworkBehaviour>(_objects.Count);
                 foreach (var obj in _objects.Values)
                 {
                     // Unity null check: skip destroyed-but-not-unregistered entries.
-                    if (obj != null) _getAllBuffer.Add(obj);
+                    if (obj != null) snapshot.Add(obj);
                 }
-                return _getAllBuffer;
+                return snapshot;
+            }
+        }
+
+        /// <summary>
+        /// Fill <paramref name="destination"/> with every currently registered
+        /// object whose <c>GameObject</c> has not been destroyed.  Zero-allocation
+        /// alternative to <see cref="GetAll"/> for hot paths that own their
+        /// iteration buffer and may dispatch into user code mid-walk — passing
+        /// a private list sidesteps the shared-buffer re-entrancy hazard
+        /// entirely.  The destination list is cleared before population.
+        /// </summary>
+        public void GetAllSnapshot(IList<NetworkBehaviour> destination)
+        {
+            if (destination == null) throw new ArgumentNullException(nameof(destination));
+            destination.Clear();
+            lock (_lock)
+            {
+                foreach (var obj in _objects.Values)
+                {
+                    if (obj != null) destination.Add(obj);
+                }
             }
         }
 
@@ -133,11 +164,11 @@ namespace RTMPE.Core
         /// (scene unload, external <c>Object.Destroy</c>, explicit scene load).
         /// Returns the number of evicted entries.
         ///
-        /// <para>Unlike <see cref="Get"/>, which lazily evicts one stale entry
+       /// <para>Unlike <see cref="Get"/>, which lazily evicts one stale entry
         /// per call, this method sweeps the full dictionary in a single pass.
         /// Call it after scene transitions to keep the registry tight.</para>
         ///
-        /// <para>Does NOT fire <see cref="NetworkBehaviour.OnNetworkDespawn"/> —
+       /// <para>Does NOT fire <see cref="NetworkBehaviour.OnNetworkDespawn"/> —
         /// the managed reference is unusable by the time this runs (Unity's
         /// null-equality returns true even before the C# field is set to null),
         /// so calling SetSpawned(false) would fault the user's handler.  Apps
@@ -145,7 +176,7 @@ namespace RTMPE.Core
         /// <see cref="SpawnManager.Despawn"/> rather than letting a scene load
         /// reap the GameObject.</para>
         ///
-        /// <para>Caller must be on the Unity main thread — uses Unity's null
+       /// <para>Caller must be on the Unity main thread — uses Unity's null
         /// equality which is not safe from background threads.</para>
         /// </summary>
         public int PruneDestroyed()
@@ -169,7 +200,11 @@ namespace RTMPE.Core
 
                 if (staleIds == null) return 0;
 
-                foreach (var id in staleIds) _objects.Remove(id);
+                foreach (var id in staleIds)
+                {
+                    _objects.Remove(id);
+                    Rooms.InterestManager.ForgetObject(id);
+                }
                 return staleIds.Count;
             }
         }
@@ -177,12 +212,12 @@ namespace RTMPE.Core
         /// <summary>
         /// Clear all registered objects.
         ///
-        /// Calls <see cref="NetworkBehaviour.SetSpawned(bool)"/> with
+       /// Calls <see cref="NetworkBehaviour.SetSpawned(bool)"/> with
         /// <see langword="false"/> on each live object before removing it from
         /// the registry, so <see cref="NetworkBehaviour.OnNetworkDespawn"/> fires
         /// and <see cref="NetworkBehaviour.IsSpawned"/> is set to <see langword="false"/>.
         ///
-        /// Despawning occurs OUTSIDE the lock to prevent re-entrance deadlocks if
+       /// Despawning occurs OUTSIDE the lock to prevent re-entrance deadlocks if
         /// <c>OnNetworkDespawn</c> triggers further registry operations.
         /// </summary>
         public void Clear()

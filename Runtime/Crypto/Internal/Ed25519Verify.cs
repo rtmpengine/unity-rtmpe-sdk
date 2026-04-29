@@ -33,8 +33,16 @@
 //   Edge case: ScalarMult(n=0) returns the identity point.
 //   When n is zero, BigInteger.Log(0,2) would throw; this case is guarded explicitly.
 //
+// STRICT-VERIFICATION POLICY:
+//   • Public-key and R-point must be canonical (y < p, no encoding ambiguity).
+//   • Public-key and R-point must NOT be in the order-8 torsion subgroup.
+//   These rules align this verifier with ed25519-dalek's verify_strict
+//   (used by the Rust gateway), eliminating cross-implementation
+//   malleability and small-subgroup attacks.
+//
 // TESTING:
-//   RFC 8032 test vectors, n=0 edge case, and signature mutation tests.
+//   RFC 8032 test vectors, n=0 edge case, signature mutation tests, and
+//   the eight published low-order Ed25519 points (Hamburg/Ladd Decaf §3).
 // ============================================================================
 
 using System;
@@ -66,11 +74,19 @@ namespace RTMPE.Crypto.Internal
         private static readonly BigInteger SqrtM1 =
             BigInteger.Parse("19681161376707505956807079304988542015446066515923890162744021073123829784752");
 
-        // Base point (Bx, By) from RFC 8032
+        // Base point (Bx, By) from RFC 8032 §5.1.
+        //
+        // By = 4 * modInverse(5, p). Bx is the unique x in [0, p) with sign
+        // bit 0 such that (Bx, By) lies on Edwards25519
+        //   −x^2 + y^2 = 1 + d*x^2*y^2 .
+        // These values are cross-checked against the RFC 8032 §6 reference
+        // implementation in the unit-test suite (see RFC 8032 §7
+        // test-vector verification — failure here means every signature
+        // check would silently fail).
         private static readonly BigInteger By =
-            BigInteger.Parse("46316835694926478169428394003475163141307993866256225615783033011972563625558");
+            BigInteger.Parse("46316835694926478169428394003475163141307993866256225615783033603165251855960");
         private static readonly BigInteger Bx =
-            BigInteger.Parse("15112221349535807912866137220509078750507884956996801189549095605099360729027");
+            BigInteger.Parse("15112221349535400772501151409588531511454012693041857206046113283949847762202");
 
         // ── Point representation ─────────────────────────────────────────────
 
@@ -149,13 +165,19 @@ namespace RTMPE.Crypto.Internal
         private static Point ScalarMult(Point pt, BigInteger n)
         {
             // Guard: multiplying by 0 returns the identity (neutral element).
-            // Also prevents BigInteger.Log(0, 2) ArgumentOutOfRangeException on
-            // adversarial inputs such as an all-zero S value in the signature.
-            if (n == BigInteger.Zero) return Point.Identity;
+            // Adversarial inputs (e.g. S = 0 in a malformed signature) are
+            // funneled through this branch and cannot trigger an exception.
+            if (n.IsZero) return Point.Identity;
+
+            // Use the exact bit length of the (non-negative) scalar. Earlier
+            // implementations used `(int)BigInteger.Log(n, 2) + 1` which for
+            // certain near-power-of-two scalars rounds the IEEE-754 double
+            // result down by one ULP, dropping the high bit of the scalar
+            // and silently producing the wrong point. `GetBitLength()`
+            // (.NET 5+) is integer-exact.
+            int bits = (int)n.GetBitLength();
 
             var Q = Point.Identity;
-            int bits = (int)BigInteger.Log(n, 2) + 1;
-
             for (int i = bits - 1; i >= 0; i--)
             {
                 Q = PointDouble(Q);
@@ -179,6 +201,16 @@ namespace RTMPE.Crypto.Internal
         /// Decode a compressed 32-byte Ed25519 point per RFC 8032 §5.1.3.
         /// Returns false if the encoding is invalid.
         /// </summary>
+        /// <remarks>
+        /// Strict canonical-encoding policy (RFC 8032 §5.1.7 + §8.4):
+        ///   • The recovered <c>y</c> coordinate must satisfy <c>0 ≤ y &lt; p</c>.
+        ///     A peer that emits <c>y ≥ p</c> is using a non-canonical encoding;
+        ///     two distinct byte representations would map to the same point and
+        ///     enable cross-implementation malleability with strict verifiers
+        ///     (notably ed25519-dalek's "strict" mode used by the Rust gateway).
+        ///   • If <c>x = 0</c> and the sign bit is 1 the encoding is rejected.
+        ///     RFC 8032 §5.1.3 step 3 forbids this combination.
+        /// </remarks>
         private static bool DecodePoint(byte[] s, out Point pt)
         {
             pt = default;
@@ -194,6 +226,8 @@ namespace RTMPE.Crypto.Internal
             // yBuf[32] = 0 (positive BigInteger)
             var y = new BigInteger(yBuf);
 
+            // Reject non-canonical encodings — the only canonical representation
+            // of a y-coordinate is the unique 0 ≤ y < p value (RFC 8032 §5.1.3).
             if (y >= P) return false;
 
             // Recover x: x^2 = (y^2 - 1) / (d*y^2 + 1)
@@ -250,6 +284,38 @@ namespace RTMPE.Crypto.Internal
                 && FMul(p1.Y, p2.Z) == FMul(p2.Y, p1.Z);
         }
 
+        /// <summary>
+        /// Test whether a decoded Ed25519 point lies in the order-8 torsion
+        /// subgroup, i.e. has order dividing the cofactor.
+        /// </summary>
+        /// <remarks>
+        /// Edwards25519 has cofactor h = 8. The eight low-order points
+        /// (including identity) satisfy [8]P = identity. Such points
+        /// contribute no security (their discrete-log is trivial) and are
+        /// the classical input to small-subgroup / cofactor-confusion
+        /// attacks — see Hamburg/Ladd "Decaf" §3 and the ed25519-dalek
+        /// strict-verification rationale.
+        ///
+        /// Rejecting them here matches RFC 8032 §5.1.7's recommendation
+        /// (final sentence) and the Rust gateway's
+        /// <c>verify_strict</c> behavior, eliminating cross-implementation
+        /// malleability where the gateway accepts a signature the SDK
+        /// rejects, or vice-versa.
+        ///
+        /// A point on extended coordinates equals identity iff X·Z = 0·Z
+        /// and Y·Z = 1·Z, i.e. <c>X == 0</c> and <c>Y == Z</c> in
+        /// projective form.
+        /// </remarks>
+        private static bool IsSmallOrder(Point pt)
+        {
+            // [8]P = double(double(double(P)))
+            var p2 = PointDouble(pt);
+            var p4 = PointDouble(p2);
+            var p8 = PointDouble(p4);
+            // Identity in (X:Y:Z:T): X = 0 and Y = Z (any non-zero Y/Z pair).
+            return p8.X.IsZero && p8.Y == p8.Z;
+        }
+
         // ── Public API ────────────────────────────────────────────────────────
 
         /// <summary>
@@ -271,6 +337,14 @@ namespace RTMPE.Crypto.Internal
             // 1. Decode the public key A.
             if (!DecodePoint(publicKeyBytes, out var A)) return false;
 
+            // Strict mode (RFC 8032 §5.1.7 final paragraph + §8.4):
+            // reject any A in the order-8 torsion subgroup. A small-order A
+            // makes the signature equation [S]B == R + [k]A trivially
+            // satisfiable in ways that don't bind the message, opening
+            // signature-malleability and cross-implementation hazards with
+            // the Rust gateway (ed25519-dalek verify_strict).
+            if (IsSmallOrder(A)) return false;
+
             // 2. Split the signature into R (first 32 bytes) and S (last 32 bytes).
             var R_bytes = new byte[32];
             var S_bytes = new byte[32];
@@ -279,6 +353,13 @@ namespace RTMPE.Crypto.Internal
 
             // 3. Decode R.
             if (!DecodePoint(R_bytes, out var R)) return false;
+
+            // Reject small-order R: same rationale as A above. A small-order
+            // R lets an attacker craft a signature that verifies for any
+            // message under any public key when paired with a small-order A,
+            // and is the canonical malleability vector closed by
+            // ed25519-dalek's strict mode.
+            if (IsSmallOrder(R)) return false;
 
             // 4. Decode S as a little-endian integer and check S < l.
             var sBuf = new byte[33];

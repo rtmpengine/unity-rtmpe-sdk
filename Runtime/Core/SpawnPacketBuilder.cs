@@ -7,22 +7,22 @@
 // Wire formats (all little-endian):
 //
 // ── SpawnRequest (client → server, type 0x30) ──────────────────────────────
-//   [prefab_id   : 4 LE u32]
-//   [object_id   : 8 LE u64]  — client-generated from GenerateObjectId()
-//   [owner_len   : 2 LE u16]
-//   [owner       : N UTF-8]   — room player UUID
-//   [pos_x       : 4 LE f32]
-//   [pos_y       : 4 LE f32]
-//   [pos_z       : 4 LE f32]
-//   [rot_x       : 4 LE f32]
-//   [rot_y       : 4 LE f32]
-//   [rot_z       : 4 LE f32]
-//   [rot_w       : 4 LE f32]
+//  [prefab_id   : 4 LE u32]
+//  [object_id   : 8 LE u64]  — client-generated from GenerateObjectId()
+//  [owner_len   : 2 LE u16]
+//  [owner       : N UTF-8]   — room player UUID
+//  [pos_x       : 4 LE f32]
+//  [pos_y       : 4 LE f32]
+//  [pos_z       : 4 LE f32]
+//  [rot_x       : 4 LE f32]
+//  [rot_y       : 4 LE f32]
+//  [rot_z       : 4 LE f32]
+//  [rot_w       : 4 LE f32]
 //
 // Total: 14 + owner_len + 28 bytes.
 //
 // ── DespawnRequest (client → server, type 0x31) ────────────────────────────
-//   [object_id   : 8 LE u64]
+//  [object_id   : 8 LE u64]
 //
 // Total: 8 bytes.
 

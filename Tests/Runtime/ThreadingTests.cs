@@ -16,7 +16,7 @@ namespace RTMPE.Tests
     /// Validates that <see cref="PacketProtocol"/>, <see cref="PacketType"/>, and
     /// <see cref="PacketFlags"/> constants match the Rust gateway wire-protocol exactly.
     ///
-    /// These tests act as a static contract guard: if any constant diverges from the
+   /// These tests act as a static contract guard: if any constant diverges from the
     /// values in <c>modules/gateway/src/packet/header.rs</c>, the build pipeline fails
     /// before a single packet is sent over the network.
     /// </summary>
@@ -125,7 +125,7 @@ namespace RTMPE.Tests
             // Verify HEADER_SIZE matches the sum of all field widths:
             // magic(2) + version(1) + type(1) + flags(1) + sequence(4) + payload_len(4) = 13
             //
-            // NOTE: PacketProtocol.OFFSET_* constants are `internal` (implementation detail);
+           // NOTE: PacketProtocol.OFFSET_* constants are `internal` (implementation detail);
             // tests must not depend on them directly.  Instead, verify the total from first
             // principles — this is the only public contract that matters.
             const int computedSize = 2   // magic       (u16 LE)

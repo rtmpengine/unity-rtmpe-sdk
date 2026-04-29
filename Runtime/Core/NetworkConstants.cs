@@ -1,20 +1,20 @@
 // RTMPE SDK — Runtime/Core/NetworkConstants.cs
 //
 // Wire-protocol constants shared between:
-//   • Rust gateway  — modules/gateway/src/packet/header.rs   (source of truth)
-//   • Unity SDK     — this file                               (C# mirror)
+//  • Rust gateway  — modules/gateway/src/packet/header.rs   (source of truth)
+//  • Unity SDK     — this file                               (C# mirror)
 //
 // ⚠  SYNC RULE: Any change to PacketType values, flag bits, MAGIC, VERSION, or
-//    HEADER_SIZE in the Rust gateway MUST be mirrored here immediately, and
-//    vice versa. Mismatched values will cause silent protocol failures at runtime.
+//   HEADER_SIZE in the Rust gateway MUST be mirrored here immediately, and
+//   vice versa. Mismatched values will cause silent protocol failures at runtime.
 //
 // Header wire layout (13 bytes, all little-endian):
-//   [0..1]  magic       : u16  = 0x5254
-//   [2]     version     : u8   = 3
-//   [3]     packet_type : u8   (see PacketType enum)
-//   [4]     flags       : u8   (see PacketFlags enum)
-//   [5..8]  sequence    : u32  (monotonic, per-connection)
-//   [9..12] payload_len : u32  (byte count of payload following header)
+//  [0..1]  magic       : u16  = 0x5254
+//  [2]     version     : u8   = 3
+//  [3]     packet_type : u8   (see PacketType enum)
+//  [4]     flags       : u8   (see PacketFlags enum)
+//  [5..8]  sequence    : u32  (monotonic, per-connection)
+//  [9..12] payload_len : u32  (byte count of payload following header)
 
 using System;
 
@@ -75,9 +75,9 @@ namespace RTMPE.Core
         // session without a full PSK re-authentication.  Server replies with a
         // normal Challenge (0x06) and the rest of the flow continues as usual.
         //
-        // ReconnectInit payload: [token_len:2 LE][token:N]
+       // ReconnectInit payload: [token_len:2 LE][token:N]
         //
-        // MUST stay in sync with modules/gateway/src/packet/header.rs
+       // MUST stay in sync with modules/gateway/src/packet/header.rs
         // (PacketType::ReconnectInit = 0x09, ReconnectAck = 0x0A).
         ReconnectInit     = 0x09,   // Client → Server: resume previous session via reconnect token
         ReconnectAck      = 0x0A,   // Reserved for future single-round-trip variant (unused today)
@@ -102,29 +102,29 @@ namespace RTMPE.Core
 
         // ── Matchmaking (AutoJoinOrCreate) ───────────────────────────────────
         // Flow: Client sends MatchmakingRequest; server atomically finds an open
-        //       waiting room matching (mode + lobby_name + project_id) or creates
-        //       a new one, joins the player, and replies with MatchmakingResponse.
+        //      waiting room matching (mode + lobby_name + project_id) or creates
+        //      a new one, joins the player, and replies with MatchmakingResponse.
         //
-        // MatchmakingRequest payload  (JSON):
-        //   { "project_id": int64, "mode": string, "lobby_name"?: string,
-        //     "min_players"?: int, "max_players"?: int,
-        //     "player_id": string, "display_name"?: string }
+       // MatchmakingRequest payload  (JSON):
+        //  { "project_id": int64, "mode": string, "lobby_name"?: string,
+        //    "min_players"?: int, "max_players"?: int,
+        //    "player_id": string, "display_name"?: string }
         //
-        // MatchmakingResponse payload (JSON):
-        //   { "ok": bool, "data"?: { "room_id": string, "room_code": string, "created": bool },
-        //     "error"?: string }
+       // MatchmakingResponse payload (JSON):
+        //  { "ok": bool, "data"?: { "room_id": string, "room_code": string, "created": bool },
+        //    "error"?: string }
         //
-        // MUST stay in sync with:
-        //   modules/gateway/src/packet/header.rs  (PacketType::MatchmakingRequest = 0x26)
-        //   modules/room/infrastructure/messaging/nats_matchmaking_handler.go
+       // MUST stay in sync with:
+        //  modules/gateway/src/packet/header.rs  (PacketType::MatchmakingRequest = 0x26)
+        //  modules/room/infrastructure/messaging/nats_matchmaking_handler.go
         MatchmakingRequest  = 0x26,   // Client → Server: AutoJoinOrCreate request
         MatchmakingResponse = 0x2B,   // Server → Client: matchmaking result
 
         // ── Lobby system (Phase 1.3) ─────────────────────────────────────────
         // Flow: LobbyJoin → server responds with current room list (JSON array).
-        //       LobbyLeave is fire-and-forget; no server reply is expected.
-        //       LobbyList requests a one-shot room listing with filters / sort.
-        //       LobbyRoomListUpdate is a server-push update to subscribed clients.
+        //      LobbyLeave is fire-and-forget; no server reply is expected.
+        //      LobbyList requests a one-shot room listing with filters / sort.
+        //      LobbyRoomListUpdate is a server-push update to subscribed clients.
         LobbyJoin           = 0x27,   // Client → Server: enter lobby browser (reply = current room list)
         LobbyLeave          = 0x28,   // Client → Server: exit lobby browser (fire-and-forget)
         LobbyList           = 0x29,   // Client → Server: filtered room list request (reply = JSON array)
@@ -159,20 +159,28 @@ namespace RTMPE.Core
         // RoomTicker.tickRoom — the foundation for true server-side
         // simulation, lag compensation, and anti-cheat.
         //
-        // Payload (raw binary, little-endian):
-        //   [count: u16 LE][payload_1: 13 bytes]…[payload_N: 13 bytes]
+       // Payload (raw binary, little-endian):
+        //  [count: u16 LE][payload_1: 13 bytes]…[payload_N: 13 bytes]
         //
-        // Per-frame layout matches InputPayload.WriteTo (13 B):
-        //   [tick: u32 LE][move_x: f32 LE][move_y: f32 LE][flags: u8]
+       // Per-frame layout matches InputPayload.WriteTo (13 B):
+        //  [tick: u32 LE][move_x: f32 LE][move_y: f32 LE][flags: u8]
         //
-        // Player identity is NOT carried in the payload — the Sync Service
+       // Player identity is NOT carried in the payload — the Sync Service
         // resolves it from the gateway's NATS envelope (session_id →
         // authoritative player_id) so a client cannot stamp another
         // player's id on its own inputs.
         //
-        // MUST stay in sync with PacketType::InputPayload = 0x43 in
+       // MUST stay in sync with PacketType::InputPayload = 0x43 in
         // modules/gateway/src/packet/header.rs
         InputPayload      = 0x43,   // Client → Server: server-authoritative input batch
+        // ── Variable batch (multi-object coalesced delta) ────────────────
+        // Payload: [count:1][count × {[entry_len:2 LE][entry:N]}] where each
+        // entry is a legacy 0x41 VariableUpdate payload verbatim.  Reduces
+        // per-packet wire overhead when many small deltas leave the same
+        // sender in one tick.  Only emitted when
+        // NetworkSettings.enableVariableBatching is true; gateways that do
+        // not negotiate the new type drop unrecognised packets.
+        VariableBatchUpdate = 0x44, // Client → Server: per-tick coalesced variable batch
         // ── RPC system ────────────────────────────────────────────────────────
         Rpc               = 0x50,   // Client → Server: RPC request (method_id dispatch)
         RpcResponse       = 0x51,   // Server → Client: RPC response (or broadcast)
@@ -200,5 +208,53 @@ namespace RTMPE.Core
         Encrypted   = 0x02,   // FLAG_ENCRYPTED   — payload is ChaCha20-Poly1305 AEAD-encrypted
         Reliable    = 0x04,   // FLAG_RELIABLE    — packet requires KCP acknowledgement
         EnhancedRpc = 0x08,   // FLAG_ENHANCED_RPC — Rpc(0x50) payload uses 27-byte Enhanced RPC header
+        GameplayOrdered = 0x10, // FLAG_GAMEPLAY_ORDERED — payload begins with a 4-byte gameplay sequence (LE u32) used to order RPC and StateSync against each other
+        // The wire sequence field is the AEAD nonce counter once a session is
+        // established, so the original application-level sequence is preserved
+        // only inside the encrypted plaintext.  When this flag is set, the AAD
+        // additionally binds a 4-byte LE u32 application sequence, allowing the
+        // gateway and receiver to deduplicate or order packets without first
+        // peeking at decrypted bytes.  Off by default; gateway must opt in.
+        AppSequence = 0x20, // FLAG_APP_SEQUENCE — application-level monotonic sequence layered into AAD
+    }
+
+    /// <summary>
+    /// Encoding selected at handshake time for network-variable state-sync
+    /// payloads.  Two FlatBuffers tables coexist in the schema; the gateway
+    /// fans out the negotiated variant per session so peers using different
+    /// formats can share a room.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="V2"/> uses <c>RTMPE.States.NetworkVariableUpdate</c> — a
+    /// <c>value_type: ValueType</c> enum tag plus a <c>data: [ubyte]</c> raw
+    /// byte vector.  Tag-vs-payload consistency is enforced on the read path
+    /// by application-level length checks.
+    /// </para>
+    /// <para>
+    /// <see cref="V4"/> uses <c>RTMPE.States.NetworkVariableUpdateV2</c> —
+    /// the value is a discriminated <c>NetworkVariableValue</c> union.  The
+    /// structural verifier validates the (tag, table-offset) pair atomically;
+    /// the consumer dispatches through type-safe variant accessors.
+    /// </para>
+    /// </remarks>
+    public enum WireFormatVersion : byte
+    {
+        V2 = 2,
+        V4 = 4,
+    }
+
+    /// <summary>
+    /// Default state-sync wire format used when no explicit negotiation has
+    /// taken place.  Matches the format that all currently-deployed gateways
+    /// emit, so the SDK is byte-compatible against any unmodified server.
+    /// </summary>
+    public static class WireFormat
+    {
+        /// <summary>
+        /// Default negotiated value used by builders / readers when no per-
+        /// session override has been supplied.
+        /// </summary>
+        public const WireFormatVersion Default = WireFormatVersion.V2;
     }
 }

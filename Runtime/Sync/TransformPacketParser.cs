@@ -3,28 +3,29 @@
 // Parses server-to-client StateDelta payloads into TransformState values.
 //
 // Wire format produced by Go's StateDelta.Serialize() (state_delta.go):
-//   [0..7]  object_id    : u64  (little-endian)
-//   [8]     changed_mask : u8   (bit flags, see constants below)
-//   [opt]   position     : 3 × f32 LE   (12 bytes; present iff bit 0x01 set)
-//   [opt]   rotation     : 4 × f32 LE   (16 bytes; present iff bit 0x02 set)
-//   [opt]   scale        : 3 × f32 LE   (12 bytes; present iff bit 0x04 set)
+//  [0..7]  object_id    : u64  (little-endian)
+//  [8]     changed_mask : u8   (bit flags, see constants below)
+//  [opt]   position     : 3 × f32 LE   (12 bytes; present iff bit 0x01 set)
+//  [opt]   rotation     : 4 × f32 LE   (16 bytes; present iff bit 0x02 set)
+//  [opt]   scale        : 3 × f32 LE   (12 bytes; present iff bit 0x04 set)
 //
 // Changed-field bit constants MUST match Go's state_delta.go:
-//   ChangedPosition byte = 1 << 0  // 0x01
-//   ChangedRotation byte = 1 << 1  // 0x02
-//   ChangedScale    byte = 1 << 2  // 0x04
-//   knownMask       byte = 0x07
+//  ChangedPosition byte = 1 << 0  // 0x01
+//  ChangedRotation byte = 1 << 1  // 0x02
+//  ChangedScale    byte = 1 << 2  // 0x04
+//  knownMask       byte = 0x07
 //
 // Unknown bits (bits 3..7) are rejected → TryParseStateDelta returns false.
 // This prevents silent field misalignment when the protocol adds new fields.
 //
 // Caller responsibility:
-//   Check changedMask after a successful parse.  Only fields with their
-//   corresponding bit set carry meaningful values.  State fields whose bits
-//   are NOT set hold zero initialisation values and must be ignored.
+//  Check changedMask after a successful parse.  Only fields with their
+//  corresponding bit set carry meaningful values.  State fields whose bits
+//  are NOT set hold zero initialisation values and must be ignored.
 //
 // Thread safety: all methods are static; no shared state.
 
+using System;
 using UnityEngine;
 
 namespace RTMPE.Sync
@@ -37,13 +38,13 @@ namespace RTMPE.Sync
     {
         // ── Changed-field bit flags ────────────────────────────────────────────
         //
-        // SYNC RULE: These values must equal the Go constants in state_delta.go.
-        //   ChangedPosition byte = 1 << 0  // 0x01
-        //   ChangedRotation byte = 1 << 1  // 0x02
-        //   ChangedScale    byte = 1 << 2  // 0x04
-        //   knownMask       byte = 0x07
+       // SYNC RULE: These values must equal the Go constants in state_delta.go.
+        //  ChangedPosition byte = 1 << 0  // 0x01
+        //  ChangedRotation byte = 1 << 1  // 0x02
+        //  ChangedScale    byte = 1 << 2  // 0x04
+        //  knownMask       byte = 0x07
         //
-        // A mismatch causes the parser to silently decode wrong fields.
+       // A mismatch causes the parser to silently decode wrong fields.
 
         /// <summary>Bit indicating the Position field is present in the delta.</summary>
         public const byte ChangedPosition = 0x01;
@@ -56,6 +57,17 @@ namespace RTMPE.Sync
 
         /// <summary>All currently known field bits.  Any bits outside this mask are unknown.</summary>
         public const byte KnownMask = 0x07;
+
+        /// <summary>
+        /// Total wire size of a client-to-server quantized transform-update
+        /// payload built by <c>TransformPacketBuilder.BuildQuantizedUpdatePayload</c>.
+        /// </summary>
+        public const int QUANTIZED_UPDATE_SIZE = 25;
+
+        /// <summary>
+        /// Bit set in the leading <c>flags</c> byte of a quantized payload.
+        /// </summary>
+        public const byte FLAG_QUANTIZED = 0x01;
 
         // ── Size constants ─────────────────────────────────────────────────────
 
@@ -178,6 +190,50 @@ namespace RTMPE.Sync
             }
 
             state = new TransformState { Position = pos, Rotation = rot, Scale = scale };
+            return true;
+        }
+
+        /// <summary>
+        /// Try to parse a client-to-server quantized transform-update payload.
+        /// Used by tests and by gateway-side decoders that mirror this SDK's
+        /// dispatch logic; the SDK itself only emits this format when
+        /// <c>NetworkSettings.quantizeTransforms</c> is true.
+        /// </summary>
+        public static bool TryParseQuantizedUpdate(
+            byte[] payload,
+            out ulong objectId,
+            out TransformState state)
+        {
+            objectId = 0;
+            state    = default;
+
+            if (payload == null || payload.Length != QUANTIZED_UPDATE_SIZE) return false;
+            if ((payload[0] & FLAG_QUANTIZED) == 0) return false;
+
+            objectId = ReadU64LE(payload, 1);
+
+            float px = TransformQuantization.ReadHalf(payload, 9);
+            float py = TransformQuantization.ReadHalf(payload, 11);
+            float pz = TransformQuantization.ReadHalf(payload, 13);
+
+            Quaternion rot = TransformQuantization.ReadSmallestThree(payload, 15);
+
+            float sx = TransformQuantization.ReadHalf(payload, 19);
+            float sy = TransformQuantization.ReadHalf(payload, 21);
+            float sz = TransformQuantization.ReadHalf(payload, 23);
+
+            // ReadHalf already maps malformed inputs to 0, so the only way a
+            // non-finite value could land here is an in-band runtime bug;
+            // a final guard makes the parser total over its declared domain.
+            if (!IsFinite(px) || !IsFinite(py) || !IsFinite(pz)) return false;
+            if (!IsFinite(sx) || !IsFinite(sy) || !IsFinite(sz)) return false;
+
+            state = new TransformState
+            {
+                Position = new Vector3(px, py, pz),
+                Rotation = rot,
+                Scale    = new Vector3(sx, sy, sz),
+            };
             return true;
         }
 

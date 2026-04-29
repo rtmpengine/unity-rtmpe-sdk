@@ -3,14 +3,14 @@
 // Lock-free FIFO queue for cross-thread producer/consumer scenarios.
 //
 // Why ConcurrentQueue<T> instead of Queue<T> + lock?
-//   ConcurrentQueue uses CAS (compare-and-swap) internally — no OS mutex is
-//   acquired on the hot path. On .NET Standard 2.1 / Unity IL2CPP this eliminates
-//   lock contention and priority inversion between the network background thread
-//   and the Unity main thread, which is critical for sub-30 ms P99 latency.
+//  ConcurrentQueue uses CAS (compare-and-swap) internally — no OS mutex is
+//  acquired on the hot path. On .NET Standard 2.1 / Unity IL2CPP this eliminates
+//  lock contention and priority inversion between the network background thread
+//  and the Unity main thread, which is critical for sub-30 ms P99 latency.
 //
 // .NET Standard 2.1 note:
-//   ConcurrentQueue<T>.Clear() was added in .NET 5 and is NOT available on
-//   .NET Standard 2.1 / Unity IL2CPP. Use the drain-loop pattern (see Clear()).
+//  ConcurrentQueue<T>.Clear() was added in .NET 5 and is NOT available on
+//  .NET Standard 2.1 / Unity IL2CPP. Use the drain-loop pattern (see Clear()).
 
 using System.Collections.Concurrent;
 
@@ -18,7 +18,10 @@ namespace RTMPE.Threading
 {
     /// <summary>
     /// Lock-free thread-safe FIFO queue backed by <see cref="ConcurrentQueue{T}"/>.
-    /// Safe for concurrent single-producer / single-consumer use patterns.
+    /// Safe for concurrent multi-producer / multi-consumer use patterns:
+    /// <see cref="ConcurrentQueue{T}"/> uses CAS for both ends of the queue,
+    /// so any number of threads may call <see cref="Enqueue"/> and
+    /// <see cref="TryDequeue"/> concurrently without external synchronization.
     /// </summary>
     public sealed class ThreadSafeQueue<T>
     {

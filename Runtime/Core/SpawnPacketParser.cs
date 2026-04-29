@@ -9,6 +9,7 @@
 using System;
 using System.Text;
 using UnityEngine;
+using RTMPE.Infrastructure.Serialization;
 
 namespace RTMPE.Core
 {
@@ -71,9 +72,28 @@ namespace RTMPE.Core
             if (ownerLen > 256)
                 return false;
 
-            string owner = ownerLen > 0
-                ? Encoding.UTF8.GetString(payload, o, ownerLen)
-                : string.Empty;
+            // Strict UTF-8 — the default Encoding.UTF8 silently substitutes the
+            // U+FFFD replacement character for any malformed byte sequence, which
+            // turns an attacker-corruptible owner-id into a string that compares
+            // unequal to a legitimate UUID but still satisfies non-empty checks.
+            // DecodeStrictUtf8 throws on either malformed UTF-8 or an embedded
+            // NUL; we treat that the same as any other malformed payload.
+            string owner;
+            if (ownerLen > 0)
+            {
+                try
+                {
+                    owner = SafeFlatBufferAccessors.DecodeStrictUtf8(payload, o, ownerLen);
+                }
+                catch (Exception)
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                owner = string.Empty;
+            }
             o += ownerLen;
 
             float px = ReadF32LE(payload, ref o);

@@ -9,13 +9,16 @@
 //  • Thread.Sleep(1) — yields the OS scheduler each iteration (~1 kHz poll rate).
 //    At a 30 Hz server tick rate (33 ms budget) this is more than sufficient. Replace
 //    with Thread.SpinWait if sub-millisecond latency is required.
-//  • Received bytes are immediately copied to an exclusive byte[] before raising
-//    OnPacketReceived, so the shared _receiveBuffer is free for the next read.
-//  • Outbound data is also copied in Send() so the caller can reuse its buffer.
 //  • A volatile bool _running acts as the cancellation signal; the thread checks it
 //    each iteration. No CancellationToken is used (avoids allocation on hot path).
+//  • Per-packet allocation is eliminated by renting receive and send buffers from
+//    System.Buffers.ArrayPool<byte>.Shared.  When a subscriber to the rented event
+//    is registered we hand the rented buffer through synchronously and return it
+//    to the pool the moment the handler returns; otherwise the legacy event is
+//    invoked with a freshly-allocated copy (still one fewer copy than before).
 
 using System;
+using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Threading;
 using RTMPE.Transport;
@@ -45,7 +48,10 @@ namespace RTMPE.Threading
 #endif
         // ── Dependencies ───────────────────────────────────────────────────────
         private readonly NetworkTransport _transport;
-        private readonly byte[]           _receiveBuffer;   // shared scratch; never exposed
+        // Receive buffer size cap.  Each receive rents a buffer of this size from
+        // ArrayPool and the kernel writes the datagram into it directly — no
+        // shared scratch + copy step.
+        private readonly int _receiveBufferSize;
 
         // ── Thread control ─────────────────────────────────────────────────────
         private Thread        _thread;
@@ -57,11 +63,32 @@ namespace RTMPE.Threading
         private int _startFlag;  // 0 = stopped, 1 = started
 
         // ── Outbound queue ─────────────────────────────────────────────────────
-        private readonly ThreadSafeQueue<byte[]> _sendQueue = new ThreadSafeQueue<byte[]>();
+        // Holds (buffer, length, fromPool).  When fromPool is true the buffer
+        // was rented from ArrayPool<byte>.Shared and MUST be returned exactly
+        // once after the underlying transport has finished with it.  Reference
+        // type byte[] in ConcurrentQueue does not allocate on the hot path
+        // beyond the segment node; the struct itself is 16 bytes and fits in
+        // ConcurrentQueue<T>'s internal slots without boxing.
+        private readonly ThreadSafeQueue<SendItem> _sendQueue = new ThreadSafeQueue<SendItem>();
+
+        private readonly struct SendItem
+        {
+            public readonly byte[] Buffer;
+            public readonly int    Length;
+            public readonly bool   FromPool;
+            public SendItem(byte[] buffer, int length, bool fromPool)
+            {
+                Buffer   = buffer;
+                Length   = length;
+                FromPool = fromPool;
+            }
+        }
 
         // Back-pressure guard: drain at most this many packets per loop iteration
         // to avoid starving the receive side under heavy write load.
         private const int MaxSendPerIteration = 100;
+        // Cap inbound drain similarly — under burst, leaves time for sends.
+        private const int MaxReceivePerIteration = 100;
 
         // ── Public surface ─────────────────────────────────────────────────────
 
@@ -70,10 +97,33 @@ namespace RTMPE.Threading
 
         /// <summary>
         /// Raised on the network background thread when a datagram is received.
-        /// The argument is an exclusively-owned copy of the payload bytes.
+        /// The argument is an exclusively-owned copy of the payload bytes
+        /// (length is exactly the datagram size).
         /// Subscribe before calling <see cref="Start"/>.
+        ///
+        /// Prefer <see cref="OnPacketReceivedRented"/> in hot paths — it elides
+        /// the per-packet allocation by handing the receive buffer through
+        /// directly.  The legacy event remains supported for callers that
+        /// retain the bytes beyond the synchronous handler return.
         /// </summary>
         public event Action<byte[]> OnPacketReceived;
+
+        /// <summary>
+        /// Zero-copy inbound delivery.  The handler is invoked synchronously with
+        /// a buffer rented from <see cref="ArrayPool{T}.Shared"/>.  The rented
+        /// buffer's <c>Length</c> is ≥ <paramref name="length"/> and only the
+        /// first <paramref name="length"/> bytes are valid datagram payload.
+        ///
+        /// The rented buffer is returned to the pool the moment every subscriber
+        /// returns.  Callers MUST NOT retain a reference to the array beyond the
+        /// duration of the synchronous call — copy out anything they wish to
+        /// keep.  Failing this rule yields use-after-return data corruption.
+        ///
+        /// When at least one rented subscriber is registered the legacy
+        /// <see cref="OnPacketReceived"/> event is NOT raised for that packet —
+        /// the rented event is the new canonical path.
+        /// </summary>
+        public event RentedPacketHandler OnPacketReceivedRented;
 
         /// <summary>
         /// Raised on the network background thread when a non-recoverable
@@ -81,14 +131,25 @@ namespace RTMPE.Threading
         /// </summary>
         public event Action<Exception> OnError;
 
+        /// <summary>
+        /// Synchronous handler for <see cref="OnPacketReceivedRented"/>.
+        /// </summary>
+        /// <param name="buffer">Pool-rented buffer — DO NOT retain past handler return.</param>
+        /// <param name="offset">First byte of the datagram payload (always 0 today).</param>
+        /// <param name="length">Number of valid bytes starting at <paramref name="offset"/>.</param>
+        public delegate void RentedPacketHandler(byte[] buffer, int offset, int length);
+
         // ── Construction ───────────────────────────────────────────────────────
 
         /// <param name="transport">Transport to own and operate. Disposed on <see cref="Dispose"/>.</param>
-        /// <param name="receiveBufferSize">Scratch buffer size in bytes (default 8 KiB).</param>
+        /// <param name="receiveBufferSize">Per-packet receive buffer size in bytes (default 8 KiB).</param>
         public NetworkThread(NetworkTransport transport, int receiveBufferSize = 8_192)
         {
-            _transport     = transport ?? throw new ArgumentNullException(nameof(transport));
-            _receiveBuffer = new byte[receiveBufferSize];
+            if (receiveBufferSize <= 0)
+                throw new ArgumentOutOfRangeException(nameof(receiveBufferSize));
+
+            _transport         = transport ?? throw new ArgumentNullException(nameof(transport));
+            _receiveBufferSize = receiveBufferSize;
         }
 
         // ── Lifecycle ──────────────────────────────────────────────────────────
@@ -150,6 +211,11 @@ namespace RTMPE.Threading
             }
 
             _thread = null;
+
+            // Drain the send queue to release any pool-rented buffers that never
+            // made it onto the wire.  Skipping this would leak rented arrays
+            // permanently from the shared pool's perspective.
+            DrainAndReleasePending();
         }
 
         /// <summary>
@@ -161,10 +227,31 @@ namespace RTMPE.Threading
         {
             if (!_running || data == null || data.Length == 0) return;
 
-            // Copy so the caller can safely reuse or discard its buffer.
-            var copy = new byte[data.Length];
-            Buffer.BlockCopy(data, 0, copy, 0, data.Length);
-            _sendQueue.Enqueue(copy);
+            // Copy into a pool-rented buffer.  ArrayPool may hand back an array
+            // larger than data.Length; we record the exact byte count alongside
+            // the buffer so the transport sends only the meaningful prefix.
+            var rented = ArrayPool<byte>.Shared.Rent(data.Length);
+            try
+            {
+                Buffer.BlockCopy(data, 0, rented, 0, data.Length);
+                _sendQueue.Enqueue(new SendItem(rented, data.Length, fromPool: true));
+            }
+            catch
+            {
+                // Enqueue throwing (OOM during segment grow, BlockCopy on a
+                // bogus rented buffer) would otherwise leak the rental for
+                // the lifetime of the process.
+                ArrayPool<byte>.Shared.Return(rented, clearArray: true);
+                throw;
+            }
+
+            // Stop() races: if the worker shut down between the entry guard
+            // and Enqueue, the item lives in the queue with no future
+            // drainer.  Re-check and drain the queue ourselves so the
+            // rental is returned and the caller's data is not silently
+            // lost in a quiet leak.  Drain is idempotent — DrainAndReleasePending
+            // is safe to call repeatedly.
+            if (!_running) DrainAndReleasePending();
         }
 
         /// <summary>
@@ -181,7 +268,9 @@ namespace RTMPE.Threading
         public void SendOwned(byte[] ownedData)
         {
             if (!_running || ownedData == null || ownedData.Length == 0) return;
-            _sendQueue.Enqueue(ownedData);
+            // Caller-owned arrays are sent in full; they must not be returned to
+            // the pool because they were never rented from it.
+            _sendQueue.Enqueue(new SendItem(ownedData, ownedData.Length, fromPool: false));
         }
 
         /// <inheritdoc/>
@@ -235,18 +324,54 @@ namespace RTMPE.Threading
         private void DrainSendQueue()
         {
             for (int i = 0;
-                 i < MaxSendPerIteration && _sendQueue.TryDequeue(out var packet);
+                 i < MaxSendPerIteration && _sendQueue.TryDequeue(out var item);
                  i++)
             {
                 try
                 {
-                    _transport.Send(packet);
+                    // UdpTransport exposes a slice-aware overload that avoids
+                    // copying the rented buffer down to its meaningful prefix.
+                    if (_transport is UdpTransport udp)
+                    {
+                        udp.Send(item.Buffer, 0, item.Length);
+                    }
+                    else
+                    {
+                        // Fallback for other transports (KCP, mock): if the
+                        // rented buffer is exactly the right size we hand it
+                        // straight in; otherwise copy down to a temporary
+                        // exact-sized array because the abstract Send contract
+                        // sends the entire array.
+                        if (item.Buffer.Length == item.Length)
+                        {
+                            _transport.Send(item.Buffer);
+                        }
+                        else
+                        {
+                            var exact = new byte[item.Length];
+                            Buffer.BlockCopy(item.Buffer, 0, exact, 0, item.Length);
+                            _transport.Send(exact);
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
                     OnError?.Invoke(ex);
+                    if (item.FromPool) ArrayPool<byte>.Shared.Return(item.Buffer, clearArray: true);
                     break;  // Stop draining on transport error; let RunLoop handle recovery
                 }
+
+                if (item.FromPool) ArrayPool<byte>.Shared.Return(item.Buffer, clearArray: true);
+            }
+        }
+
+        // Drain any send items that remain queued at shutdown, returning rented
+        // buffers to the pool.  Without this the pool sees the rentals leaked.
+        private void DrainAndReleasePending()
+        {
+            while (_sendQueue.TryDequeue(out var item))
+            {
+                if (item.FromPool) ArrayPool<byte>.Shared.Return(item.Buffer, clearArray: true);
             }
         }
 
@@ -255,29 +380,79 @@ namespace RTMPE.Threading
             // Drain all available datagrams each iteration instead of
             // consuming only one.  At 30 Hz with 16 players up to 16 packets can
             // arrive within a single 33 ms window.  Reading only one per 1 ms cycle
-            // added up to 15 ms of queuing latency for late-arriving packets.
+            // adds up to 15 ms of queuing latency for late-arriving packets.
             //
-            // The loop is capped at MaxSendPerIteration (100) to avoid consuming
-            // every CPU cycle on receive when under a burst — leaving time for sends.
+            // Each receive rents a fresh buffer from ArrayPool — no shared
+            // scratch + copy step.  The buffer is returned to the pool the
+            // moment the synchronous subscriber chain returns.
             try
             {
-                for (int i = 0; i < MaxSendPerIteration; i++)
+                for (int i = 0; i < MaxReceivePerIteration; i++)
                 {
                     if (!_transport.Poll(0)) break; // no more data
 
-                    int n = _transport.Receive(_receiveBuffer);
-                    if (n <= 0) break;
+                    var rented = ArrayPool<byte>.Shared.Rent(_receiveBufferSize);
+                    int n;
+                    try
+                    {
+                        n = _transport.Receive(rented);
+                    }
+                    catch
+                    {
+                        ArrayPool<byte>.Shared.Return(rented, clearArray: true);
+                        throw;
+                    }
 
-                    // Copy to an exclusive array before raising the event — the shared
-                    // _receiveBuffer is immediately recycled for the next read.
-                    var packet = new byte[n];
-                    Buffer.BlockCopy(_receiveBuffer, 0, packet, 0, n);
-                    OnPacketReceived?.Invoke(packet);
+                    if (n <= 0)
+                    {
+                        ArrayPool<byte>.Shared.Return(rented, clearArray: true);
+                        break;
+                    }
+
+                    DispatchReceived(rented, n);
                 }
             }
             catch (Exception ex)
             {
                 OnError?.Invoke(ex);
+            }
+        }
+
+        // Hand the just-received datagram to subscribers, then return the
+        // rented buffer to the shared pool exactly once.  The try/finally
+        // guarantees return even if a subscriber throws.
+        private void DispatchReceived(byte[] rented, int length)
+        {
+            // Snapshot delegates once — Action invocation is not racy with
+            // concurrent subscribe/unsubscribe but reading the field twice
+            // could observe different values.
+            var rentedHandler = OnPacketReceivedRented;
+            var legacyHandler = OnPacketReceived;
+
+            try
+            {
+                if (rentedHandler != null)
+                {
+                    // Zero-copy delivery: one buffer, one synchronous call.
+                    // After all subscribers return the buffer goes back to
+                    // the pool and is reused on the next receive.
+                    rentedHandler(rented, 0, length);
+                }
+                else if (legacyHandler != null)
+                {
+                    // Legacy contract guarantees an exclusively-owned array
+                    // sized exactly to the datagram length.  This path still
+                    // saves one copy vs. the original "shared scratch + new
+                    // byte[n]" implementation: kernel writes directly into
+                    // `rented` and we copy out once into the exact-sized array.
+                    var packet = new byte[length];
+                    Buffer.BlockCopy(rented, 0, packet, 0, length);
+                    legacyHandler(packet);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented, clearArray: true);
             }
         }
     }

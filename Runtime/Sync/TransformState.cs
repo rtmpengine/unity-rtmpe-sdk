@@ -4,14 +4,14 @@
 // the network by NetworkTransform.
 //
 // Design decisions:
-//   • Uses UnityEngine.Vector3 and UnityEngine.Quaternion directly so that
-//     NetworkTransform can assign/read Unity transform fields without an
-//     intermediate conversion type.
-//   • No UnityEngine behaviour or MonoBehaviour dependencies — pure data.
-//   • TransformPacketBuilder and TransformPacketParser operate on this type,
-//     making both serialisation and deserialisation paths type-safe.
-//   • Identity static property gives a canonical "at rest" value useful for
-//     initialisation and test default construction.
+//  • Uses UnityEngine.Vector3 and UnityEngine.Quaternion directly so that
+//    NetworkTransform can assign/read Unity transform fields without an
+//    intermediate conversion type.
+//  • No UnityEngine behaviour or MonoBehaviour dependencies — pure data.
+//  • TransformPacketBuilder and TransformPacketParser operate on this type,
+//    making both serialisation and deserialisation paths type-safe.
+//  • Identity static property gives a canonical "at rest" value useful for
+//    initialisation and test default construction.
 
 using UnityEngine;
 

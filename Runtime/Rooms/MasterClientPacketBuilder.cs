@@ -2,9 +2,9 @@
 //
 // Builds the payload bytes for the Phase 2 room-management packets:
 //
-//   • MasterClientTransfer (0x2D) — client → server
-//   • KickPlayer            (0x2E) — client → server
-//   • SceneLoaded           (0x2F) — client → server
+//  • MasterClientTransfer (0x2D) — client → server
+//  • KickPlayer            (0x2E) — client → server
+//  • SceneLoaded           (0x2F) — client → server
 //
 // The payload is a minimal JSON document.  Keeping the builder in a
 // dedicated file (mirroring PropertyPacketBuilder) lets the packet layer

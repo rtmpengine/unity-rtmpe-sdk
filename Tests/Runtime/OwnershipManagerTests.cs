@@ -248,6 +248,86 @@ namespace RTMPE.Tests
             Assert.AreEqual(0, aliceObjects.Count, "Alice should own nothing.");
         }
 
+        // ── Outstanding-request bookkeeping ────────────────────────────────────
+        //
+        // Defends against forged ownership-transfer responses.  A predictable
+        // request_id allocation lets an attacker race a fake reply into the
+        // open correlation window; ids are now drawn from a CSPRNG and we
+        // refuse any response whose id was never issued.
+
+        [Test]
+        [Description("Unknown request ids are rejected by TryAcknowledgeResponse.")]
+        public void TryAcknowledgeResponse_UnknownId_Rejected()
+        {
+            _ownership.ResetOutstandingForTest();
+            Assert.IsFalse(_ownership.TryAcknowledgeResponse(0xDEADBEEF));
+            Assert.IsFalse(_ownership.TryAcknowledgeResponse(0));
+            Assert.AreEqual(0, _ownership.OutstandingCount);
+        }
+
+        [Test]
+        [Description("Stale entries past the TTL are pruned and no longer ack-able.")]
+        public void PruneExpiredOutstanding_RemovesStaleEntries()
+        {
+            _ownership.ResetOutstandingForTest();
+
+            // Inject one expired entry directly so the test does not depend on
+            // real wall time.
+            var fld = typeof(OwnershipManager).GetField(
+                "_outstandingDeadlineMs",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var setFld = typeof(OwnershipManager).GetField(
+                "_outstanding",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var deadlines = (System.Collections.Generic.Dictionary<uint, long>)fld.GetValue(_ownership);
+            var set = (System.Collections.Generic.HashSet<uint>)setFld.GetValue(_ownership);
+            deadlines[42u] = 0;     // already expired
+            set.Add(42u);
+
+            _ownership.PruneExpiredOutstanding();
+
+            Assert.AreEqual(0, _ownership.OutstandingCount);
+            Assert.IsFalse(_ownership.TryAcknowledgeResponse(42u));
+        }
+
+        [Test]
+        [Description("Allocated ids are not the trivial monotonic 1, 2, 3 sequence.")]
+        public void AllocateOutstandingRequestId_IsNotTrivialMonotonic()
+        {
+            _ownership.ResetOutstandingForTest();
+            var mi = typeof(OwnershipManager).GetMethod(
+                "AllocateOutstandingRequestId",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+            uint a = (uint)mi.Invoke(_ownership, null);
+            uint b = (uint)mi.Invoke(_ownership, null);
+            uint c = (uint)mi.Invoke(_ownership, null);
+
+            Assert.AreNotEqual(0u, a);
+            Assert.AreNotEqual(0u, b);
+            Assert.AreNotEqual(0u, c);
+            // Three random uint draws colliding to a 1,2,3 sequence has
+            // probability ~2^-96 — catches a regression that reverts the
+            // CSPRNG to a counter.
+            bool monotonic = (b == a + 1u) && (c == b + 1u);
+            Assert.IsFalse(monotonic);
+            Assert.AreEqual(3, _ownership.OutstandingCount);
+        }
+
+        [Test]
+        [Description("Known id ack succeeds exactly once; replay rejected.")]
+        public void TryAcknowledgeResponse_KnownId_AcceptedOnceThenRejected()
+        {
+            _ownership.ResetOutstandingForTest();
+            var mi = typeof(OwnershipManager).GetMethod(
+                "AllocateOutstandingRequestId",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            uint id = (uint)mi.Invoke(_ownership, null);
+
+            Assert.IsTrue(_ownership.TryAcknowledgeResponse(id));
+            Assert.IsFalse(_ownership.TryAcknowledgeResponse(id));
+        }
+
         // ── Test double ────────────────────────────────────────────────────────
 
         private sealed class ConcreteNB : NetworkBehaviour

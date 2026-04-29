@@ -14,7 +14,7 @@ namespace RTMPE.Core
     /// <c>GameObject</c> (or a parent) as a <see cref="NetworkBehaviour"/> to
     /// receive server-authorised damage via the <c>ApplyDamage</c> RPC (method_id=301).
     ///
-    /// <see cref="NetworkManager"/> looks up this interface using
+   /// <see cref="NetworkManager"/> looks up this interface using
     /// <c>GetComponentInParent&lt;IDamageable&gt;</c> when an ApplyDamage RPC arrives.
     /// </summary>
     public interface IDamageable

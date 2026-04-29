@@ -5,33 +5,33 @@
 // "Exponential Backoff And Jitter" (Marc Brooker, 2015).
 //
 // Algorithm:
-//     baseExp  = min(maxDelay, baseDelay * 2^attempt)
-//     delay    = random_uniform(0, baseExp)
+//    baseExp  = min(maxDelay, baseDelay * 2^attempt)
+//    delay    = random_uniform(0, baseExp)
 //
 // Properties:
-//   • Exponential growth between attempts prevents reconnect storms on long
-//     outages (the server is not hammered by retry traffic while it recovers).
-//   • Full Jitter de-correlates reconnect times across many clients — without
-//     it, every client that dropped at t=0 would retry in lock-step at t=1s,
-//     t=2s, t=4s, …, producing synchronized load spikes that are the
-//     canonical cause of cascading failure during gateway recovery.
-//   • The attempt counter is explicit so callers can reset it on success
-//     without discarding the RNG state.
+//  • Exponential growth between attempts prevents reconnect storms on long
+//    outages (the server is not hammered by retry traffic while it recovers).
+//  • Full Jitter de-correlates reconnect times across many clients — without
+//    it, every client that dropped at t=0 would retry in lock-step at t=1s,
+//    t=2s, t=4s, …, producing synchronized load spikes that are the
+//    canonical cause of cascading failure during gateway recovery.
+//  • The attempt counter is explicit so callers can reset it on success
+//    without discarding the RNG state.
 //
 // Thread safety:
-//   • Each instance owns its own System.Random. Callers on a single logical
-//     connection (e.g. one NetworkManager) must not share a single backoff
-//     instance across threads without external synchronization.
+//  • Each instance owns its own System.Random. Callers on a single logical
+//    connection (e.g. one NetworkManager) must not share a single backoff
+//    instance across threads without external synchronization.
 //
 // Usage:
-//     var backoff = new ReconnectBackoff();
-//     while (!Connected && backoff.Attempt < MaxAttempts)
-//     {
-//         var delay = backoff.NextDelay();
-//         yield return new WaitForSeconds((float)delay.TotalSeconds);
-//         TryConnect();
-//     }
-//     if (Connected) backoff.Reset();
+//    var backoff = new ReconnectBackoff();
+//    while (!Connected && backoff.Attempt < MaxAttempts)
+//    {
+//        var delay = backoff.NextDelay();
+//        yield return new WaitForSeconds((float)delay.TotalSeconds);
+//        TryConnect();
+//    }
+//    if (Connected) backoff.Reset();
 
 using System;
 
@@ -52,6 +52,19 @@ namespace RTMPE.Core
         private readonly int    _maxDelayMs;
         private readonly Random _rng;
         private int             _attempt;
+
+        // Saturation cap for the attempt counter.  Once the exponential has
+        // saturated to maxDelayMs (which happens around attempt = 30 with the
+        // default 1 s base / 30 s max bounds), further increments are pure
+        // bookkeeping — the returned delay no longer changes.  Capping at 30
+        // is well past the point where ComputeExponentialCapMs short-circuits
+        // (see its `if (attempt >= 30) return maxDelayMs;` early-out) and
+        // gives more than two billion safe NextDelay() invocations before the
+        // counter would have hit int.MaxValue under the old `checked(...)` —
+        // a value never reached in any plausible reconnect scenario, but which
+        // would otherwise raise OverflowException out of a long-running
+        // reconnect coroutine.
+        private const int MaxAttemptForBackoff = 30;
 
         /// <summary>
         /// Number of <see cref="NextDelay"/> calls since construction or the last
@@ -121,7 +134,15 @@ namespace RTMPE.Core
             // the upper bound is inclusive — avoids the awkward "you can never
             // hit exactly cap" artifact that makes T-N3-03 flaky.
             var ms = _rng.Next(cap + 1);
-            _attempt = checked(_attempt + 1); // overflow at ~2B is a bug
+            // Saturating increment — once the backoff has saturated at
+            // maxDelayMs the exact attempt number is irrelevant, so we clamp
+            // at MaxAttemptForBackoff instead of allowing the counter to
+            // approach int.MaxValue.  The previous `checked(_attempt + 1)`
+            // would have thrown OverflowException after ~2 billion calls,
+            // surfacing as an unhandled exception out of an app's reconnect
+            // coroutine.  Capping is the conservative fix because callers
+            // already observe a saturated delay long before this matters.
+            if (_attempt < MaxAttemptForBackoff) _attempt++;
             return TimeSpan.FromMilliseconds(ms);
         }
 
@@ -155,7 +176,7 @@ namespace RTMPE.Core
             // maxDelayMs we can short-circuit.  The log2(max/base) boundary is
             // cheap to compute.
             //
-            // Example: baseDelayMs = 1000, maxDelayMs = 30_000 → saturation at
+           // Example: baseDelayMs = 1000, maxDelayMs = 30_000 → saturation at
             // attempt = 5 (2^5 × 1000 = 32 000 > 30 000).  For attempts ≥ 5 we
             // return 30 000 without attempting the shift.
             if (attempt >= 30) return maxDelayMs; // 2^30 × 1ms already ≈ 12 days

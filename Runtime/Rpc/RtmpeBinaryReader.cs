@@ -4,12 +4,12 @@
 // Reuses RpcSerializer's LE primitive helpers for bit-identical decoding.
 //
 // Truncation policy:
-//   • Each read first checks whether enough bytes remain.
-//   • On under-flow the reader sets HasFailed = true and returns the natural
-//     default for the requested type without advancing the cursor.
-//   • Subsequent reads short-circuit on HasFailed so the implementer's loop
-//     terminates cleanly and the outer dispatch (RpcSerializer.ReadParam) can
-//     abandon the parameter.
+//  • Each read first checks whether enough bytes remain.
+//  • On under-flow the reader sets HasFailed = true and returns the natural
+//    default for the requested type without advancing the cursor.
+//  • Subsequent reads short-circuit on HasFailed so the implementer's loop
+//    terminates cleanly and the outer dispatch (RpcSerializer.ReadParam) can
+//    abandon the parameter.
 //
 // All multi-byte values are little-endian, matching the rest of the wire format.
 

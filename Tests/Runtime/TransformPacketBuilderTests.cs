@@ -211,5 +211,75 @@ namespace RTMPE.Tests
             for (int i = 0; i < 48; i++)
                 Assert.AreEqual(0, payload[i], $"payload[{i}] should be 0");
         }
+
+        // ── Quantized payload variant ────────────────────────────────────
+
+        [Test]
+        [Description("Quantized payload is exactly 25 bytes and starts with the FLAG_QUANTIZED bit.")]
+        public void BuildQuantizedUpdatePayload_FlagAndLength()
+        {
+            var state = new TransformState
+            {
+                Position = new Vector3(1.5f, -2.25f, 3f),
+                Rotation = Quaternion.identity,
+                Scale    = Vector3.one,
+            };
+            var payload = TransformPacketBuilder.BuildQuantizedUpdatePayload(123UL, state);
+
+            Assert.IsNotNull(payload);
+            Assert.AreEqual(TransformPacketBuilder.QUANTIZED_PAYLOAD_SIZE, payload.Length);
+            Assert.AreEqual(25, payload.Length);
+            Assert.AreNotEqual(0, payload[0] & TransformPacketBuilder.FLAG_QUANTIZED);
+        }
+
+        [Test]
+        [Description("Quantized payload roundtrips position within half-precision tolerance.")]
+        public void BuildQuantizedUpdatePayload_PositionRoundtrip()
+        {
+            var state = new TransformState
+            {
+                Position = new Vector3(12.5f, -34.75f, 100f),
+                Rotation = Quaternion.identity,
+                Scale    = Vector3.one,
+            };
+            var payload = TransformPacketBuilder.BuildQuantizedUpdatePayload(7UL, state);
+
+            Assert.IsTrue(TransformPacketParser.TryParseQuantizedUpdate(
+                payload, out ulong objectId, out var decoded));
+            Assert.AreEqual(7UL, objectId);
+            Assert.AreEqual(state.Position.x, decoded.Position.x, 0.5f);
+            Assert.AreEqual(state.Position.y, decoded.Position.y, 0.5f);
+            Assert.AreEqual(state.Position.z, decoded.Position.z, 0.5f);
+        }
+
+        [Test]
+        [Description("Quantized encoder rejects NaN position by returning null.")]
+        public void BuildQuantizedUpdatePayload_NaNPositionReturnsNull()
+        {
+            var state = new TransformState
+            {
+                Position = new Vector3(float.NaN, 0f, 0f),
+                Rotation = Quaternion.identity,
+                Scale    = Vector3.one,
+            };
+            Assert.IsNull(TransformPacketBuilder.BuildQuantizedUpdatePayload(1UL, state));
+        }
+
+        [Test]
+        [Description("Parser rejects a length-mismatched quantized payload.")]
+        public void TryParseQuantizedUpdate_WrongLengthRejected()
+        {
+            var bad = new byte[24];
+            bad[0] = TransformPacketParser.FLAG_QUANTIZED;
+            Assert.IsFalse(TransformPacketParser.TryParseQuantizedUpdate(bad, out _, out _));
+        }
+
+        [Test]
+        [Description("Parser rejects a quantized-length payload with the flag bit cleared.")]
+        public void TryParseQuantizedUpdate_FlagCleared_Rejected()
+        {
+            var bad = new byte[TransformPacketParser.QUANTIZED_UPDATE_SIZE]; // flag bit unset
+            Assert.IsFalse(TransformPacketParser.TryParseQuantizedUpdate(bad, out _, out _));
+        }
     }
 }

@@ -7,17 +7,17 @@
 //
 // ── Disambiguation logic ──────────────────────────────────────────────────────
 //
-//   IsPhysics3D(payload) → true iff bit 0x40 set AND bit 0x80 clear.
-//   IsPhysics2D(payload) → true iff bit 0x80 set (3-D marker can coexist but
-//                           bit 0x80 wins — caller checks 2-D first is optional
-//                           since IsPhysics3D already requires bit 0x80 to be clear).
+//  IsPhysics3D(payload) → true iff bit 0x40 set AND bit 0x80 clear.
+//  IsPhysics2D(payload) → true iff bit 0x80 set (3-D marker can coexist but
+//                          bit 0x80 wins — caller checks 2-D first is optional
+//                          since IsPhysics3D already requires bit 0x80 to be clear).
 //
 // ── Error handling ────────────────────────────────────────────────────────────
 //
-//   All TryParse methods follow the TryParse pattern: returns false on any
-//   truncation, null input, wrong type marker, or unknown data bits.
-//   Unknown bits (bits not in DataFieldMask plus the relevant type marker) are
-//   rejected to prevent silent field misalignment on future protocol extensions.
+//  All TryParse methods follow the TryParse pattern: returns false on any
+//  truncation, null input, wrong type marker, or unknown data bits.
+//  Unknown bits (bits not in DataFieldMask plus the relevant type marker) are
+//  rejected to prevent silent field misalignment on future protocol extensions.
 //
 // Thread safety: all methods are static; no shared state.
 
@@ -137,6 +137,17 @@ namespace RTMPE.Sync
                 rot.z = ReadF32LE(payload, off); off += 4;
                 rot.w = ReadF32LE(payload, off); off += 4;
                 if (!IsFinite(rot.x) || !IsFinite(rot.y) || !IsFinite(rot.z) || !IsFinite(rot.w)) return false;
+
+                // Per-component cap: unit quaternions have |component| ≤ 1.
+                // Rejecting components outside [-1.1, 1.1] before squaring them
+                // prevents crafted values whose individual squares sum to a
+                // magnitude near 1.0 but whose raw floats are unexpectedly large,
+                // which could cause numerical instability in PhysX integration.
+                const float MaxComponent = 1.1f;
+                if (rot.x < -MaxComponent || rot.x > MaxComponent ||
+                    rot.y < -MaxComponent || rot.y > MaxComponent ||
+                    rot.z < -MaxComponent || rot.z > MaxComponent ||
+                    rot.w < -MaxComponent || rot.w > MaxComponent) return false;
 
                 // Same magnitude / renormalisation discipline as
                 // TransformPacketParser: a non-unit quaternion fed to

@@ -6,14 +6,14 @@
 // full wire packet (13-byte standard header + Enhanced RPC payload).
 //
 // Enhanced RPC payload layout (all little-endian):
-//   [method_id   :  4 LE u32]  FNV-1a("TypeName.MethodName")
-//   [sender_id   :  8 LE u64]  gateway session ID
-//   [request_id  :  4 LE u32]  client-assigned correlation ID
-//   [object_id   :  8 LE u64]  NetworkBehaviour.NetworkObjectId
-//   [target      :  1 u8]      RpcTarget (All=0x00, Others=0x01, Server=0x02)
-//   [rpc_flags   :  1 u8]      reserved, set to 0x00
-//   [param_count :  1 u8]      number of typed parameters that follow
-//   [params…]                  typed param stream (RpcSerializer format)
+//  [method_id   :  4 LE u32]  FNV-1a("TypeName.MethodName")
+//  [sender_id   :  8 LE u64]  gateway session ID
+//  [request_id  :  4 LE u32]  client-assigned correlation ID
+//  [object_id   :  8 LE u64]  NetworkBehaviour.NetworkObjectId
+//  [target      :  1 u8]      RpcTarget (All=0x00, Others=0x01, Server=0x02)
+//  [rpc_flags   :  1 u8]      reserved, set to 0x00
+//  [param_count :  1 u8]      number of typed parameters that follow
+//  [params…]                  typed param stream (RpcSerializer format)
 //
 // Total fixed header: 27 bytes.
 
@@ -53,6 +53,16 @@ namespace RTMPE.Rpc
             RpcTarget target,
             object[]  args = null)
         {
+            // Zero is the gateway's "unset" sentinel for the session id field;
+            // building a packet with senderId=0 produces a frame the gateway
+            // and every receiving peer silently drop as spoofed.  Failing
+            // loudly at the builder turns a hard-to-trace silent drop into
+            // an immediate, attributable programmer error.
+            if (senderId == 0)
+                throw new ArgumentException(
+                    "senderId must be non-zero; gateway and peers reject senderId=0 as spoofed.",
+                    nameof(senderId));
+
             if (args == null) args = Array.Empty<object>();
 
             if (args.Length > byte.MaxValue)

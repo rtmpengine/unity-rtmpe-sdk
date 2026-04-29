@@ -8,22 +8,22 @@
 // the Instantiate/Destroy cost.
 //
 // Contract:
-//   • Acquire must return a fully-configured GameObject with the same
-//     NetworkBehaviour component the prefab has.  It MUST NOT return null
-//     on success; instead, throw or return a fresh Instantiate if the
-//     pool is empty.  SpawnManager treats a null return as a fatal error.
-//   • Release is called instead of Object.Destroy when an object despawns.
-//     Implementations SHOULD deactivate the GameObject and keep it for
-//     later reuse.  Implementations MAY choose to Destroy rarely-used
-//     prefabs to cap pool memory; that decision is purely internal.
-//   • All calls happen on the Unity main thread.  Implementations do NOT
-//     need to be thread-safe.
+//  • Acquire must return a fully-configured GameObject with the same
+//    NetworkBehaviour component the prefab has.  It MUST NOT return null
+//    on success; instead, throw or return a fresh Instantiate if the
+//    pool is empty.  SpawnManager treats a null return as a fatal error.
+//  • Release is called instead of Object.Destroy when an object despawns.
+//    Implementations SHOULD deactivate the GameObject and keep it for
+//    later reuse.  Implementations MAY choose to Destroy rarely-used
+//    prefabs to cap pool memory; that decision is purely internal.
+//  • All calls happen on the Unity main thread.  Implementations do NOT
+//    need to be thread-safe.
 //
 // Why an interface rather than a concrete class:
-//   Different games want wildly different pooling strategies (global pool,
-//   per-scene pool, LRU-capped, warm-up on scene load, etc.).  The SDK
-//   intentionally ships no built-in pool so we don't paint consumers into
-//   a specific design.  Users with no pooling needs pay zero overhead.
+//  Different games want wildly different pooling strategies (global pool,
+//  per-scene pool, LRU-capped, warm-up on scene load, etc.).  The SDK
+//  intentionally ships no built-in pool so we don't paint consumers into
+//  a specific design.  Users with no pooling needs pay zero overhead.
 
 using UnityEngine;
 

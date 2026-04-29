@@ -17,7 +17,7 @@ namespace RTMPE.Rpc
     /// <see cref="INetworkSerializable.NetworkDeserialize"/>.
     /// All multi-byte values are decoded little-endian.
     ///
-    /// <para>Failure handling: if the underlying buffer is truncated mid-read
+   /// <para>Failure handling: if the underlying buffer is truncated mid-read
     /// the reader returns the natural default for the requested type
     /// (<c>0</c>, <c>false</c>, <see cref="string.Empty"/>, …) and sets the
     /// <see cref="HasFailed"/> flag.  Implementers may continue calling read

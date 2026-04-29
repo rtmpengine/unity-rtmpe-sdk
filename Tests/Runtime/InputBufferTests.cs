@@ -58,21 +58,25 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        public void Push_OverCapacity_OldestEntryOverwritten()
+        public void Push_OverCapacity_RejectsNewest_OldestPreserved()
         {
             var buf  = new InputBuffer();
             var dest = new InputPayload[InputBuffer.Capacity];
 
             for (uint i = 0; i < 64; i++)
-                buf.Push(new InputPayload { Tick = i });
+                Assert.IsTrue(buf.Push(new InputPayload { Tick = i }));
 
+            // Saturated: each excess push must be rejected so the oldest
+            // entry (the rollback anchor for the next reconciliation) is
+            // preserved.
             for (uint i = 64; i < 69; i++)
-                buf.Push(new InputPayload { Tick = i });
+                Assert.IsFalse(buf.Push(new InputPayload { Tick = i }));
 
             int n = buf.CopyUnacknowledgedTo(dest);
             Assert.AreEqual(64, n);
-            Assert.AreEqual(5u,  dest[0].Tick);
-            Assert.AreEqual(68u, dest[63].Tick);
+            Assert.AreEqual(0u,  dest[0].Tick);
+            Assert.AreEqual(63u, dest[63].Tick);
+            Assert.AreEqual(5L, buf.DroppedInputCount);
         }
 
         // ── AcknowledgeUpTo ──────────────────────────────────────────────────

@@ -6,37 +6,38 @@
 //
 // ── Architecture ──────────────────────────────────────────────────────────────
 //
-//   Mirrors NetworkRigidbody exactly but targets Rigidbody2D instead of Rigidbody.
-//   Key 2-D differences:
-//     • Position is Vector2 (XY plane); Z is never touched.
-//     • Rotation is a single float in degrees (not a Quaternion).
-//     • AngularVelocity is a single float in degrees/second.
-//     • MovePosition(Vector2) / MoveRotation(float) are used for non-kinematic
-//       correction (Rigidbody2D's equivalents of the 3-D MovePosition/Rotation).
+//  Mirrors NetworkRigidbody exactly but targets Rigidbody2D instead of Rigidbody.
+//  Key 2-D differences:
+//    • Position is Vector2 (XY plane); Z is never touched.
+//    • Rotation is a single float in degrees (not a Quaternion).
+//    • AngularVelocity is a single float in degrees/second.
+//    • MovePosition(Vector2) / MoveRotation(float) are used for non-kinematic
+//      correction (Rigidbody2D's equivalents of the 3-D MovePosition/Rotation).
 //
-//   Owner (authoritative physics):
-//     FixedUpdate() captures Rigidbody2D state and sends PhysicsSync2D payloads
-//     as PacketType.StateSync (0x40) when enabled fields change beyond thresholds.
+//  Owner (authoritative physics):
+//    FixedUpdate() captures Rigidbody2D state and sends PhysicsSync2D payloads
+//    as PacketType.StateSync (0x40) when enabled fields change beyond thresholds.
 //
-//   Non-owner (remote simulation):
-//     ApplyRemoteState() is called by NetworkManager when a 2-D physics packet
-//     arrives.  FixedUpdate() applies dead reckoning, position/rotation correction,
-//     and velocity blending each physics step.
+//  Non-owner (remote simulation):
+//    ApplyRemoteState() is called by NetworkManager when a 2-D physics packet
+//    arrives.  FixedUpdate() applies dead reckoning, position/rotation correction,
+//    and velocity blending each physics step.
 //
 // ── Threading ─────────────────────────────────────────────────────────────────
 //
-//   All methods run on the Unity main thread.  No locks needed.
+//  All methods run on the Unity main thread.  No locks needed.
 //
 // ── Angle conventions ─────────────────────────────────────────────────────────
 //
-//   Rigidbody2D.rotation returns degrees in the range (-180, 180].
-//   Rigidbody2D.angularVelocity returns degrees/second.
-//   Both values are transmitted as-is (no conversion to radians).
-//   Quaternion.Angle is NOT used for rotation-change detection; Mathf.Abs of
-//   the delta angle (with DeltaAngle normalisation) is used instead.
+//  Rigidbody2D.rotation returns degrees in the range (-180, 180].
+//  Rigidbody2D.angularVelocity returns degrees/second.
+//  Both values are transmitted as-is (no conversion to radians).
+//  Quaternion.Angle is NOT used for rotation-change detection; Mathf.Abs of
+//  the delta angle (with DeltaAngle normalisation) is used instead.
 
 using UnityEngine;
 using RTMPE.Core;
+using RTMPE.Sync.Internal;
 
 namespace RTMPE.Sync
 {
@@ -153,6 +154,13 @@ namespace RTMPE.Sync
         private byte           _appliedConstraints;
         private bool           _hasReceivedConstraints;
 
+        // Receive-side hardening: token-bucket rate limit and per-tick
+        // delta-cap reference state.  Mirrors the 3-D component.
+        private float _rateBucketTokens;
+        private float _rateBucketLastTime;
+        private uint  _appliedSequence;
+        private bool  _hasAppliedPosition;
+
         // ── Unity lifecycle ────────────────────────────────────────────────────
 
         protected override void OnNetworkSpawn()
@@ -178,6 +186,14 @@ namespace RTMPE.Sync
 
             _appliedConstraints     = (byte)(int)_rb.constraints;
             _hasReceivedConstraints = false;
+
+            // Pre-fill the rate-limit bucket; see NetworkRigidbody for rationale.
+            var settings0 = NetworkManager.Instance?.Settings;
+            float capacity0 = settings0 != null ? Mathf.Max(0f, settings0.maxPhysicsPacketsPerSecond) : 0f;
+            _rateBucketTokens   = capacity0;
+            _rateBucketLastTime = Time.fixedTime;
+            _hasAppliedPosition = false;
+            _appliedSequence    = 0;
 
             _sendAccum = 0f;
         }
@@ -340,9 +356,9 @@ namespace RTMPE.Sync
             if (!_makeRemoteKinematic)
             {
                 if (_syncVelocity)
-                    _rb.linearVelocity = Vector2.Lerp(
-                        _rb.linearVelocity, _receivedState.Velocity,
-                        Time.fixedDeltaTime * _positionCorrectionSpeed);
+                    _rb.SetLinearVelocity(Vector2.Lerp(
+                        _rb.GetLinearVelocity(), _receivedState.Velocity,
+                        Time.fixedDeltaTime * _positionCorrectionSpeed));
 
                 if (_syncAngularVelocity)
                     _rb.angularVelocity = Mathf.Lerp(
@@ -359,8 +375,51 @@ namespace RTMPE.Sync
         /// </summary>
         internal void ApplyRemoteState(PhysicsState2D incoming, byte changedMask)
         {
+            var settings = NetworkManager.Instance?.Settings;
+
+            // Per-object inbound rate limit (token-bucket).  See NetworkRigidbody
+            // for the threat model — same defence applies in 2-D.
+            if (settings != null && settings.maxPhysicsPacketsPerSecond > 0f)
+            {
+                float now = Time.fixedTime;
+                float dt  = Mathf.Max(0f, now - _rateBucketLastTime);
+                _rateBucketLastTime = now;
+                float capacity = settings.maxPhysicsPacketsPerSecond;
+                _rateBucketTokens = Mathf.Min(capacity,
+                    _rateBucketTokens + dt * settings.maxPhysicsPacketsPerSecond);
+                if (_rateBucketTokens < 1f) return;
+                _rateBucketTokens -= 1f;
+            }
+
+            // Plausibility caps on velocity, angular velocity, and per-tick
+            // position delta.  In 2-D, AngularVelocity is a single float in
+            // degrees/second so we compare the absolute value.
+            if (settings != null)
+            {
+                if (settings.maxLinearVelocity > 0f
+                    && (changedMask & PhysicsPacketBuilder.ChangedVelocity) != 0
+                    && incoming.Velocity.sqrMagnitude
+                       > settings.maxLinearVelocity * settings.maxLinearVelocity)
+                    return;
+
+                if (settings.maxAngularVelocity > 0f
+                    && (changedMask & PhysicsPacketBuilder.ChangedAngularVelocity) != 0
+                    && Mathf.Abs(incoming.AngularVelocity) > settings.maxAngularVelocity)
+                    return;
+
+                if (settings.maxPositionDeltaPerTick > 0f
+                    && (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
+                    && _hasAppliedPosition
+                    && (incoming.Position - _receivedState.Position).sqrMagnitude
+                       > settings.maxPositionDeltaPerTick * settings.maxPositionDeltaPerTick)
+                    return;
+            }
+
             if ((changedMask & PhysicsPacketBuilder.ChangedPosition) != 0)
+            {
                 _receivedState.Position = incoming.Position;
+                _hasAppliedPosition     = true;
+            }
 
             if ((changedMask & PhysicsPacketBuilder.ChangedRotation) != 0)
                 _receivedState.Rotation = incoming.Rotation;
@@ -374,14 +433,17 @@ namespace RTMPE.Sync
             if ((changedMask & PhysicsPacketBuilder.ChangedSleep) != 0)
                 _receivedState.IsSleeping = incoming.IsSleeping;
 
-            if ((changedMask & PhysicsPacketBuilder.ChangedConstraints) != 0)
+            if ((changedMask & PhysicsPacketBuilder.ChangedConstraints) != 0
+                && settings != null && settings.allowDynamicConstraints)
             {
-                _receivedState.ConstraintMask = incoming.ConstraintMask;
+                byte allow = (byte)(settings.dynamicConstraintsAllowMask & 0xFF);
+                _receivedState.ConstraintMask = (byte)(incoming.ConstraintMask & allow);
                 _hasReceivedConstraints       = true;
             }
 
             _lastReceiveTime  = Time.fixedTime;
             _hasReceivedState = true;
+            unchecked { _appliedSequence++; }
         }
 
         /// <summary>
@@ -443,7 +505,7 @@ namespace RTMPE.Sync
             {
                 Position        = _rb.position,
                 Rotation        = _rb.rotation,
-                Velocity        = _rb.linearVelocity,
+                Velocity        = _rb.GetLinearVelocity(),
                 AngularVelocity = _rb.angularVelocity,
                 IsSleeping      = _rb.IsSleeping(),
                 ConstraintMask  = (byte)(int)_rb.constraints,

@@ -120,6 +120,16 @@ namespace RTMPE.Crypto.Internal
                 output[i * 4 + 2] = (byte)(v >> 16);
                 output[i * 4 + 3] = (byte)(v >> 24);
             }
+
+            // Wipe the working state. Both `s` and `w` contain the 32-byte
+            // AEAD key in words [4..12]; if these arrays are promoted to
+            // gen-1/2 by the GC under heavy load, key bytes can linger in
+            // long-lived heap regions. Zeroing immediately after the block
+            // closes the only window in which a heap-dump adversary could
+            // recover the key from this transient state. Cf. RFC 9106 §5.4
+            // and OpenSSL's OPENSSL_cleanse pattern.
+            Array.Clear(w, 0, 16);
+            Array.Clear(s, 0, 16);
         }
 
         /// <summary>XOR input with the ChaCha20 keystream starting at <paramref name="initialCounter"/>.</summary>
@@ -142,6 +152,13 @@ namespace RTMPE.Crypto.Internal
                         = (byte)(input[inputOffset + processed + i] ^ block[i]);
                 processed += take;
             }
+
+            // Wipe the keystream block. While ChaCha20 keystream bytes are
+            // not directly key-recoverable, retaining 64 bytes of contiguous
+            // keystream from a known-plaintext packet would let a heap-dump
+            // adversary forge / decrypt that specific packet, so we zero on
+            // exit as defense-in-depth.
+            Array.Clear(block, 0, block.Length);
         }
 
         // ── Poly1305 MAC ─────────────────────────────────────────────────────
@@ -201,6 +218,17 @@ namespace RTMPE.Crypto.Internal
             int copy = Math.Min(result.Length, 16);
             Buffer.BlockCopy(result, 0, tag, 0, copy);
             // Remaining bytes of tag are already 0 (C# default).
+
+            // Wipe scratch buffers carrying the one-time r/s key bytes and
+            // the partially-computed accumulator. The BigInteger `r`/`s`/
+            // `acc` cannot be wiped (immutable, lives on the GC heap until
+            // the next gen-0 sweep) — that residual is part of the broader
+            // managed-heap-residue threat model called out in this file's
+            // header. Wiping the byte arrays is the best we can do without
+            // re-implementing Poly1305 in constant-time field arithmetic.
+            Array.Clear(rBytes, 0, rBytes.Length);
+            Array.Clear(sBytes, 0, sBytes.Length);
+            Array.Clear(result, 0, result.Length);
             return tag;
         }
 
@@ -254,25 +282,45 @@ namespace RTMPE.Crypto.Internal
             if (plaintext == null) plaintext = Array.Empty<byte>();
             if (aad       == null) aad = Array.Empty<byte>();
 
-            // 1. Derive one-time Poly1305 key from block counter 0 (first 32 bytes).
-            var block0 = new byte[64];
-            ChaCha20Block(key, 0, nonce, block0);
-            var poly1305Key = new byte[32];
-            Buffer.BlockCopy(block0, 0, poly1305Key, 0, 32);
+            // Zeroize working AEAD state on every exit path so an exception
+            // (e.g. OOM allocating the result buffer) does not leave the
+            // Poly1305 one-time key recoverable from heap.  Recovering it
+            // would let an attacker forge tags for any other plaintext under
+            // the same (key, nonce) pair — RFC 8439 §4 mandates one-time use.
+            byte[] block0      = null;
+            byte[] poly1305Key = null;
+            byte[] polyInput   = null;
+            try
+            {
+                // 1. Derive one-time Poly1305 key from block counter 0 (first 32 bytes).
+                block0 = new byte[64];
+                ChaCha20Block(key, 0, nonce, block0);
+                poly1305Key = new byte[32];
+                Buffer.BlockCopy(block0, 0, poly1305Key, 0, 32);
 
-            // 2. Encrypt plaintext with ChaCha20 starting at counter 1.
-            var ciphertext = new byte[plaintext.Length];
-            ChaCha20XorKeyStream(key, 1, nonce, plaintext, 0, ciphertext, 0, plaintext.Length);
+                // 2. Encrypt plaintext with ChaCha20 starting at counter 1.
+                var ciphertext = new byte[plaintext.Length];
+                ChaCha20XorKeyStream(key, 1, nonce, plaintext, 0, ciphertext, 0, plaintext.Length);
 
-            // 3. Compute Poly1305 MAC over: AAD || pad16 || ciphertext || pad16 || lengths.
-            var polyInput = BuildPolyInput(aad, aad.Length, ciphertext, ciphertext.Length);
-            var tag = Poly1305Mac(polyInput, 0, polyInput.Length, poly1305Key);
+                // 3. Compute Poly1305 MAC over: AAD || pad16 || ciphertext || pad16 || lengths.
+                polyInput = BuildPolyInput(aad, aad.Length, ciphertext, ciphertext.Length);
+                var tag = Poly1305Mac(polyInput, 0, polyInput.Length, poly1305Key);
 
-            // 4. Return ciphertext || tag.
-            var result = new byte[ciphertext.Length + 16];
-            Buffer.BlockCopy(ciphertext, 0, result, 0, ciphertext.Length);
-            Buffer.BlockCopy(tag, 0, result, ciphertext.Length, 16);
-            return result;
+                // 4. Return ciphertext || tag.
+                var result = new byte[ciphertext.Length + 16];
+                Buffer.BlockCopy(ciphertext, 0, result, 0, ciphertext.Length);
+                Buffer.BlockCopy(tag, 0, result, ciphertext.Length, 16);
+                return result;
+            }
+            finally
+            {
+                if (block0      != null) Array.Clear(block0,      0, block0.Length);
+                if (poly1305Key != null) Array.Clear(poly1305Key, 0, poly1305Key.Length);
+                // polyInput contains AAD + ciphertext (already-on-the-wire
+                // data — not secret) but keeping the buffer alive serves no
+                // purpose; clear it for symmetry with the secret material.
+                if (polyInput   != null) Array.Clear(polyInput,   0, polyInput.Length);
+            }
         }
 
         /// <summary>
@@ -289,23 +337,40 @@ namespace RTMPE.Crypto.Internal
 
             int ctLen = ciphertextWithTag.Length - 16;
 
-            // Derive one-time Poly1305 key.
-            var block0 = new byte[64];
-            ChaCha20Block(key, 0, nonce, block0);
-            var poly1305Key = new byte[32];
-            Buffer.BlockCopy(block0, 0, poly1305Key, 0, 32);
+            // Zeroize working AEAD state on every exit path (success, MAC
+            // failure, or exception in any of the helper allocations) so a
+            // throw cannot leave Poly1305 one-time keys recoverable from heap.
+            byte[] block0      = null;
+            byte[] poly1305Key = null;
+            byte[] polyInput   = null;
+            byte[] expectedTag = null;
+            try
+            {
+                // Derive one-time Poly1305 key.
+                block0 = new byte[64];
+                ChaCha20Block(key, 0, nonce, block0);
+                poly1305Key = new byte[32];
+                Buffer.BlockCopy(block0, 0, poly1305Key, 0, 32);
 
-            // Verify tag before decrypting (authenticate-then-decrypt).
-            var polyInput = BuildPolyInput(aad, aad.Length, ciphertextWithTag, ctLen);
-            var expectedTag = Poly1305Mac(polyInput, 0, polyInput.Length, poly1305Key);
+                // Verify tag before decrypting (authenticate-then-decrypt).
+                polyInput = BuildPolyInput(aad, aad.Length, ciphertextWithTag, ctLen);
+                expectedTag = Poly1305Mac(polyInput, 0, polyInput.Length, poly1305Key);
 
-            if (!ConstantTimeEquals(expectedTag, 0, ciphertextWithTag, ctLen, 16))
-                return null; // MAC verification failed — reject
+                if (!ConstantTimeEquals(expectedTag, 0, ciphertextWithTag, ctLen, 16))
+                    return null; // MAC verification failed — reject
 
-            // Decrypt.
-            var plaintext = new byte[ctLen];
-            ChaCha20XorKeyStream(key, 1, nonce, ciphertextWithTag, 0, plaintext, 0, ctLen);
-            return plaintext;
+                // Decrypt.
+                var plaintext = new byte[ctLen];
+                ChaCha20XorKeyStream(key, 1, nonce, ciphertextWithTag, 0, plaintext, 0, ctLen);
+                return plaintext;
+            }
+            finally
+            {
+                if (block0      != null) Array.Clear(block0,      0, block0.Length);
+                if (poly1305Key != null) Array.Clear(poly1305Key, 0, poly1305Key.Length);
+                if (expectedTag != null) Array.Clear(expectedTag, 0, expectedTag.Length);
+                if (polyInput   != null) Array.Clear(polyInput,   0, polyInput.Length);
+            }
         }
 
         // ── Helpers ───────────────────────────────────────────────────────────

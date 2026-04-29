@@ -2,22 +2,31 @@
 //
 // Client-side orchestrator for the four-step ECDH handshake:
 //
-//   Round 1 (client → server):
-//     HandshakeInit: [nonce:12][ChaCha20-Poly1305([key_len:2][key:N])] encrypted with PSK
+//  Round 1 (client → server):
+//    HandshakeInit: [nonce:12][ChaCha20-Poly1305([key_len:2][key:N])] encrypted with PSK
 //
-//   Round 1 reply (server → client):
-//     Challenge: [server_ephemeral_pub:32][server_static_pub:32][ed25519_sig:64] = 128 B
+//  Round 1 reply (server → client):
+//    Challenge: [server_ephemeral_pub:32][server_static_pub:32][ed25519_sig:64] = 128 B
 //
-//   Round 2 (client → server):
-//     HandshakeResponse: [client_ephemeral_pub:32]
+//  Round 2 (client → server):
+//    HandshakeResponse: [client_ephemeral_pub:32]
 //
-//   Round 2 reply (server → client):
-//     SessionAck: [crypto_id:4 LE][jwt_len:2 LE][jwt:N][rc_len:2 LE][reconnect:R]
+//  Round 2 reply (server → client):
+//    SessionAck: [crypto_id:4 LE][jwt_len:2 LE][jwt:N][rc_len:2 LE][reconnect:R]
 //
 // After receiving Challenge, the client:
-//   1. Verifies the Ed25519 signature: Verify(server_static_pub, server_ephemeral_pub, sig)
-//   2. Performs X25519: SharedSecret(client_private, server_ephemeral_pub)
-//   3. Derives directional SessionKeys via HKDF-SHA256
+//  1. Recomputes the canonical handshake transcript (see HandshakeTranscript)
+//     and verifies the Ed25519 signature against the 32-byte transcript hash.
+//  2. Performs X25519: SharedSecret(client_private, server_ephemeral_pub)
+//  3. Derives directional SessionKeys via HKDF-SHA256
+//
+// Channel binding: the signature is verified over the canonical transcript
+// hash, not the bare ephemeral public key.  The transcript binds protocol
+// version, cipher-suite identifier, server static public key, server
+// ephemeral public key, and SHA-256(HandshakeInit ciphertext).  This closes:
+//  • cross-session replay (different HandshakeInit → different transcript),
+//  • version downgrade   (forged version byte    → different transcript),
+//  • cipher-suite downgrade (forged suite id      → different transcript).
 //
 // HandshakeHandler implements IDisposable.  Dispose() zeros the ephemeral
 // private key and the server ephemeral public key in-place, reducing the
@@ -25,6 +34,7 @@
 // The caller (NetworkManager) disposes this handler on disconnect.
 
 using System;
+using System.Security.Cryptography;
 using System.Text;
 using RTMPE.Crypto.Internal;
 
@@ -41,6 +51,41 @@ namespace RTMPE.Crypto
         // HKDF constants must match the gateway exactly.
         private static readonly byte[] HkdfSalt = Encoding.ASCII.GetBytes("RTMPE-v3-hkdf-salt-2026");
         private static readonly byte[] HkdfInfoBase = Encoding.ASCII.GetBytes("RTMPE-v3-session-key");
+
+        // ── Handshake-transcript binding constants  ────────────────
+        //
+       // These MUST match `modules/gateway/src/crypto/server_auth.rs` exactly,
+        // byte for byte.  Any divergence silently breaks server authentication.
+
+        /// <summary>
+        /// Current handshake protocol version.  Embedded as the first variable
+        /// byte of the transcript so a downgrade attempt yields a different
+        /// hash and an invalid signature.
+        /// </summary>
+        public const byte HandshakeProtocolVersion = 0x02;
+
+        /// <summary>
+        /// Cipher-suite identifier:
+        /// X25519 + ChaCha20-Poly1305 + Ed25519 + HKDF-SHA256.
+        /// </summary>
+        public const byte CipherSuiteId = 0x01;
+
+        /// <summary>
+        /// 30-byte domain-separation tag (29-char ASCII label + NUL byte).
+        /// The NUL terminator prevents prefix collisions with any future tag.
+        /// </summary>
+        private static readonly byte[] TranscriptDomainTag =
+            Encoding.ASCII.GetBytes("RTMPE-handshake-v2-transcript\0");
+
+        /// <summary>Length of the client-init-hash slot in the transcript.</summary>
+        private const int ClientInitHashLen = 32;
+
+        /// <summary>
+        /// Sentinel for the client-init-hash slot when there is no inbound
+        /// HandshakeInit ciphertext (reconnect flow).  Replay defence in that
+        /// flow is provided by the single-use reconnect token instead.
+        /// </summary>
+        private static readonly byte[] ClientInitHashAbsent = new byte[ClientInitHashLen];
 
         // ── Per-session ephemeral key pair ───────────────────────────────────
         private readonly byte[] _clientPrivateKey;
@@ -69,13 +114,22 @@ namespace RTMPE.Crypto
         /// <summary>
         /// Validate the 128-byte <c>Challenge</c> payload received from the server.
         ///
-        /// Parses the three fields, verifies the Ed25519 signature,
+       /// Parses the three fields, recomputes the canonical handshake
+        /// transcript, verifies the Ed25519 signature against it,
         /// and stores the server ephemeral public key for <see cref="DeriveSessionKeys"/>.
         ///
-        /// If an optional pinned server public key is provided, it is also
+       /// If an optional pinned server public key is provided, it is also
         /// checked against the key embedded in the Challenge.
         /// </summary>
         /// <param name="challengePayload">128 bytes: [ephemeral:32][static:32][sig:64].</param>
+        /// <param name="handshakeInitCiphertext">
+        /// The exact bytes the client sent in its <c>HandshakeInit</c> packet
+        /// (the encrypted API-key envelope produced by <c>ApiKeyCipher</c>).
+        /// SHA-256 is computed over this slice and bound into the transcript.
+        /// Pass <see langword="null"/> ONLY for the reconnect flow, where there
+        /// is no inbound ciphertext and replay defence is provided by the
+        /// single-use reconnect token instead.
+        /// </param>
         /// <param name="serverEphemeralPub">Receives the server's X25519 ephemeral public key.</param>
         /// <param name="serverStaticPub">Receives the server's Ed25519 static public key.</param>
         /// <param name="pinnedServerStaticPub">
@@ -88,6 +142,7 @@ namespace RTMPE.Crypto
         /// </returns>
         public bool ValidateChallenge(
             byte[] challengePayload,
+            byte[] handshakeInitCiphertext,
             out byte[] serverEphemeralPub,
             out byte[] serverStaticPub,
             byte[] pinnedServerStaticPub = null)
@@ -106,23 +161,45 @@ namespace RTMPE.Crypto
             Buffer.BlockCopy(challengePayload, 32, staticPub, 0, 32);
             Buffer.BlockCopy(challengePayload, 64, sig,       0, 64);
 
-            // Pinning check: if the developer has pinned the server public key,
-            // reject the connection if the embedded key doesn't match.
+            // Deterministic-work validation: every failure path does roughly
+            // the same amount of work, so a passive observer cannot tell
+            // "pin mismatch" from "signature failure" by response time.
             //
-            // Constant-time comparison: although both keys are technically public,
-            // an early-exit byte-by-byte compare leaks the prefix of the pinned
-            // key via response-time timing.  Using a constant-time accumulator
-            // closes that side-channel at zero perf cost (32 iterations).
+           // Concretely: we ALWAYS run the (expensive) Ed25519 verify, even
+            // when the pinning check has already failed.  The cost of an extra
+            // signature verification on a rejected challenge is negligible
+            // (it happens at most once per failed connection attempt) and
+            // closes a meaningful side-channel — without it, an attacker who
+            // pins their own key on the client could probe the legitimate
+            // server's static key prefix by measuring how quickly the client
+            // bails out.
+            bool pinOk = true;
             if (pinnedServerStaticPub != null)
             {
-                if (pinnedServerStaticPub.Length != 32) return false;
-                if (!ConstantTimeEquals(pinnedServerStaticPub, staticPub)) return false;
+                pinOk = pinnedServerStaticPub.Length == 32
+                     && ConstantTimeEquals(pinnedServerStaticPub, staticPub);
             }
 
-            // Verify the Ed25519 signature of the ephemeral key.
-            // The server signs: sign(server_static_priv, server_ephemeral_pub)
-            if (!Ed25519Verify.Verify(staticPub, ephemeral, sig))
-                return false;
+            // Compute the canonical 32-byte client_init_hash:
+            //  • init flow:      SHA-256(HandshakeInit ciphertext bytes)
+            //  • reconnect flow: 32 × 0x00 (the absent-sentinel agreed with
+            //                    the gateway in `CLIENT_INIT_HASH_ABSENT`).
+            byte[] clientInitHash = handshakeInitCiphertext != null
+                ? Sha256(handshakeInitCiphertext)
+                : ClientInitHashAbsent;
+
+            // Reconstruct the transcript byte-for-byte and verify the
+            // Ed25519 signature against it (always — see comment above).
+            byte[] transcript = ComputeTranscript(
+                staticPub,
+                ephemeral,
+                clientInitHash,
+                HandshakeProtocolVersion,
+                CipherSuiteId);
+
+            bool sigOk = Ed25519Verify.Verify(staticPub, transcript, sig);
+
+            if (!pinOk || !sigOk) return false;
 
             _serverEphemeralPub = ephemeral;
             serverEphemeralPub  = ephemeral;
@@ -130,11 +207,54 @@ namespace RTMPE.Crypto
             return true;
         }
 
+        // ── Transcript construction ────────────────────────────────
+
+        /// <summary>
+        /// Compute the canonical 32-byte handshake transcript hash.
+        ///
+       /// MUST match <c>ServerAuthenticator::compute_transcript</c> in the
+        /// Rust gateway byte-for-byte.  Layout (98-byte pre-image):
+        ///  [0  .. 30) TranscriptDomainTag
+        ///  [30 .. 31) protocol_version
+        ///  [31 .. 32) cipher_suite_id
+        ///  [32 .. 64) server_static_pub
+        ///  [64 .. 96) server_ephemeral_pub
+        ///  [96 ..128) client_init_hash
+        /// All fields are fixed-width — the layout is unambiguous without
+        /// length prefixes.
+        /// </summary>
+        internal static byte[] ComputeTranscript(
+            byte[] serverStaticPub,
+            byte[] serverEphemeralPub,
+            byte[] clientInitHash,
+            byte protocolVersion,
+            byte cipherSuiteId)
+        {
+            const int Size = 30 + 1 + 1 + 32 + 32 + ClientInitHashLen;
+            var buf = new byte[Size];
+            int o = 0;
+            Buffer.BlockCopy(TranscriptDomainTag, 0, buf, o, TranscriptDomainTag.Length);
+            o += TranscriptDomainTag.Length;
+            buf[o++] = protocolVersion;
+            buf[o++] = cipherSuiteId;
+            Buffer.BlockCopy(serverStaticPub,    0, buf, o, 32); o += 32;
+            Buffer.BlockCopy(serverEphemeralPub, 0, buf, o, 32); o += 32;
+            Buffer.BlockCopy(clientInitHash,     0, buf, o, ClientInitHashLen);
+
+            return Sha256(buf);
+        }
+
+        private static byte[] Sha256(byte[] input)
+        {
+            using var sha = SHA256.Create();
+            return sha.ComputeHash(input);
+        }
+
         /// <summary>
         /// Complete the X25519 ECDH and derive directional session keys + IP migration key
         /// via HKDF-SHA256.
         ///
-        /// Must be called after <see cref="ValidateChallenge"/> succeeds.
+       /// Must be called after <see cref="ValidateChallenge"/> succeeds.
         /// Returns <see langword="null"/> if the ECDH shared secret is degenerate (all-zero).
         /// </summary>
         /// <param name="ipMigrationKey">
@@ -155,11 +275,15 @@ namespace RTMPE.Crypto
             var sharedSecret = Curve25519.SharedSecret(_clientPrivateKey, _serverEphemeralPub);
             if (sharedSecret == null) return null; // degenerate key — reject
 
-            SessionKeys result = null;
-            byte[] prk      = null;
-            byte[] keyInit  = null;
-            byte[] keyResp  = null;
-            bool   committed = false;
+            SessionKeys result   = null;
+            byte[] prk           = null;
+            byte[] keyInit       = null;
+            byte[] keyResp       = null;
+            byte[] info          = null;
+            byte[] infoInit      = null;
+            byte[] infoResp      = null;
+            byte[] infoMig       = null;
+            bool   committed     = false;
             try
             {
                 // Determine which side is the "initiator" (smaller public key).
@@ -170,7 +294,7 @@ namespace RTMPE.Crypto
                     ? (_clientPublicKey, _serverEphemeralPub)
                     : (_serverEphemeralPub, _clientPublicKey);
 
-                var info = new byte[HkdfInfoBase.Length + 32 + 32];
+                info = new byte[HkdfInfoBase.Length + 32 + 32];
                 Buffer.BlockCopy(HkdfInfoBase, 0, info, 0,                   HkdfInfoBase.Length);
                 Buffer.BlockCopy(first,        0, info, HkdfInfoBase.Length, 32);
                 Buffer.BlockCopy(second,       0, info, HkdfInfoBase.Length + 32, 32);
@@ -179,20 +303,20 @@ namespace RTMPE.Crypto
                 prk = HkdfSha256.Extract(HkdfSalt, sharedSecret);
 
                 // HKDF-Expand × 3:
-                //   info+\x00 → initiator AEAD key
-                //   info+\x01 → responder AEAD key
-                //   info+\x02 → IP migration HMAC key (N-8)
-                var infoInit = new byte[info.Length + 1];
+                //  info+\x00 → initiator AEAD key
+                //  info+\x01 → responder AEAD key
+                //  info+\x02 → IP migration HMAC key (N-8)
+                infoInit = new byte[info.Length + 1];
                 Buffer.BlockCopy(info, 0, infoInit, 0, info.Length);
                 infoInit[info.Length] = 0x00;
                 keyInit = HkdfSha256.Expand(prk, infoInit, 32);
 
-                var infoResp = new byte[info.Length + 1];
+                infoResp = new byte[info.Length + 1];
                 Buffer.BlockCopy(info, 0, infoResp, 0, info.Length);
                 infoResp[info.Length] = 0x01;
                 keyResp = HkdfSha256.Expand(prk, infoResp, 32);
 
-                var infoMig = new byte[info.Length + 1];
+                infoMig = new byte[info.Length + 1];
                 Buffer.BlockCopy(info, 0, infoMig, 0, info.Length);
                 infoMig[info.Length] = 0x02;
                 ipMigrationKey = HkdfSha256.Expand(prk, infoMig, 32);
@@ -209,7 +333,14 @@ namespace RTMPE.Crypto
             finally
             {
                 Array.Clear(sharedSecret, 0, sharedSecret.Length);
-                if (prk != null) Array.Clear(prk, 0, prk.Length);
+                if (prk     != null) Array.Clear(prk,     0, prk.Length);
+                // The info buffers contain ephemeral public-key material.
+                // Clearing them limits the window during which a heap dump
+                // could recover per-session identifiers.
+                if (info    != null) Array.Clear(info,    0, info.Length);
+                if (infoInit != null) Array.Clear(infoInit, 0, infoInit.Length);
+                if (infoResp != null) Array.Clear(infoResp, 0, infoResp.Length);
+                if (infoMig  != null) Array.Clear(infoMig,  0, infoMig.Length);
                 // If an exception interrupted derivation after one or more
                 // directional keys were expanded, the caller never received
                 // them and they must be wiped from memory.  Once `committed`
@@ -249,16 +380,27 @@ namespace RTMPE.Crypto
 
         /// <summary>
         /// Constant-time equality of two equal-length byte arrays.
-        /// Returns true iff every byte matches, taking the same number of
-        /// operations regardless of where (or whether) a difference exists.
         /// </summary>
         /// <remarks>
+        /// <para>
         /// Used for the pinned server public key check.  Even though pinned
         /// public keys are not secret in the cryptographic sense, an early-exit
-        /// compare leaks the matched prefix length via timing — a passive
-        /// observer learning "first byte differs" vs. "first 16 bytes match"
-        /// could brute-force the pinned key offline.  Constant-time closes
-        /// that side-channel.
+        /// per-byte compare leaks the matched prefix length via timing — a
+        /// passive observer learning "first byte differs" vs. "first 16 bytes
+        /// match" could brute-force the pinned key offline.  Constant-time
+        /// closes that side-channel.
+        /// </para>
+        /// <para>
+        /// <b>Length handling:</b> when <paramref name="a"/> and
+        /// <paramref name="b"/> differ in length the method returns
+        /// <see langword="false"/> immediately, without scanning either input.
+        /// This is intentional: in every RTMPE call site both inputs are
+        /// fixed-size (32-byte public keys, 16-byte MACs) — the lengths are
+        /// public protocol constants, not secrets — so revealing a
+        /// length mismatch leaks no useful information.  When the lengths
+        /// match (the common case) the body runs a constant number of
+        /// XOR-OR operations regardless of where a difference occurs.
+        /// </para>
         /// </remarks>
         internal static bool ConstantTimeEquals(byte[] a, byte[] b)
         {

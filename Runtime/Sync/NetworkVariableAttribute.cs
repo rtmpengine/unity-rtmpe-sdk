@@ -5,7 +5,7 @@
 // Primary use case: per-variable bandwidth throttling.  By default every dirty
 // NetworkVariable is flushed at the global tick cadence (NetworkManager
 // VariableFlushInterval = 30 Hz).  Marking a field with
-//   [NetworkVariable(SendRateHz = 10f)]
+//  [NetworkVariable(SendRateHz = 10f)]
 // caps that variable's outbound rate at 10 Hz independently of its siblings,
 // reducing bandwidth for values that change frequently but only need slow
 // synchronisation (health bars, ammo counts, kill streaks, …).
@@ -31,25 +31,25 @@ namespace RTMPE.Sync
     /// Optional metadata for a <see cref="NetworkVariableBase"/>-typed field or
     /// property declared on a <see cref="RTMPE.Core.NetworkBehaviour"/>.
     ///
-    /// <para>Currently supports per-variable send-rate throttling via
+   /// <para>Currently supports per-variable send-rate throttling via
     /// <see cref="SendRateHz"/>.  Future extensions (e.g. relevancy filters,
     /// reliability hints) will live on this same attribute to avoid stacking
     /// multiple custom attributes on a single declaration.</para>
     ///
-    /// <example>
+   /// <example>
     /// <code>
     /// public sealed class PlayerStats : NetworkBehaviour
     /// {
-    ///     // 30 Hz default — used by transform-style values that need smooth interpolation.
-    ///     public NetworkVariableVector3 velocity;
+    ///    // 30 Hz default — used by transform-style values that need smooth interpolation.
+    ///    public NetworkVariableVector3 velocity;
     ///
-    ///     // 10 Hz — health changes are visually discrete; saves ~66 % bandwidth.
-    ///     [NetworkVariable(SendRateHz = 10f)]
-    ///     public NetworkVariableInt health;
+   ///    // 10 Hz — health changes are visually discrete; saves ~66 % bandwidth.
+    ///    [NetworkVariable(SendRateHz = 10f)]
+    ///    public NetworkVariableInt health;
     ///
-    ///     // 2 Hz — cosmetic counter; minimal bandwidth.
-    ///     [NetworkVariable(SendRateHz = 2f)]
-    ///     public NetworkVariableInt killStreak;
+   ///    // 2 Hz — cosmetic counter; minimal bandwidth.
+    ///    [NetworkVariable(SendRateHz = 2f)]
+    ///    public NetworkVariableInt killStreak;
     /// }
     /// </code>
     /// </example>
@@ -62,7 +62,7 @@ namespace RTMPE.Sync
         /// <summary>
         /// Maximum send rate in updates per second for this variable.
         ///
-        /// <para>A value of <c>0</c> (the default) means "use the global flush
+       /// <para>A value of <c>0</c> (the default) means "use the global flush
         /// cadence" — currently 30 Hz, configured by
         /// <c>NetworkManager.VariableFlushInterval</c>.  Any positive value
         /// independently throttles this variable to at most one send per
@@ -71,7 +71,7 @@ namespace RTMPE.Sync
         /// preserved when a flush is skipped) but they are coalesced into the
         /// next eligible send window.</para>
         ///
-        /// <para>Negative values are clamped to <c>0</c> (treated as "use
+       /// <para>Negative values are clamped to <c>0</c> (treated as "use
         /// default") with a one-line warning at registration time.  Values
         /// above <c>NetworkManager.VariableFlushInterval</c>'s implied ceiling
         /// (30 Hz) are accepted but cannot exceed the global tick rate — the

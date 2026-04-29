@@ -9,18 +9,18 @@
 // without pulling in a general-purpose JSON library.
 //
 // Wire shape (matches the Go server's RoomPropertyUpdatePayload):
-//   {
-//     "version": 3,
-//     "properties": {
-//       "GameMode": {"type":"string","value":"TDM"},
-//       "MaxScore": {"type":"int","value":100}
-//     }
-//   }
+//  {
+//    "version": 3,
+//    "properties": {
+//      "GameMode": {"type":"string","value":"TDM"},
+//      "MaxScore": {"type":"int","value":100}
+//    }
+//  }
 //
 // PlayerPropertyUpdatePayload additionally has a top-level "player_id":"…".
 //
 // Type-discriminator strings match exactly:
-//   int | float | bool | string | bytes | vector3 | color
+//  int | float | bool | string | bytes | vector3 | color
 
 using System;
 using System.Collections.Generic;
@@ -39,7 +39,7 @@ namespace RTMPE.Rooms
     {
         // ─── Type-tag constants ────────────────────────────────────────────
         //
-        // These MUST match `entities.PropertyType*` strings in the Go server.
+       // These MUST match `entities.PropertyType*` strings in the Go server.
         // Any rename here must happen simultaneously on both sides.
 
         internal const string TagInt     = "int";
@@ -207,7 +207,7 @@ namespace RTMPE.Rooms
 
         // ─── Decode ────────────────────────────────────────────────────────
         //
-        // Minimal recursive-descent parser — sufficient for the property
+       // Minimal recursive-descent parser — sufficient for the property
         // payload shape above.  Rejects malformed input with
         // FormatException carrying an actionable error message.
 
@@ -379,7 +379,7 @@ namespace RTMPE.Rooms
                 case TagInt:
                     return PropertyValue.OfInt(int.Parse(raw, CultureInfo.InvariantCulture));
                 case TagFloat:
-                    return PropertyValue.OfFloat(float.Parse(raw, CultureInfo.InvariantCulture));
+                    return PropertyValue.OfFloat(ParseFiniteFloat(raw));
                 case TagBool:
                     if (raw == "true")  return PropertyValue.OfBool(true);
                     if (raw == "false") return PropertyValue.OfBool(false);
@@ -418,9 +418,32 @@ namespace RTMPE.Rooms
             var result = new float[expected];
             for (int i = 0; i < expected; i++)
             {
-                result[i] = float.Parse(parts[i].Trim(), CultureInfo.InvariantCulture);
+                result[i] = ParseFiniteFloat(parts[i].Trim());
             }
             return result;
+        }
+
+        // Non-finite values (NaN, +/-Infinity) flow into Unity Transforms and
+        // PhysX where a single poisoned component triggers broad system
+        // collapse — colliders detach, rigidbodies sleep with corrupt state,
+        // and downstream gameplay code reads NaN positions for many frames
+        // before the engine notices.  Rejecting at the parse boundary keeps
+        // the blast radius local to the inbound packet handler, which
+        // already catches FormatException and discards the offending update.
+        private static float ParseFiniteFloat(string raw)
+        {
+            float v = float.Parse(raw, CultureInfo.InvariantCulture);
+            if (!IsFinite(v))
+                throw new FormatException("PropertyJson: non-finite float rejected: " + raw);
+            return v;
+        }
+
+        // .NET Standard 2.1 has float.IsFinite, but Unity's older runtime
+        // targets do not always expose it — implement explicitly so the SDK
+        // compiles unchanged across every supported Unity version.
+        private static bool IsFinite(float v)
+        {
+            return !float.IsNaN(v) && !float.IsInfinity(v);
         }
 
         // ─── Parser primitives ─────────────────────────────────────────────
@@ -473,17 +496,17 @@ namespace RTMPE.Rooms
 
                                 // UTF-16 surrogate pair handling.
                                 //
-                                // Characters above U+FFFF must be encoded as a
+                               // Characters above U+FFFF must be encoded as a
                                 // high-surrogate (0xD800-0xDBFF) followed by a
                                 // low-surrogate (0xDC00-0xDFFF).  A bare
                                 // surrogate (unpaired) is RFC 8259 §7-invalid
                                 // in strict mode, but many producers emit them
                                 // — we therefore:
-                                //   1. Combine a valid pair into one char pair
-                                //      (which StringBuilder stores correctly).
-                                //   2. Append a bare high-surrogate as-is to
-                                //      preserve round-trip identity with the
-                                //      Unicode replacement-character rule.
+                                //  1. Combine a valid pair into one char pair
+                                //     (which StringBuilder stores correctly).
+                                //  2. Append a bare high-surrogate as-is to
+                                //     preserve round-trip identity with the
+                                //     Unicode replacement-character rule.
                                 if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF)
                                 {
                                     // High-surrogate — peek for an immediately
@@ -538,48 +561,92 @@ namespace RTMPE.Rooms
             return int.Parse(s.Substring(start, pos - start), CultureInfo.InvariantCulture);
         }
 
+        // Brace counts inside string literals must not affect structural depth;
+        // otherwise a value containing JSON-meaningful characters silently
+        // truncates the parse and leaves the outer reader positioned mid-value
+        // — which then desynchronises every subsequent key/value pair in the
+        // enclosing object.  Dispatch by leading character to the value-type
+        // readers (which already understand string-escape rules) instead of
+        // running a naive byte-level brace counter that cannot tell a closing
+        // brace inside `"a}b"` from a real terminator.
         private static void SkipValue(string s, ref int pos)
         {
             SkipWhitespace(s, ref pos);
             if (pos >= s.Length)
                 throw new FormatException("PropertyJson: unexpected EOF");
             char c = s[pos];
-            if (c == '"')
+            switch (c)
             {
-                int tmp = pos;
-                ReadString(s, ref tmp);
-                pos = tmp;
-                return;
-            }
-            if (c == '{' || c == '[')
-            {
-                char open = c, close = (c == '{') ? '}' : ']';
-                int depth = 0;
-                while (pos < s.Length)
+                case '"':
                 {
-                    char cur = s[pos];
-                    if (cur == '"')
-                    {
-                        int tmp = pos;
-                        ReadString(s, ref tmp);
-                        pos = tmp;
-                        continue;
-                    }
-                    if (cur == open)  depth++;
-                    if (cur == close) { depth--; if (depth == 0) { pos++; return; } }
-                    pos++;
+                    // ReadString consumes the opening quote, every escape, and
+                    // the closing quote — leaving pos one past the literal.
+                    ReadString(s, ref pos);
+                    return;
                 }
-                throw new FormatException("PropertyJson: unterminated collection");
+                case '{':
+                case '[':
+                {
+                    SkipStructured(s, ref pos);
+                    return;
+                }
+                default:
+                {
+                    // Primitive: number, true/false/null.  Stop at any character
+                    // that JSON treats as a value terminator.  The inbound payload
+                    // is validated downstream when the captured slice is actually
+                    // parsed as a typed value, so a permissive scan here is safe.
+                    while (pos < s.Length)
+                    {
+                        char cur = s[pos];
+                        if (cur == ',' || cur == '}' || cur == ']' ||
+                            cur == ' ' || cur == '\t' || cur == '\n' || cur == '\r')
+                            break;
+                        pos++;
+                    }
+                    return;
+                }
             }
-            // Primitive: read until , } ] whitespace
+        }
+
+        // Skip a balanced JSON object or array starting at `s[pos]`.  Tracks
+        // whether the cursor is inside a string literal — and, while inside,
+        // honours backslash escapes — so a `{`, `}`, `[`, or `]` appearing
+        // inside `"..."` cannot perturb the structural-depth counter.
+        private static void SkipStructured(string s, ref int pos)
+        {
+            // The expected closer is set once from the leading delimiter so a
+            // mismatched closing token surfaces a precise FormatException
+            // rather than running off the end of the buffer.
+            char close = (s[pos] == '{') ? '}' : ']';
+            int depth = 0;
             while (pos < s.Length)
             {
                 char cur = s[pos];
-                if (cur == ',' || cur == '}' || cur == ']' ||
-                    cur == ' ' || cur == '\t' || cur == '\n' || cur == '\r')
-                    break;
+                if (cur == '"')
+                {
+                    // Delegate to the canonical string reader so escape rules
+                    // (including \" and the \uXXXX surrogate machinery) match
+                    // exactly the parse that ReadString itself would perform.
+                    ReadString(s, ref pos);
+                    continue;
+                }
+                if (cur == '{' || cur == '[') depth++;
+                else if (cur == '}' || cur == ']')
+                {
+                    depth--;
+                    if (depth == 0)
+                    {
+                        if (cur != close)
+                            throw new FormatException(
+                                $"PropertyJson: mismatched '{cur}' at {pos} (expected '{close}')");
+                        pos++;
+                        return;
+                    }
+                }
                 pos++;
             }
+            throw new FormatException("PropertyJson: unterminated collection");
         }
     }
 }

@@ -16,26 +16,25 @@
 
 // There are three conditional compilation symbols that have an impact on performance/features of this ByteBuffer implementation.
 //
-//      UNSAFE_BYTEBUFFER
-//          This will use unsafe code to manipulate the underlying byte array. This
-//          can yield a reasonable performance increase.
+//     UNSAFE_BYTEBUFFER
+//         This will use unsafe code to manipulate the underlying byte array. This
+//         can yield a reasonable performance increase.
 //
-//      BYTEBUFFER_NO_BOUNDS_CHECK
-//          This will disable the bounds check asserts to the byte array. This can
-//          yield a small performance gain in normal code.
+//     BYTEBUFFER_NO_BOUNDS_CHECK
+//         This will disable the bounds check asserts to the byte array. This can
+//         yield a small performance gain in normal code.
 //
-//      ENABLE_SPAN_T
-//          This will enable reading and writing blocks of memory with a Span<T> instead of just
-//          T[].  You can also enable writing directly to shared memory or other types of memory
-//          by providing a custom implementation of ByteBufferAllocator.
-//          ENABLE_SPAN_T also requires UNSAFE_BYTEBUFFER to be defined, or .NET
-//          Standard 2.1.
+//     ENABLE_SPAN_T
+//         This will enable reading and writing blocks of memory with a Span<T> instead of just
+//         T[].  You can also enable writing directly to shared memory or other types of memory
+//         by providing a custom implementation of ByteBufferAllocator.
+//         ENABLE_SPAN_T also requires UNSAFE_BYTEBUFFER to be defined, or .NET
+//         Standard 2.1.
 //
 // Using UNSAFE_BYTEBUFFER and BYTEBUFFER_NO_BOUNDS_CHECK together can yield a
 // performance gain of ~15% for some operations, however doing so is potentially
 // dangerous. Do so at your own risk!
 //
-
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -222,7 +221,10 @@ namespace Google.FlatBuffers
         /// <returns>The number of bytes the array takes on wire</returns>
         public static int ArraySize<T>(T[] x)
         {
-            return SizeOf<T>() * x.Length;
+            // Local hardening over upstream: `checked` so a sufficiently large
+            // T[] does not silently wrap to a small positive byte count and
+            // alias the AssertOffsetAndLength range guard at the call site.
+            return checked(SizeOf<T>() * x.Length);
         }
 
         /// <summary>
@@ -234,13 +236,15 @@ namespace Google.FlatBuffers
         /// <returns>The number of bytes the array segment takes on wire</returns>
         public static int ArraySize<T>(ArraySegment<T> x)
         {
-            return SizeOf<T>() * x.Count;
+            // Local hardening over upstream: see ArraySize(T[]) note.
+            return checked(SizeOf<T>() * x.Count);
         }
 
 #if ENABLE_SPAN_T && UNSAFE_BYTEBUFFER
         public static int ArraySize<T>(Span<T> x)
         {
-            return SizeOf<T>() * x.Length;
+            // Local hardening over upstream: see ArraySize(T[]) note.
+            return checked(SizeOf<T>() * x.Length);
         }
 #endif
 
@@ -450,32 +454,59 @@ namespace Google.FlatBuffers
 
         private void AssertOffsetAndLength(int offset, int length)
         {
-#if !BYTEBUFFER_NO_BOUNDS_CHECK
-            if (offset < 0 ||
-                offset > _buffer.Length - length)
+            // Local hardening over upstream: even when BYTEBUFFER_NO_BOUNDS_CHECK
+            // is defined we keep a minimal in-buffer check. The upstream guard
+            // was meant as a perf knob for trusted producers, but compiling
+            // it out leaves an unconditional out-of-buffer read primitive on
+            // a build that handles untrusted bytes from the network. The
+            // strict bounds check (e.g. multiple-of-T validation in
+            // ConvertBytesToTs) remains gated by the original flag; only the
+            // raw range guard is unconditional.
+            if (offset < 0 || length < 0 || offset > _buffer.Length - length)
+            {
                 throw new ArgumentOutOfRangeException();
-#endif
+            }
         }
 
         public static int ConvertTsToBytes<T>(int valueInTs)
             where T : struct
         {
             var sizeOfT = SizeOf<T>();
-            var valueInBytes = valueInTs * sizeOfT;
-            return valueInBytes;
+            // Local hardening over upstream: a wraparound on the typed-element
+            // multiply would let a hostile payload claim N elements whose byte
+            // size silently aliases a small positive value, which then passes
+            // the buffer-range guard and exposes attacker-controlled bytes
+            // through MemoryMarshal.Cast at the call site. The `checked` block
+            // surfaces the overflow as ArithmeticException, which the receive
+            // wrapper converts into a packet drop.
+            return checked(valueInTs * sizeOfT);
         }
 
         public static int ConvertBytesToTs<T>(int valueInBytes)
             where T : struct
         {
             var sizeOfT = SizeOf<T>();
+            // Local hardening over upstream: the multiple-of-sizeof(T) check
+            // is unconditional. Upstream gates it on BYTEBUFFER_NO_BOUNDS_CHECK
+            // as a perf knob, but compiling it out causes integer division to
+            // silently truncate a non-multiple length and produce a typed array
+            // that ends one or more bytes before the wire payload — the caller
+            // never learns it was handed truncated data. The receive path
+            // accepts adversarial bytes, so this check must fire on every
+            // build. A negative valueInBytes is also rejected here because the
+            // caller's bounds guard (AssertOffsetAndLength) only proves the
+            // start offset; an attacker-supplied negative length would divide
+            // to a non-positive count and bypass downstream allocation sizing.
+            if (valueInBytes < 0)
+            {
+                throw new ArgumentException(
+                    $"{valueInBytes} is not a valid byte length");
+            }
             var valueInTs = valueInBytes / sizeOfT;
-#if !BYTEBUFFER_NO_BOUNDS_CHECK
             if (valueInTs * sizeOfT != valueInBytes)
             {
                 throw new ArgumentException($"{valueInBytes} must be a multiple of SizeOf<{typeof(T).Name}>()={sizeOfT}");
             }
-#endif
             return valueInTs;
         }
 
@@ -762,6 +793,25 @@ namespace Google.FlatBuffers
         }
 #endif
 
+        // Strict UTF-8 decoder used by the hardened Table.__string accessor.
+        // Throws DecoderFallbackException on malformed input rather than
+        // silently substituting U+FFFD, and validates the offset/length
+        // against the buffer regardless of build flags.
+        private static readonly UTF8Encoding s_strictUtf8 =
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+        public string GetStringUTF8Strict(int startPos, int len)
+        {
+            AssertOffsetAndLength(startPos, len);
+#if ENABLE_SPAN_T && UNSAFE_BYTEBUFFER
+            return s_strictUtf8.GetString(_buffer.ReadOnlySpan.Slice(startPos, len));
+#elif ENABLE_SPAN_T
+            return s_strictUtf8.GetString(_buffer.Span.Slice(startPos, len));
+#else
+            return s_strictUtf8.GetString(_buffer.Buffer, startPos, len);
+#endif
+        }
+
 #if UNSAFE_BYTEBUFFER
         // Unsafe but more efficient versions of Get*.
         public short GetShort(int offset)
@@ -987,7 +1037,7 @@ namespace Google.FlatBuffers
                 // if we are BE, we have to swap each element by itself
                 //for(int i = x.Length - 1; i >= 0; i--)
                 //{
-                //  todo: low priority, but need to genericize the Put<T>() functions
+                // todo: low priority, but need to genericize the Put<T>() functions
                 //}
             }
             return offset;
@@ -1047,7 +1097,7 @@ namespace Google.FlatBuffers
                 // if we are BE, we have to swap each element by itself
                 //for(int i = x.Length - 1; i >= 0; i--)
                 //{
-                //  todo: low priority, but need to genericize the Put<T>() functions
+                // todo: low priority, but need to genericize the Put<T>() functions
                 //}
             }
             return offset;
@@ -1083,7 +1133,7 @@ namespace Google.FlatBuffers
                 // if we are BE, we have to swap each element by itself
                 //for(int i = x.Length - 1; i >= 0; i--)
                 //{
-                //  todo: low priority, but need to genericize the Put<T>() functions
+                // todo: low priority, but need to genericize the Put<T>() functions
                 //}
             }
             return offset;

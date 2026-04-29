@@ -2,13 +2,13 @@
 //
 // Regression tests for core SDK functionality:
 //
-//   RoomManagement  — ParseJoinRoomResponse / ParseCreateRoomResponse: localPlayerId
-//   StateSync       — OnDataReceived subscription (state sync receive path)
-//   NetworkVars     — NetworkVariable flush loop (dirty-flag → serialize → send)
-//   RpcProtocol     — IDamageable interface and RPC payload encoding
-//   PacketHandling  — DataAck packet handling
-//   ObjectIdentity  — GenerateObjectId encoding contract
-//   UdpTransport    — UdpTransport IPv6 fallback
+//  RoomManagement  — ParseJoinRoomResponse / ParseCreateRoomResponse: localPlayerId
+//  StateSync       — OnDataReceived subscription (state sync receive path)
+//  NetworkVars     — NetworkVariable flush loop (dirty-flag → serialize → send)
+//  RpcProtocol     — IDamageable interface and RPC payload encoding
+//  PacketHandling  — DataAck packet handling
+//  ObjectIdentity  — GenerateObjectId encoding contract
+//  UdpTransport    — UdpTransport IPv6 fallback
 //
 // Internal members are accessible via [assembly: InternalsVisibleTo("RTMPE.SDK.Tests")].
 
@@ -72,9 +72,9 @@ namespace RTMPE.Tests
         public void JoinResponse_WithLocalPlayerId_Extracts()
         {
             // Wire: [msgKind=0x00][ok=1]
-            //   [room_id][room_code][name][player_count:1][max_players:1][is_public:1]
-            //   [player: player_id][player: display_name][is_host:1][is_ready:1]
-            //   [local_player_id]   ← appended by server v3.1+
+            //  [room_id][room_code][name][player_count:1][max_players:1][is_public:1]
+            //  [player: player_id][player: display_name][is_host:1][is_ready:1]
+            //  [local_player_id]   ← appended by server v3.1+
             var buf = new byte[256];
             int off = 0;
             buf[off++] = 0x00; // Response
@@ -453,8 +453,9 @@ namespace RTMPE.Tests
         public void FlushDirtyVariables_LongString_PayloadCorrectAndClean()
         {
             // 300 ASCII chars: SerializeWithId emits [var_id:2][value_len:2][ushort_prefix:2][utf8:300]
-            // = 306 bytes per variable.  FlushDirtyVariables prepends [object_id:8][count:1] = 9 bytes.
-            // Expected total payload = 9 + 306 = 315 bytes.
+            // = 306 bytes per variable.  FlushDirtyVariables prepends
+            // [object_id:8][tick:4][count:1] = 13 bytes.
+            // Expected total payload = 13 + 306 = 319 bytes.
             var nvs = new NetworkVariableString(_owner, variableId: 5, initialValue: "");
             nvs.Value = new string('Z', 300);
 
@@ -462,11 +463,11 @@ namespace RTMPE.Tests
             _owner.FlushDirtyVariables(p => captured = p);
 
             Assert.IsNotNull(captured, "Payload must not be null.");
-            Assert.AreEqual(315, captured.Length,
-                "Payload: 8 (object_id) + 1 (count) + 2 (var_id) + 2 (value_len) + 2 (ushort str prefix) + 300 (utf8) = 315.");
+            Assert.AreEqual(319, captured.Length,
+                "Payload: 8 (object_id) + 4 (tick) + 1 (count) + 2 (var_id) + 2 (value_len) + 2 (ushort str prefix) + 300 (utf8) = 319.");
 
-            // Verify count byte (offset 8) equals 1 (one dirty variable flushed).
-            Assert.AreEqual((byte)1, captured[8], "count byte must be 1.");
+            // Verify count byte (offset 12) equals 1 (one dirty variable flushed).
+            Assert.AreEqual((byte)1, captured[12], "count byte must be 1.");
 
             // Variable must be clean after flush.
             Assert.IsFalse(nvs.IsDirty, "Variable must be marked clean after FlushDirtyVariables.");
@@ -693,7 +694,7 @@ namespace RTMPE.Tests
     // ════════════════════════════════════════════════════════════════════════
     // SpawnPacketBuilder / SpawnPacketParser — round-trip
     //
-    // Regression for the WriteF32LE/ReadF32LE endian fix: previously
+   // Regression for the WriteF32LE/ReadF32LE endian fix: previously
     // BitConverter.GetBytes(float) / BitConverter.ToSingle() were used, which
     // are platform-endian. The fix uses SingleToInt32Bits + explicit byte
     // extraction (writer) and manual byte assembly + Int32BitsToSingle (reader),
@@ -761,7 +762,7 @@ namespace RTMPE.Tests
     // ════════════════════════════════════════════════════════════════════════
     // SendPositionUpdate — LE encoding round-trip
     //
-    // Regression for the zero-alloc fix: previously BitConverter.GetBytes(float)
+   // Regression for the zero-alloc fix: previously BitConverter.GetBytes(float)
     // was used for both x and y, creating two temporary byte[] allocations per
     // call.  The fix uses SingleToInt32Bits + explicit byte extraction (the same
     // pattern as TransformPacketBuilder.WriteF32LE).  This test verifies that the

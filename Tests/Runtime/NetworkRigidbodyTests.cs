@@ -3,12 +3,12 @@
 // NUnit tests for NetworkRigidbody (3-D physics sync component).
 //
 // Coverage:
-//   GetState()          — default before spawn; captures Rigidbody position/sleep
-//                         after spawn.
-//   ApplyRemoteState()  — verifies partial-mask field merging: only fields whose
-//                         bit is set in changedMask are overwritten; all others
-//                         are preserved from prior calls.
-//   ApplyReconciliation — confirmed to be a no-op (must not throw).
+//  GetState()          — default before spawn; captures Rigidbody position/sleep
+//                        after spawn.
+//  ApplyRemoteState()  — verifies partial-mask field merging: only fields whose
+//                        bit is set in changedMask are overwritten; all others
+//                        are preserved from prior calls.
+//  ApplyReconciliation — confirmed to be a no-op (must not throw).
 //
 // Private fields (_receivedState, _hasReceivedState) are accessed via reflection
 // so that production code carries no test-only surface area.
@@ -250,6 +250,175 @@ namespace RTMPE.Tests.Runtime
 
             Assert.DoesNotThrow(() =>
                 _nrb.ApplyReconciliation(new PhysicsState(), PhysicsPacketBuilder.ChangedPosition));
+        }
+
+        [Test]
+        [Description("Owner reconciliation rejects a server position whose distance " +
+                     "exceeds NetworkSettings.maxServerCorrectionDistance — defends a " +
+                     "Rigidbody owner from a hostile / compromised server attempting " +
+                     "to teleport the local body to an arbitrary location.")]
+        public void ApplyReconciliation_OwnerCap_RejectsTeleport()
+        {
+            // Configure tight server-correction cap.
+            var settings = _manager.Settings;
+            settings.maxServerCorrectionDistance = 5f;
+
+            EnableOwnerReconciliation();
+            _nrb.Initialize(1UL, "local-player");
+            _nrb.SetSpawned(true);
+
+            var rb = _testGo.GetComponent<Rigidbody>();
+            rb.position = Vector3.zero;
+            Vector3 startPos = rb.position;
+
+            // 100m server correction must be rejected (cap = 5m).
+            var hostile = new PhysicsState { Position = new Vector3(100f, 0f, 0f) };
+            _nrb.ApplyReconciliation(hostile, PhysicsPacketBuilder.ChangedPosition);
+
+            Assert.AreEqual(startPos, rb.position,
+                "Position must NOT be teleported when server correction exceeds the cap.");
+        }
+
+        [Test]
+        [Description("Owner reconciliation rejects a server position outside the " +
+                     "configured world-bounds AABB — second-line defence against " +
+                     "out-of-world teleport.")]
+        public void ApplyReconciliation_OwnerCap_RejectsOutOfBounds()
+        {
+            var settings = _manager.Settings;
+            settings.maxServerCorrectionDistance = 10_000f; // disable distance cap
+            settings.worldBoundsEnabled = true;
+            settings.worldBoundsCenter  = Vector3.zero;
+            settings.worldBoundsExtents = new Vector3(10f, 10f, 10f);
+
+            EnableOwnerReconciliation();
+            _nrb.Initialize(1UL, "local-player");
+            _nrb.SetSpawned(true);
+
+            var rb = _testGo.GetComponent<Rigidbody>();
+            rb.position = Vector3.zero;
+            Vector3 startPos = rb.position;
+
+            // Position outside the AABB (|x| = 50 > extents.x = 10).
+            var hostile = new PhysicsState { Position = new Vector3(50f, 0f, 0f) };
+            _nrb.ApplyReconciliation(hostile, PhysicsPacketBuilder.ChangedPosition);
+
+            Assert.AreEqual(startPos, rb.position,
+                "Position must NOT be applied when it lies outside world bounds.");
+        }
+
+        [Test]
+        [Description("Owner reconciliation accepts a server correction within the cap. " +
+                     "The snap is queued for FixedUpdate so the actual _rb.position write " +
+                     "lands on the physics cadence rather than mid-Update.")]
+        public void ApplyReconciliation_OwnerCap_AcceptsValidCorrection()
+        {
+            var settings = _manager.Settings;
+            settings.maxServerCorrectionDistance = 50f;
+            settings.worldBoundsEnabled = false;
+
+            EnableOwnerReconciliation();
+            _nrb.Initialize(1UL, "local-player");
+            _nrb.SetSpawned(true);
+
+            var rb = _testGo.GetComponent<Rigidbody>();
+            rb.position = Vector3.zero;
+
+            // 4m correction is within the 50m cap; ownerReconcileSnapThreshold
+            // default is 3m so this MUST snap to the new position.
+            var ok = new PhysicsState { Position = new Vector3(4f, 0f, 0f) };
+            _nrb.ApplyReconciliation(ok, PhysicsPacketBuilder.ChangedPosition);
+
+            // Pre-FixedUpdate: the snap is QUEUED, not applied.
+            Assert.AreEqual(Vector3.zero, rb.position,
+                "ApplyReconciliation must NOT mutate _rb.position directly — the snap is queued.");
+
+            InvokeFixedUpdate(_nrb);
+
+            Assert.AreEqual(new Vector3(4f, 0f, 0f), rb.position,
+                "FixedUpdate must drain the queued snap and write _rb.position on the physics cadence.");
+        }
+
+        [Test]
+        [Description("ApplyReconciliation followed by FixedUpdate writes the snap exactly once " +
+                     "even if FixedUpdate runs again with no new correction.")]
+        public void ApplyReconciliation_QueueDrains_OnceAndOnly()
+        {
+            var settings = _manager.Settings;
+            settings.maxServerCorrectionDistance = 50f;
+            settings.worldBoundsEnabled = false;
+
+            EnableOwnerReconciliation();
+            _nrb.Initialize(1UL, "local-player");
+            _nrb.SetSpawned(true);
+
+            var rb = _testGo.GetComponent<Rigidbody>();
+            rb.position = Vector3.zero;
+
+            var ok = new PhysicsState { Position = new Vector3(5f, 0f, 0f) };
+            _nrb.ApplyReconciliation(ok, PhysicsPacketBuilder.ChangedPosition);
+
+            InvokeFixedUpdate(_nrb);
+            Assert.AreEqual(new Vector3(5f, 0f, 0f), rb.position);
+
+            // Without a fresh ApplyReconciliation, a subsequent FixedUpdate
+            // must NOT re-apply the previous snap.  Move the body manually to
+            // simulate physics integration; the next FixedUpdate must leave
+            // it where it is (no zombie snap).
+            rb.position = new Vector3(5.5f, 0f, 0f);
+            InvokeFixedUpdate(_nrb);
+
+            Assert.AreEqual(new Vector3(5.5f, 0f, 0f), rb.position,
+                "A drained queue must not re-apply the previous snap on subsequent FixedUpdates.");
+        }
+
+        [Test]
+        [Description("Adversarial: a rejected correction (over the cap) must NOT queue a snap, " +
+                     "so a subsequent FixedUpdate leaves the body alone.")]
+        public void ApplyReconciliation_RejectedCorrection_LeavesQueueEmpty()
+        {
+            var settings = _manager.Settings;
+            settings.maxServerCorrectionDistance = 5f;
+
+            EnableOwnerReconciliation();
+            _nrb.Initialize(1UL, "local-player");
+            _nrb.SetSpawned(true);
+
+            var rb = _testGo.GetComponent<Rigidbody>();
+            rb.position = Vector3.zero;
+
+            // 100m correction — rejected.
+            var hostile = new PhysicsState { Position = new Vector3(100f, 0f, 0f) };
+            _nrb.ApplyReconciliation(hostile, PhysicsPacketBuilder.ChangedPosition);
+
+            InvokeFixedUpdate(_nrb);
+
+            Assert.AreEqual(Vector3.zero, rb.position,
+                "A rejected correction must not queue a snap; FixedUpdate must observe an empty queue.");
+        }
+
+        // Drive the private FixedUpdate(): in Edit-Mode tests Unity does not
+        // run the physics callback automatically, so the test fixture must
+        // invoke it explicitly to simulate the next physics step.
+        private static void InvokeFixedUpdate(NetworkRigidbody nrb)
+        {
+            var mi = typeof(NetworkRigidbody).GetMethod(
+                "FixedUpdate",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.IsNotNull(mi, "Private FixedUpdate not found via reflection.");
+            mi.Invoke(nrb, null);
+        }
+
+        // Helper: flips the [SerializeField] _enableOwnerReconciliation flag via
+        // reflection so the reconciliation path actually executes.  Avoids
+        // adding a test-only public mutator to the production component.
+        private void EnableOwnerReconciliation()
+        {
+            var fi = typeof(NetworkRigidbody).GetField(
+                "_enableOwnerReconciliation",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.IsNotNull(fi);
+            fi.SetValue(_nrb, true);
         }
 
         // ── Reflection helper ─────────────────────────────────────────────────

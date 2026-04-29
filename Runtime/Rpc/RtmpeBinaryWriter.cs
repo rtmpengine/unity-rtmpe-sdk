@@ -5,9 +5,9 @@
 // encoding with the rest of the RPC pipeline.
 //
 // Usage pattern (from RpcSerializer):
-//   var writer = new RtmpeBinaryWriter(buf, offset);
-//   serializable.NetworkSerialize(writer);
-//   bytesWritten = writer.Position - offset;
+//  var writer = new RtmpeBinaryWriter(buf, offset);
+//  serializable.NetworkSerialize(writer);
+//  bytesWritten = writer.Position - offset;
 //
 // The writer assumes buf is already large enough for the payload.  RpcSerializer
 // computes the required size via INetworkSerializable.NetworkSerialize against

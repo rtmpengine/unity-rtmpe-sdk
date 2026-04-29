@@ -248,7 +248,7 @@ namespace RTMPE.Tests
         public void BuildReconnectInit_WithoutProof_HasNoProofBytes()
         {
             const string token = "test-token-no-proof";
-            var pkt = _builder.BuildReconnectInit(token); // no proof
+            var pkt = _builder.BuildReconnectInitWithoutProof(token);
 
             var tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
             // Payload = 2 (len) + tokenLen; no extra bytes
@@ -267,27 +267,39 @@ namespace RTMPE.Tests
 
         // ── Payload size cap (audit fix C-015) ────────────────────────────────
         //
-        // Oversized payloads previously made it to the socket where they
+       // Oversized payloads previously made it to the socket where they
         // surfaced as a generic SocketException with no link back to the call
         // site.  The builder now rejects them up front with a clear
         // ArgumentException referencing the cap constant.
 
         [Test]
-        public void Build_PayloadEqualsCap_StillAccepted()
+        public void Build_PayloadEqualsApplicationCap_StillAccepted()
         {
-            // Exactly MaxPayloadBytes must still be built (inclusive cap).
-            var payload = new byte[PacketBuilder.MaxPayloadBytes];
+            // Exactly MaxApplicationPayloadBytes must still build cleanly —
+            // it is the inclusive upper bound for one-datagram delivery.
+            var payload = new byte[PacketBuilder.MaxApplicationPayloadBytes];
             var pkt = _builder.Build(PacketType.Data, PacketFlags.None, payload);
             Assert.AreEqual(PacketProtocol.HEADER_SIZE + payload.Length, pkt.Length);
         }
 
         [Test]
-        public void Build_PayloadOverCap_ThrowsArgumentException()
+        public void Build_PayloadOverApplicationCap_ThrowsArgumentException()
         {
-            var payload = new byte[PacketBuilder.MaxPayloadBytes + 1];
+            // The application cap fires first so the failure is diagnosable
+            // at the call site instead of late in the AEAD / transport
+            // pipeline as an opaque SocketException.
+            var payload = new byte[PacketBuilder.MaxApplicationPayloadBytes + 1];
             var ex = Assert.Throws<ArgumentException>(() =>
                 _builder.Build(PacketType.Data, PacketFlags.None, payload));
-            StringAssert.Contains("MaxPayloadBytes", ex.Message);
+            StringAssert.Contains("MaxApplicationPayloadBytes", ex.Message);
+        }
+
+        [Test]
+        public void EnsureFitsInDatagram_RejectsNegativeLength()
+        {
+            // Defensive guard against negative-length programmer errors.
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                PacketBuilder.EnsureFitsInDatagram(-1));
         }
     }
 }

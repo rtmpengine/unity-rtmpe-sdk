@@ -3,34 +3,34 @@
 // Foundation for synchronising arbitrary typed values over the RTMPE network.
 //
 // Design decisions:
-//   • Two-tier hierarchy:
-//       NetworkVariableBase  — non-generic; holds VariableId, IsDirty, Owner.
-//                              Enables generic lists/registration without
-//                              reflection (List<NetworkVariableBase>).
-//       NetworkVariable<T>   — generic; constrained to struct + IEquatable<T>
-//                              to guarantee value-equality semantics and inline
-//                              storage (no boxing on read).
-//   • NetworkVariableString  — extends NetworkVariableBase directly.
-//                              Strings are reference types; they cannot satisfy
-//                              the struct constraint.  Uses reference equality
-//                              (`!=`) plus null normalisation (null treated as "").
-//   • IsDirty tracks whether the local value has changed since the last
-//     MarkClean() call.  The dirt flag is set by Value setter; cleared by
-//     MarkClean().  SetValueWithoutNotify() does NOT set IsDirty, because it
-//     is intended for the RECEIVING side (applying an incoming update, not
-//     originating a new one).
-//   • OnValueChanged(oldValue, newValue) fires AFTER _value is updated so that
-//     callbacks can safely read Value without re-entrancy issues.
-//   • VariableId (ushort) is assigned by the caller to identify this variable
-//     within its owning NetworkBehaviour.  Used by the packet serialiser
-//     to route incoming updates to the correct variable.
-//   • Owner (NetworkBehaviour) is stored for the send path — dirty variables
-//     are flushed at 30 Hz for owning clients.
-//     Not null-checked here — callers must pass a valid instance.
+//  • Two-tier hierarchy:
+//      NetworkVariableBase  — non-generic; holds VariableId, IsDirty, Owner.
+//                             Enables generic lists/registration without
+//                             reflection (List<NetworkVariableBase>).
+//      NetworkVariable<T>   — generic; constrained to struct + IEquatable<T>
+//                             to guarantee value-equality semantics and inline
+//                             storage (no boxing on read).
+//  • NetworkVariableString  — extends NetworkVariableBase directly.
+//                             Strings are reference types; they cannot satisfy
+//                             the struct constraint.  Uses reference equality
+//                             (`!=`) plus null normalisation (null treated as "").
+//  • IsDirty tracks whether the local value has changed since the last
+//    MarkClean() call.  The dirt flag is set by Value setter; cleared by
+//    MarkClean().  SetValueWithoutNotify() does NOT set IsDirty, because it
+//    is intended for the RECEIVING side (applying an incoming update, not
+//    originating a new one).
+//  • OnValueChanged(oldValue, newValue) fires AFTER _value is updated so that
+//    callbacks can safely read Value without re-entrancy issues.
+//  • VariableId (ushort) is assigned by the caller to identify this variable
+//    within its owning NetworkBehaviour.  Used by the packet serialiser
+//    to route incoming updates to the correct variable.
+//  • Owner (NetworkBehaviour) is stored for the send path — dirty variables
+//    are flushed at 30 Hz for owning clients.
+//    Not null-checked here — callers must pass a valid instance.
 //
 // NetworkVariableString.Value setter normalises null to "" on write.
-//   A null value assigned via Value = null is stored as "" preventing
-//   get→Serialize→Deserialize state divergence.
+//  A null value assigned via Value = null is stored as "" preventing
+//  get→Serialize→Deserialize state divergence.
 //
 // Security note: no AEAD here.  These objects hold application-layer values;
 // the surrounding gateway pipeline handles encryption.
@@ -85,14 +85,14 @@ namespace RTMPE.Sync
         /// siblings; the dirty flag is preserved across skipped flushes so the
         /// next eligible window picks up the most recent value.
         ///
-        /// <para>Configured declaratively via
+       /// <para>Configured declaratively via
         /// <see cref="NetworkVariableAttribute.SendRateHz"/> on the owning
         /// field/property and applied by <see cref="NetworkBehaviour"/> when
         /// the variable is registered.  May also be assigned manually for
         /// dynamic throttling (e.g. raise the rate during a boss fight, lower
         /// it while idle).</para>
         ///
-        /// <para>Negative assignments are clamped to <c>0</c>.</para>
+       /// <para>Negative assignments are clamped to <c>0</c>.</para>
         /// </summary>
         public float SendRateHz
         {
@@ -106,12 +106,12 @@ namespace RTMPE.Sync
         /// <c>Time.unscaledTime</c>.  Updated by the flush loop after the
         /// variable's bytes have been appended to the outbound packet.
         ///
-        /// <para>Reset to <c>0f</c> on ownership change and on disconnect so a
+       /// <para>Reset to <c>0f</c> on ownership change and on disconnect so a
         /// freshly owning client can flush its first value immediately rather
         /// than waiting out a stale throttle window inherited from the
         /// previous owner.</para>
         ///
-        /// <para>Internal — only the flush path and the
+       /// <para>Internal — only the flush path and the
         /// ownership-reset hook should mutate this field.</para>
         /// </summary>
         internal float LastFlushTimeUnscaled { get; set; }
@@ -186,7 +186,7 @@ namespace RTMPE.Sync
         /// so the receiver can identify which variable to update AND skip
         /// unknown variable IDs without corrupting the stream.
         ///
-        /// Wire layout: [var_id:2 LE][value_len:2 LE][value_bytes:N]
+       /// Wire layout: [var_id:2 LE][value_len:2 LE][value_bytes:N]
         /// </summary>
         public void SerializeWithId(BinaryWriter writer)
         {
@@ -198,17 +198,17 @@ namespace RTMPE.Sync
             // IDs instead of stopping mid-packet and losing all subsequent
             // variables.
             //
-            // Fast path: rent a pool-backed byte[] large enough for every
+           // Fast path: rent a pool-backed byte[] large enough for every
             // struct value (Quaternion = 16 B) and most strings.  This is
             // zero-heap for the common case (30 Hz × N objects × M vars).
             //
-            // Slow path: NetworkVariableString may emit up to 65,537 bytes.
+           // Slow path: NetworkVariableString may emit up to 65,537 bytes.
             // Writing past the rented buffer throws NotSupportedException on
             // a non-growable MemoryStream; we detect this and fall through
             // to a growable stream.  The slow path executes only for the
             // long-string edge case — ≈ 0 % of gameplay traffic.
             //
-            // Hard cap: the wire format encodes the per-value length as a
+           // Hard cap: the wire format encodes the per-value length as a
             // ushort, so any value longer than ushort.MaxValue would silently
             // truncate and desync receiver state.  Detect and skip such
             // values before writing anything to the outer writer.
@@ -262,7 +262,11 @@ namespace RTMPE.Sync
             }
             finally
             {
-                pool.Return(rented);
+                // Clear before return so subsequent renters cannot read
+                // residual variable payloads from the shared pool — a peer
+                // app component that rents the same buffer next would
+                // otherwise observe the previous owner's serialized state.
+                pool.Return(rented, clearArray: true);
             }
 
             // Slow path: allocate a growable stream.  Matches the pre-pool
@@ -313,6 +317,50 @@ namespace RTMPE.Sync
         {
             return reader.ReadUInt16();
         }
+
+        // ── Per-variable inbound tick gate ─────────────────────────────────────
+        //
+        // Tracks the highest tick this variable has applied from a server
+        // VariableUpdate so a re-ordered datagram cannot silently roll the
+        // value back.  Comparison is RFC 1982 modular so a uint32 wrap during
+        // a long-running session does not wedge the gate.
+
+        private uint _lastAppliedTick;
+        private bool _hasLastAppliedTick;
+
+        /// <summary>
+        /// Returns <see langword="true"/> when an inbound update stamped with
+        /// <paramref name="incomingTick"/> should be applied — i.e. when the
+        /// tick is strictly greater than the highest tick already applied to
+        /// this variable.  The first call (no prior tick) always accepts.
+        /// </summary>
+        internal bool TryAcceptInboundTick(uint incomingTick)
+        {
+            if (!_hasLastAppliedTick)
+            {
+                _hasLastAppliedTick = true;
+                _lastAppliedTick    = incomingTick;
+                return true;
+            }
+            // (int)(a - b) > 0 iff a is strictly greater than b on the
+            // 32-bit ring; matches InputBuffer.SeqGreater so the whole SDK
+            // observes the same wrap semantics.
+            if ((int)(incomingTick - _lastAppliedTick) <= 0)
+                return false;
+            _lastAppliedTick = incomingTick;
+            return true;
+        }
+
+        /// <summary>
+        /// Reset the inbound tick gate.  Called on ownership change and on
+        /// disconnect so the gate cannot block the first update under a fresh
+        /// session whose tick counter restarts at zero.
+        /// </summary>
+        internal void ResetInboundTickGate()
+        {
+            _hasLastAppliedTick = false;
+            _lastAppliedTick    = 0u;
+        }
     }
 
     // ── Generic typed variable ─────────────────────────────────────────────────
@@ -320,11 +368,11 @@ namespace RTMPE.Sync
     /// <summary>
     /// A network-synchronised value of type <typeparamref name="T"/>.
     ///
-    /// <typeparamref name="T"/> must be a value type (<c>struct</c>) that
+   /// <typeparamref name="T"/> must be a value type (<c>struct</c>) that
     /// implements <see cref="IEquatable{T}"/>, ensuring that the equality
     /// check in the <see cref="Value"/> setter is allocation-free and correct.
     ///
-    /// Concrete sealed subclasses should call back to this via
+   /// Concrete sealed subclasses should call back to this via
     /// <c>base(owner, variableId, initialValue)</c> and then implement
     /// <see cref="NetworkVariableBase.Serialize"/> and
     /// <see cref="NetworkVariableBase.Deserialize"/>.
@@ -350,12 +398,12 @@ namespace RTMPE.Sync
         /// <summary>
         /// Gets or sets the current value.
         ///
-        /// <b>Set:</b> if the new value differs from the current value
+       /// <b>Set:</b> if the new value differs from the current value
         /// (per <see cref="IEquatable{T}.Equals"/>), the internal field is
         /// updated, <see cref="NetworkVariableBase.IsDirty"/> is set to
         /// <see langword="true"/>, and <see cref="OnValueChanged"/> fires.
         ///
-        /// Setting the same value a second time is a no-op (no event, no dirty).
+       /// Setting the same value a second time is a no-op (no event, no dirty).
         /// </summary>
         public T Value
         {
@@ -403,7 +451,7 @@ namespace RTMPE.Sync
         /// Apply a value received from the server without firing
         /// <see cref="OnValueChanged"/> or setting <see cref="NetworkVariableBase.IsDirty"/>.
         ///
-        /// Use this on the receiving client when handling an incoming variable
+       /// Use this on the receiving client when handling an incoming variable
         /// update packet so that the local UI/gameplay does not re-broadcast
         /// the value it just received.
         /// </summary>
@@ -422,7 +470,7 @@ namespace RTMPE.Sync
     /// is a reference type and cannot satisfy the <c>struct</c> constraint on
     /// <see cref="NetworkVariable{T}"/>.
     ///
-    /// <b>Null normalisation:</b> <see langword="null"/> is treated as
+   /// <b>Null normalisation:</b> <see langword="null"/> is treated as
     /// <see cref="string.Empty"/> everywhere (Value property, constructor,
     /// SetValueWithoutNotify, Serialize).  This prevents null-reference
     /// exceptions in callbacks and ensures Serialize/Deserialize round-trips

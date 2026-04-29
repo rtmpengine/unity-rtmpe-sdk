@@ -2,18 +2,34 @@
 //
 // Builds the binary payload for a client-to-server transform update packet.
 //
-// Wire format (48 bytes, all fields little-endian):
-//   [0..7]   object_id : u64  — Unity NetworkObject.NetworkObjectId
-//   [8..11]  pos_x     : f32  — world-space position X
-//   [12..15] pos_y     : f32  — world-space position Y
-//   [16..19] pos_z     : f32  — world-space position Z
-//   [20..23] rot_x     : f32  — quaternion X  (world-space rotation)
-//   [24..27] rot_y     : f32  — quaternion Y
-//   [28..31] rot_z     : f32  — quaternion Z
-//   [32..35] rot_w     : f32  — quaternion W
-//   [36..39] scale_x   : f32  — local-space scale X
-//   [40..43] scale_y   : f32  — local-space scale Y
-//   [44..47] scale_z   : f32  — local-space scale Z
+// Wire format — full precision (48 bytes, all fields little-endian, the
+// historical "v0" layout that omits any control byte for back-compat):
+//  [0..7]   object_id : u64  — Unity NetworkObject.NetworkObjectId
+//  [8..11]  pos_x     : f32  — world-space position X
+//  [12..15] pos_y     : f32  — world-space position Y
+//  [16..19] pos_z     : f32  — world-space position Z
+//  [20..23] rot_x     : f32  — quaternion X  (world-space rotation)
+//  [24..27] rot_y     : f32  — quaternion Y
+//  [28..31] rot_z     : f32  — quaternion Z
+//  [32..35] rot_w     : f32  — quaternion W
+//  [36..39] scale_x   : f32  — local-space scale X
+//  [40..43] scale_y   : f32  — local-space scale Y
+//  [44..47] scale_z   : f32  — local-space scale Z
+//
+// Wire format — quantized (25 bytes, gated on FLAG_QUANTIZED, only emitted
+// when NetworkSettings.quantizeTransforms is true and the gateway has
+// negotiated support for the encoding):
+//  [0]      flags     : u8   — bit 0x01 set indicates the quantized layout
+//  [1..8]   object_id : u64
+//  [9..14]  position  : 3 × half-float (binary16) LE  (6 bytes)
+//  [15..18] rotation  : smallest-three packed u32 LE  (4 bytes)
+//  [19..24] scale     : 3 × half-float (binary16) LE  (6 bytes)
+//
+// Detection: the legacy 48-byte payload has a fixed total length of 48,
+// while the quantized variant is 25 bytes.  The receiver dispatches on
+// length first; on a length-25 payload it then verifies the leading flags
+// byte has bit 0x01 set before treating the remainder as quantized
+// fields.  Any unrecognised length / flag combination is rejected.
 //
 // The payload is wrapped in a 13-byte RTMPE header (PacketType.Data, 0x10)
 // by the caller via NetworkManager.SendData().
@@ -21,13 +37,13 @@
 // The layout matches the Go server's ObjectState struct field order so that
 // future server-side deserialisers can read the raw bytes directly.
 //
-//   Go reference: modules/synchronization/domain/entities/object_state.go
-//     type ObjectState struct {
-//         ObjectID uint64
-//         Position Vec3         // float32 × 3
-//         Rotation Quaternion   // float32 × 4 (X Y Z W)
-//         Scale    Vec3         // float32 × 3
-//     }
+//  Go reference: modules/synchronization/domain/entities/object_state.go
+//    type ObjectState struct {
+//        ObjectID uint64
+//        Position Vec3         // float32 × 3
+//        Rotation Quaternion   // float32 × 4 (X Y Z W)
+//        Scale    Vec3         // float32 × 3
+//    }
 //
 // Security note: no AEAD here. The surrounding gateway pipeline applies
 // ChaCha20-Poly1305 encryption before the packet leaves the device.
@@ -62,6 +78,20 @@ namespace RTMPE.Sync
 
         /// <summary>Byte offset of <c>scale_x</c> within the payload.</summary>
         internal const int OFFSET_SCALE = 36;
+
+        /// <summary>
+        /// Total wire size of the quantized payload variant.
+        /// flags(1) + object_id(8) + half-float position(6) + packed rotation(4)
+        /// + half-float scale(6) = 25 bytes.
+        /// </summary>
+        public const int QUANTIZED_PAYLOAD_SIZE = 25;
+
+        /// <summary>
+        /// Bit set in the <c>flags</c> byte of a quantized payload.  A future
+        /// extension may add additional flags in higher bits without breaking
+        /// the dispatcher's length-then-flag detection.
+        /// </summary>
+        public const byte FLAG_QUANTIZED = 0x01;
 
         // ── Factory method ────────────────────────────────────────────────────
 
@@ -105,6 +135,46 @@ namespace RTMPE.Sync
 
             return payload;
         }
+
+        /// <summary>
+        /// Build the 25-byte quantized variant of the transform-update payload.
+        /// Encodes position and scale as half-precision floats and rotation as
+        /// a smallest-three packed quaternion.  Returns <see langword="null"/>
+        /// when any source value is non-finite (NaN/Inf) or the rotation is
+        /// degenerate — the caller falls back to the full-precision builder
+        /// or skips the update; emitting a sentinel-laced quantized payload
+        /// would corrupt the receiver's transform.
+        /// </summary>
+        public static byte[] BuildQuantizedUpdatePayload(ulong objectId, TransformState state)
+        {
+            // Half-precision floats lose ~20 bits of mantissa; rejecting NaN/Inf
+            // at the encoder keeps the wire format total over its declared
+            // domain (finite rigid-body poses) and prevents a degenerate
+            // simulation from propagating sentinel bit patterns to peers.
+            if (!IsFinite(state.Position.x) || !IsFinite(state.Position.y) || !IsFinite(state.Position.z))
+                return null;
+            if (!IsFinite(state.Scale.x)    || !IsFinite(state.Scale.y)    || !IsFinite(state.Scale.z))
+                return null;
+
+            var payload = new byte[QUANTIZED_PAYLOAD_SIZE];
+            payload[0] = FLAG_QUANTIZED;
+
+            WriteU64LE(payload, 1, objectId);
+
+            if (!TransformQuantization.TryWriteHalf(payload, 9,  state.Position.x)) return null;
+            if (!TransformQuantization.TryWriteHalf(payload, 11, state.Position.y)) return null;
+            if (!TransformQuantization.TryWriteHalf(payload, 13, state.Position.z)) return null;
+
+            if (!TransformQuantization.TryWriteSmallestThree(payload, 15, state.Rotation)) return null;
+
+            if (!TransformQuantization.TryWriteHalf(payload, 19, state.Scale.x)) return null;
+            if (!TransformQuantization.TryWriteHalf(payload, 21, state.Scale.y)) return null;
+            if (!TransformQuantization.TryWriteHalf(payload, 23, state.Scale.z)) return null;
+
+            return payload;
+        }
+
+        private static bool IsFinite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
 
         // ── Private write helpers ─────────────────────────────────────────────
 

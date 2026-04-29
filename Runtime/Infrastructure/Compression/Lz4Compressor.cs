@@ -4,14 +4,14 @@
 // Rust lz4_flex crate used by the RTMPE gateway.
 //
 // Wire format (matches gateway compression.rs):
-//   [uncompressed_len: u32 LE][lz4_block: N bytes]
+//  [uncompressed_len: u32 LE][lz4_block: N bytes]
 //
 // Size constraints (must match gateway constants):
-//   MIN_COMPRESSIBLE = 128 bytes  — below this, don't compress
-//   MAX_DECOMPRESSED = 16384 bytes — gateway hard cap
+//  MIN_COMPRESSIBLE = 128 bytes  — below this, don't compress
+//  MAX_DECOMPRESSED = 16384 bytes — gateway hard cap
 //
 // The LZ4 Block format implemented here is the canonical spec:
-//   https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md
+//  https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md
 //
 // Compression note: This is a greedy single-pass compressor using a 4096-entry
 // hash table.  It prioritises speed and zero-allocation in the hot path over
@@ -19,6 +19,7 @@
 // real-time game protocol.
 
 using System;
+using System.Buffers;
 
 namespace RTMPE.Infrastructure.Compression
 {
@@ -39,6 +40,34 @@ namespace RTMPE.Infrastructure.Compression
         private const int HashTableSize = 4096;
         private const int HashShift = 20; // 32 - log2(HashTableSize)
 
+        // Maximum permitted ratio of declared-output to compressed-payload size.
+        // The absolute MaxDecompressed cap still applies; this additional gate
+        // catches small-input/huge-output amplification where a few bytes of
+        // attacker-supplied LZ4 unfold into the full 16 KiB ceiling.  At a 100×
+        // ratio a 16 KiB output requires at least ~164 bytes of compressed
+        // payload, which is well above genuine traffic ratios observed for
+        // game-protocol packets (typically 2×–8×).
+        private const int MaxCompressionRatio = 100;
+
+        // Per-token cap on the number of bytes a single LZ4 match may write.
+        // Genuine matches in a 16 KiB block are bounded by MaxDecompressed;
+        // this tighter limit defends the byte-loop overlap path against
+        // pathological RLE expansions where a 1-byte run is amplified to the
+        // full output ceiling from a tiny token.  4 KiB still admits every
+        // realistic match in a 16 KiB packet while clamping the worst case.
+        private const int MaxSingleMatchExpansion = 4096;
+
+        // Compile-time tripwire: MaxDecompressed must fit in a signed int so
+        // the checked((int)declaredLen) cast in Decompress() is always safe.
+        // Currently trivially true (MaxDecompressed = 16 384); the check
+        // becomes meaningful if MaxDecompressed is ever widened to long.
+        static Lz4Compressor()
+        {
+            if ((long)MaxDecompressed > int.MaxValue)
+                throw new InvalidOperationException(
+                    "MaxDecompressed exceeds int range — audit all (int) casts in this file.");
+        }
+
         // ── Public API ────────────────────────────────────────────────────────
 
         /// <summary>
@@ -46,13 +75,13 @@ namespace RTMPE.Infrastructure.Compression
         /// </summary>
         /// <param name="data">Input bytes.</param>
         /// <param name="compressed">
-        ///   <see langword="true"/> when the output is smaller than the input
-        ///   and compression was beneficial; <see langword="false"/> when the
-        ///   original data should be sent as-is.
+        ///  <see langword="true"/> when the output is smaller than the input
+        ///  and compression was beneficial; <see langword="false"/> when the
+        ///  original data should be sent as-is.
         /// </param>
         /// <returns>
-        ///   The wire-format compressed payload (prefix + LZ4 block), or
-        ///   <paramref name="data"/> unchanged when compression is not beneficial.
+        ///  The wire-format compressed payload (prefix + LZ4 block), or
+        ///  <paramref name="data"/> unchanged when compression is not beneficial.
         /// </returns>
         public static byte[] CompressIfBeneficial(byte[] data, out bool compressed)
         {
@@ -97,8 +126,26 @@ namespace RTMPE.Infrastructure.Compression
                 throw new InvalidOperationException(
                     $"LZ4: declared length {declaredLen} exceeds cap {MaxDecompressed}.");
 
-            var output = new byte[(int)declaredLen];
-            int produced = DecompressBlock(data, PrefixSize, data.Length - PrefixSize,
+            // Reject empty/sub-minimum payloads.  The gateway never emits a
+            // compressed frame for inputs below MinCompressible, so receiving
+            // one indicates a crafted or corrupt packet.
+            if (declaredLen < MinCompressible)
+                throw new InvalidOperationException(
+                    $"LZ4: declared length {declaredLen} below minimum {MinCompressible}.");
+
+            int compressedPayload = data.Length - PrefixSize;
+            if (compressedPayload <= 0)
+                throw new InvalidOperationException("LZ4: compressed payload is empty.");
+
+            // Ratio gate runs BEFORE allocating the output buffer so that a
+            // crafted prefix cannot force us to materialise the full ceiling.
+            if (declaredLen / (uint)compressedPayload > MaxCompressionRatio)
+                throw new InvalidOperationException(
+                    $"LZ4: compression ratio {declaredLen}/{compressedPayload} exceeds " +
+                    $"maximum {MaxCompressionRatio}.");
+
+            var output = new byte[checked((int)declaredLen)];
+            int produced = DecompressBlock(data, PrefixSize, compressedPayload,
                                            output, 0, (int)declaredLen);
 
             if (produced != (int)declaredLen)
@@ -116,73 +163,97 @@ namespace RTMPE.Infrastructure.Compression
             // Worst case: every byte is a literal (token + literal).
             // LZ4 worst-case expansion is src.Length + src.Length/255 + 16.
             int maxDst = PrefixSize + srcLen + (srcLen / 255) + 16;
-            var dst = new byte[maxDst];
 
-            // Write uncompressed length prefix.
-            dst[0] = (byte) srcLen;
-            dst[1] = (byte)(srcLen >>  8);
-            dst[2] = (byte)(srcLen >> 16);
-            dst[3] = (byte)(srcLen >> 24);
-
-            int dstOff = PrefixSize;
-
-            // Hash table: maps 4-byte hash → last position in src.
-            var table = new int[HashTableSize];
-            for (int i = 0; i < HashTableSize; i++) table[i] = -1;
-
-            int srcOff   = 0;
-            int litStart = 0;
-
-            // Leave MFLIMIT = 12 bytes at the end as literals (LZ4 spec requirement).
-            const int MfLimit = 12;
-            int srcLimit = srcLen - MfLimit;
-
-            while (srcOff < srcLimit)
+            // Both the worst-case destination buffer and the hash table are
+            // strictly transient and never escape this method; renting them
+            // from the shared pool eliminates ~20 KB of per-call GC pressure
+            // on iOS/Android where the SDK runs on Mono/IL2CPP.
+            var pool = ArrayPool<byte>.Shared;
+            var intPool = ArrayPool<int>.Shared;
+            byte[] dst = pool.Rent(maxDst);
+            int[]  table = intPool.Rent(HashTableSize);
+            try
             {
-                // Hash the next 4 bytes.
-                uint h = Hash4(src, srcOff);
-                int  matchPos = table[h];
-                table[h] = srcOff;
+                // Rented arrays are not zero-initialised; the hash table must
+                // start as "no prior position" or stale entries from a previous
+                // tenant would be interpreted as valid back-references and
+                // corrupt the compressed stream.
+                for (int i = 0; i < HashTableSize; i++) table[i] = -1;
 
-                // Check if a match exists and is within the 64KB distance limit.
-                if (matchPos >= 0 && srcOff - matchPos < 65536)
+                // Write uncompressed length prefix.
+                dst[0] = (byte) srcLen;
+                dst[1] = (byte)(srcLen >>  8);
+                dst[2] = (byte)(srcLen >> 16);
+                dst[3] = (byte)(srcLen >> 24);
+
+                int dstOff = PrefixSize;
+
+                int srcOff   = 0;
+                int litStart = 0;
+
+                // Leave MFLIMIT = 12 bytes at the end as literals (LZ4 spec requirement).
+                const int MfLimit = 12;
+                int srcLimit = srcLen - MfLimit;
+
+                while (srcOff < srcLimit)
                 {
-                    // Verify the 4-byte match.
-                    if (src[matchPos]     == src[srcOff]     &&
-                        src[matchPos + 1] == src[srcOff + 1] &&
-                        src[matchPos + 2] == src[srcOff + 2] &&
-                        src[matchPos + 3] == src[srcOff + 3])
+                    // Hash the next 4 bytes.
+                    uint h = Hash4(src, srcOff);
+                    int  matchPos = table[(int)h];
+                    table[(int)h] = srcOff;
+
+                    // Check if a match exists and is within the 64KB distance limit.
+                    if (matchPos >= 0 && srcOff - matchPos < 65536)
                     {
-                        // Extend match forward.
-                        int matchLen = 4;
-                        while (srcOff + matchLen < srcLen &&
-                               src[matchPos + matchLen] == src[srcOff + matchLen])
-                            matchLen++;
+                        // Verify the 4-byte match.
+                        if (src[matchPos]     == src[srcOff]     &&
+                            src[matchPos + 1] == src[srcOff + 1] &&
+                            src[matchPos + 2] == src[srcOff + 2] &&
+                            src[matchPos + 3] == src[srcOff + 3])
+                        {
+                            // Extend match forward.
+                            int matchLen = 4;
+                            while (srcOff + matchLen < srcLen &&
+                                   src[matchPos + matchLen] == src[srcOff + matchLen])
+                                matchLen++;
 
-                        // Write the sequence: token + literals + offset + match extra.
-                        int litLen = srcOff - litStart;
-                        dstOff = WriteSequence(src, dst, dstOff,
-                                               litStart, litLen,
-                                               srcOff - matchPos,
-                                               matchLen);
+                            // Write the sequence: token + literals + offset + match extra.
+                            int litLen = srcOff - litStart;
+                            dstOff = WriteSequence(src, dst, dstOff,
+                                                   litStart, litLen,
+                                                   srcOff - matchPos,
+                                                   matchLen);
 
-                        srcOff   += matchLen;
-                        litStart  = srcOff;
-                        continue;
+                            srcOff   += matchLen;
+                            litStart  = srcOff;
+                            continue;
+                        }
                     }
+
+                    srcOff++;
                 }
 
-                srcOff++;
+                // Write remaining literals as a final sequence (no match).
+                int finalLitLen = srcLen - litStart;
+                dstOff = WriteFinalLiterals(src, dst, dstOff, litStart, finalLitLen);
+
+                // Trim to actual compressed size before returning ownership to caller.
+                var result = new byte[dstOff];
+                Buffer.BlockCopy(dst, 0, result, 0, dstOff);
+                return result;
             }
-
-            // Write remaining literals as a final sequence (no match).
-            int finalLitLen = srcLen - litStart;
-            dstOff = WriteFinalLiterals(src, dst, dstOff, litStart, finalLitLen);
-
-            // Trim to actual compressed size.
-            var result = new byte[dstOff];
-            Buffer.BlockCopy(dst, 0, result, 0, dstOff);
-            return result;
+            finally
+            {
+                // Clear before return so subsequent renters cannot read
+                // residual compressed payload bytes from the shared pool —
+                // the produced dst slice carries the just-compressed message,
+                // and another component renting the same array would
+                // otherwise observe the previous tenant's data.  The hash
+                // table is re-initialised by every callee at line ~181 so
+                // it does not need clearArray:true on return.
+                pool.Return(dst, clearArray: true);
+                intPool.Return(table);
+            }
         }
 
         private static int WriteSequence(
@@ -191,7 +262,7 @@ namespace RTMPE.Infrastructure.Compression
             int offset, int matchLen)
         {
             // Token byte: high nibble = literal run length (capped at 15),
-            //             low  nibble = match extra length (matchLen - 4, capped at 15).
+            //            low  nibble = match extra length (matchLen - 4, capped at 15).
             int extraMatch = matchLen - 4; // min match is 4
             int tokenLit   = litLen  >= 15 ? 15 : litLen;
             int tokenMatch = extraMatch >= 15 ? 15 : extraMatch;
@@ -301,6 +372,19 @@ namespace RTMPE.Infrastructure.Compression
                 srcOff += 2;
                 if (matchOffset == 0) return -1; // invalid
                 int matchSrc = dstOff - matchOffset;
+                // LZ4 back-references address bytes already produced by this
+                // same decompression. A match that would read before the
+                // start of the output buffer (matchSrc < 0) is invalid in
+                // every LZ4 dialect and must be rejected.
+                //
+               // Importantly, this does NOT reject matches whose offset is
+                // smaller than their length — those are the canonical LZ4
+                // RLE construction (e.g. offset=1 with matchLen=N replicates
+                // a single byte N times) and are required by the spec. The
+                // overlap path below (`matchOffset < matchLen`) handles them
+                // byte-by-byte; do not "tighten" this guard to forbid the
+                // overlap or the run-length-encoded tail of every legitimate
+                // packet will fail to decompress.
                 if (matchSrc < 0) return -1;     // out-of-bounds back-reference
 
                 // Extended match length (base = 4).
@@ -315,11 +399,29 @@ namespace RTMPE.Infrastructure.Compression
                     } while (b == 255);
                 }
 
-                if (matchLen < 0 || dstLen - dstOff < matchLen) return -1;
+                // Cap a single match's expansion before any further bookkeeping.
+                // The aggregate output is already bounded by dstLen, but this
+                // tighter per-token bound rejects crafted streams where one
+                // token tries to materialise the full ceiling from a near-empty
+                // input — the byte-loop overlap path otherwise pays full cost.
+                if (matchLen < 0 || matchLen > MaxSingleMatchExpansion) return -1;
+                if (dstLen - dstOff < matchLen) return -1;
 
-                // Copy match (may overlap — byte-by-byte to handle RLE correctly).
-                for (int i = 0; i < matchLen; i++)
-                    dst[dstOff + i] = dst[matchSrc + i];
+                // Non-overlapping matches (offset >= length) cannot read bytes
+                // we are about to write, so the entire run can be moved with a
+                // bulk copy — orders of magnitude faster than the byte loop.
+                // True overlap (offset < length) is the LZ4 RLE construction
+                // and MUST proceed byte-by-byte: each output byte may depend on
+                // a byte written earlier in this same match.
+                if (matchOffset >= matchLen)
+                {
+                    Buffer.BlockCopy(dst, matchSrc, dst, dstOff, matchLen);
+                }
+                else
+                {
+                    for (int i = 0; i < matchLen; i++)
+                        dst[dstOff + i] = dst[matchSrc + i];
+                }
                 dstOff += matchLen;
             }
 

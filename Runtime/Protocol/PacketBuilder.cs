@@ -3,12 +3,12 @@
 // Builds outbound RTMPE packets with the correct 13-byte header.
 //
 // Header layout (all little-endian):
-//   [0..1]  magic       : u16  = 0x5254 ("RT")
-//   [2]     version     : u8   = 3
-//   [3]     packet_type : u8
-//   [4]     flags       : u8
-//   [5..8]  sequence    : u32  (monotonically increasing, per-connection)
-//   [9..12] payload_len : u32
+//  [0..1]  magic       : u16  = 0x5254 ("RT")
+//  [2]     version     : u8   = 3
+//  [3]     packet_type : u8
+//  [4]     flags       : u8
+//  [5..8]  sequence    : u32  (monotonically increasing, per-connection)
+//  [9..12] payload_len : u32
 //
 // The sequence counter is an instance field (NOT static) so each connection
 // has its own independent counter. Sharing a PacketBuilder across connections
@@ -74,7 +74,58 @@ namespace RTMPE.Protocol
         /// Thrown when <paramref name="reconnectToken"/> is null, empty, or
         /// its UTF-8 encoding exceeds 128 bytes.
         /// </exception>
-        public byte[] BuildReconnectInit(string reconnectToken, byte[] proof = null)
+        public byte[] BuildReconnectInit(string reconnectToken, byte[] proof)
+        {
+            if (proof == null)
+                throw new ArgumentNullException(nameof(proof),
+                    "proof is required.  Compute it via " +
+                    nameof(ComputeReconnectProof) +
+                    "(token, ipMigrationKey), or call " +
+                    nameof(BuildReconnectInitWithoutProof) +
+                    " when no IP-migration key was negotiated.");
+            if (proof.Length != 32)
+                throw new ArgumentException("proof must be exactly 32 bytes.", nameof(proof));
+
+            return BuildReconnectInitInternal(reconnectToken, proof);
+        }
+
+        /// <summary>
+        /// Build a <c>ReconnectInit</c> packet without an HMAC proof.
+        /// Use this only when no IP-migration key was negotiated for the
+        /// previous session (older gateway, or session torn down before
+        /// HKDF expansion completed).  In all other cases, prefer
+        /// <see cref="BuildReconnectInit"/> with a proof so the gateway can
+        /// accept a reconnect from a new IP address (WiFi → 4G migration).
+        /// </summary>
+        public byte[] BuildReconnectInitWithoutProof(string reconnectToken)
+        {
+            return BuildReconnectInitInternal(reconnectToken, null);
+        }
+
+        /// <summary>
+        /// Compute the 32-byte HMAC-SHA256 proof bound to a reconnect token.
+        /// Pair with <see cref="BuildReconnectInit"/>.
+        /// </summary>
+        /// <param name="reconnectToken">
+        /// The token returned in the previous <c>SessionAck</c>.
+        /// </param>
+        /// <param name="ipMigrationKey">
+        /// The 32-byte IP-migration key derived alongside the session keys
+        /// (HKDF info suffix <c>\x02</c> — see <c>HandshakeHandler.DeriveSessionKeys</c>).
+        /// </param>
+        public static byte[] ComputeReconnectProof(string reconnectToken, byte[] ipMigrationKey)
+        {
+            if (string.IsNullOrEmpty(reconnectToken))
+                throw new ArgumentException("reconnectToken must not be null or empty.", nameof(reconnectToken));
+            if (ipMigrationKey == null || ipMigrationKey.Length != 32)
+                throw new ArgumentException("ipMigrationKey must be exactly 32 bytes.", nameof(ipMigrationKey));
+
+            var tokenBytes = System.Text.Encoding.UTF8.GetBytes(reconnectToken);
+            using var hmac = new System.Security.Cryptography.HMACSHA256(ipMigrationKey);
+            return hmac.ComputeHash(tokenBytes);
+        }
+
+        private byte[] BuildReconnectInitInternal(string reconnectToken, byte[] proof)
         {
             if (string.IsNullOrEmpty(reconnectToken))
                 throw new ArgumentException("reconnectToken must not be null or empty.", nameof(reconnectToken));
@@ -84,9 +135,6 @@ namespace RTMPE.Protocol
                 throw new ArgumentException(
                     $"reconnectToken UTF-8 length {tokenBytes.Length} exceeds 128 bytes (gateway cap).",
                     nameof(reconnectToken));
-
-            if (proof != null && proof.Length != 32)
-                throw new ArgumentException("proof must be exactly 32 bytes.", nameof(proof));
 
             // Payload: [token_len: u16 LE][token: N][proof: 32 optional]
             // The gateway detects the proof by checking payload.len() > 2 + token_len.
@@ -122,25 +170,64 @@ namespace RTMPE.Protocol
         // ── Core builder ──────────────────────────────────────────────────────
 
         /// <summary>
-        /// Maximum payload length accepted by <see cref="Build"/>.  Matches the
-        /// parser-side cap in <see cref="PacketParser"/> (1 MiB) so a caller
-        /// that builds an oversized packet fails here — loudly and deterministic-
-        /// ally with an <see cref="ArgumentException"/> — rather than at the
-        /// socket layer where the diagnostic is "SocketException: Message too
-        /// long" with no breadcrumb back to the offending call site.
+        /// Wire-validation upper bound on payload length.  Matches the
+        /// parser-side cap in <see cref="PacketParser"/> (1 MiB) and protects
+        /// the build path against an integer-class bug that would let a
+        /// caller pass a 4 GiB array into <see cref="Build"/>.  Defense in
+        /// depth only — every realistic call site is bounded much more
+        /// tightly by <see cref="MaxApplicationPayloadBytes"/>, which is the
+        /// limit a normal builder consumer should hit first.
         /// </summary>
         public const int MaxPayloadBytes = 1 * 1024 * 1024;
+
+        // The transport-side datagram envelope is bounded so a legitimately
+        // built packet survives every link in the path (PPPoE, IPsec, IPv6
+        // minimum-MTU networks).  Constants below mirror UdpTransport's
+        // DefaultMaxDatagramSize without taking a Transport assembly
+        // dependency from Protocol — the literal 1200 is documented in
+        // UdpTransport.DefaultMaxDatagramSize and the two values must move
+        // together.  An automated guard against drift is provided by the
+        // transport-suite test "DatagramAndApplicationCapsAreInSync".
+        private const int DefaultDatagramSizeMirror = 1200;
+
+        // 4-byte AEAD seq prefix + 16-byte Poly1305 tag are appended by the
+        // EncryptAndSend pipeline; documented in NetworkManager.cs's encrypt
+        // path.  An application caller hands plaintext to the builder, so the
+        // cap below pre-deducts what AEAD will add later.
+        private const int AeadOverheadBytes = 4 + 16;
+
+        /// <summary>
+        /// Largest application payload that, after the 13-byte RTMPE header
+        /// and the 20-byte AEAD overhead, still fits inside one
+        /// <see cref="DefaultDatagramSizeMirror"/>-byte UDP datagram.
+        /// Exceeding this causes an <see cref="ArgumentException"/> at the
+        /// builder so the caller diagnoses the size error at the call site
+        /// instead of meeting it as a delayed transport failure or, worse,
+        /// silently relying on IP fragmentation (poor on mobile / CGNAT).
+        /// </summary>
+        public const int MaxApplicationPayloadBytes =
+            DefaultDatagramSizeMirror - PacketProtocol.HEADER_SIZE - AeadOverheadBytes;
 
         /// <summary>
         /// Build a complete packet: 13-byte header + payload.
         /// The sequence number is atomically incremented per call.
         /// </summary>
         /// <exception cref="ArgumentException">
-        /// Thrown when <paramref name="payload"/> exceeds <see cref="MaxPayloadBytes"/>.
+        /// Thrown when <paramref name="payload"/> exceeds
+        /// <see cref="MaxApplicationPayloadBytes"/> (the layered, MTU-aware
+        /// cap that fires first) or <see cref="MaxPayloadBytes"/> (the
+        /// defense-in-depth wire-validation cap).
         /// </exception>
         public byte[] Build(PacketType type, PacketFlags flags, byte[] payload)
         {
             if (payload == null) payload = Array.Empty<byte>();
+
+            // Application-layer cap fires first.  Application payloads
+            // exceeding the transport MTU envelope silently rely on IP
+            // fragmentation (poor on mobile / CGNAT); rejecting at the
+            // builder makes the failure diagnosable at the call site instead
+            // of late in the pipeline as an opaque SocketException.
+            EnsureFitsInDatagram(payload.Length);
 
             if (payload.Length > MaxPayloadBytes)
                 throw new ArgumentException(
@@ -184,6 +271,31 @@ namespace RTMPE.Protocol
                 Buffer.BlockCopy(payload, 0, packet, PacketProtocol.HEADER_SIZE, payload.Length);
 
             return packet;
+        }
+
+        /// <summary>
+        /// Enforce that <paramref name="payloadLength"/> can be wrapped in
+        /// header + AEAD overhead and still fit one transport datagram.
+        /// Throws <see cref="ArgumentException"/> when the payload exceeds
+        /// <see cref="MaxApplicationPayloadBytes"/>.
+        /// </summary>
+        /// <remarks>
+        /// Public for unit-test introspection and for callers that want to
+        /// pre-validate before constructing a payload buffer.  The check is
+        /// embedded in <see cref="Build"/> so every builder consumer benefits
+        /// without an extra call.
+        /// </remarks>
+        public static void EnsureFitsInDatagram(int payloadLength)
+        {
+            if (payloadLength < 0)
+                throw new ArgumentOutOfRangeException(nameof(payloadLength),
+                    "payloadLength must be non-negative.");
+            if (payloadLength > MaxApplicationPayloadBytes)
+                throw new ArgumentException(
+                    $"payload length {payloadLength} exceeds " +
+                    $"PacketBuilder.MaxApplicationPayloadBytes ({MaxApplicationPayloadBytes}). " +
+                    "Fragment the message at the application layer; do not rely on IP fragmentation.",
+                    nameof(payloadLength));
         }
     }
 }

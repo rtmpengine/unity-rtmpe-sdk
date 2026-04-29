@@ -4,25 +4,25 @@
 // running Play-Mode session.  Open via: Window > RTMPE > Network Debugger.
 //
 // Design constraints:
-//   • READ-ONLY.  No buttons that mutate state — this is a debugger, not a
-//     console.  Modifying live network state from the Editor would silently
-//     desync clients.
-//   • Polls NetworkManager.Instance via EditorApplication.update at ~250 ms
-//     so the visible refresh rate is independent of Unity's frame rate.
-//     We compute traffic rates by sampling counter deltas across the polling
-//     interval; this is cheaper and more stable than per-frame integration.
-//   • Allocation-budget conscious — IMGUI is already chatty; we keep our own
-//     code free of per-repaint heap allocations beyond what the panels need.
-//   • Telemetry counters are read via Volatile/Interlocked accessors on
-//     NetworkManager — no new fields are exposed for the window's benefit.
+//  • READ-ONLY.  No buttons that mutate state — this is a debugger, not a
+//    console.  Modifying live network state from the Editor would silently
+//    desync clients.
+//  • Polls NetworkManager.Instance via EditorApplication.update at ~250 ms
+//    so the visible refresh rate is independent of Unity's frame rate.
+//    We compute traffic rates by sampling counter deltas across the polling
+//    interval; this is cheaper and more stable than per-frame integration.
+//  • Allocation-budget conscious — IMGUI is already chatty; we keep our own
+//    code free of per-repaint heap allocations beyond what the panels need.
+//  • Telemetry counters are read via Volatile/Interlocked accessors on
+//    NetworkManager — no new fields are exposed for the window's benefit.
 //
 // Layout:
-//   Connection panel  : state, endpoint, in-room flag, local IDs, room ID,
-//                       master client flag.
-//   Traffic panel     : packets/s, bytes/s for both directions (rolling 1 s).
-//   Variables panel   : per-NetworkObject list with dirty/clean status, send
-//                       rate cap and last-flush age.
-//   Rooms panel       : current room ID, master, player list (best-effort).
+//  Connection panel  : state, endpoint, in-room flag, local IDs, room ID,
+//                      master client flag.
+//  Traffic panel     : packets/s, bytes/s for both directions (rolling 1 s).
+//  Variables panel   : per-NetworkObject list with dirty/clean status, send
+//                      rate cap and last-flush age.
+//  Rooms panel       : current room ID, master, player list (best-effort).
 
 #if UNITY_EDITOR
 using System;
@@ -443,27 +443,18 @@ namespace RTMPE.Editor
         // ── Helpers ────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Defensive accessor for the spawn-manager registry.  The SDK keeps
-        /// it inside an internal <c>SpawnManager</c> reference; if a future
-        /// refactor renames or relocates it the window degrades gracefully
-        /// instead of throwing inside OnGUI.
+        /// Defensive accessor for the spawn-manager registry.  Goes through the
+        /// internal <see cref="NetworkManager.SpawnManagerInternal"/> accessor
+        /// (visible to RTMPE.SDK.Editor via InternalsVisibleTo) instead of
+        /// reflecting on private fields — reflection silently rots across
+        /// renames, an internal accessor breaks compilation immediately.
         /// </summary>
         private static RTMPE.Core.NetworkObjectRegistry SafeGetRegistry(NetworkManager nm)
         {
+            if (nm == null) return null;
             try
             {
-                // The public surface of NetworkManager does not expose
-                // SpawnManager directly today; reach through the internal
-                // reflection-discoverable field for diagnostics only.  This
-                // is editor-only code and must not exist in shipping
-                // gameplay paths.
-                var field = typeof(NetworkManager).GetField(
-                    "_spawnManager",
-                    System.Reflection.BindingFlags.Instance |
-                    System.Reflection.BindingFlags.NonPublic);
-                if (field == null) return null;
-                var sm = field.GetValue(nm) as RTMPE.Core.SpawnManager;
-                return sm?.Registry;
+                return nm.SpawnManagerInternal?.Registry;
             }
             catch
             {

@@ -200,5 +200,25 @@ namespace RTMPE.Tests
 
             Assert.DoesNotThrow(() => _manager.Send(new byte[] { 0x01, 0x02 }));
         }
+
+        // ── Component menu wiring ──────────────────────────────────────────────
+
+        [Test]
+        [Description("NetworkManager must expose an AddComponentMenu entry so the README's " +
+                     "\"Component -> RTMPE -> NetworkManager\" instruction actually surfaces in " +
+                     "the Unity Inspector's Add-Component menu.")]
+        public void NetworkManager_DeclaresAddComponentMenuAttribute()
+        {
+            var attrs = typeof(NetworkManager)
+                .GetCustomAttributes(typeof(AddComponentMenu), inherit: false);
+            Assert.IsTrue(attrs.Length > 0,
+                "NetworkManager must be decorated with [AddComponentMenu] so it appears in " +
+                "the Unity Inspector Add-Component menu under \"RTMPE\".");
+
+            var menu = (AddComponentMenu)attrs[0];
+            StringAssert.StartsWith("RTMPE/", menu.componentMenu,
+                "AddComponentMenu path must live under the \"RTMPE\" submenu so all RTMPE " +
+                "components group together in the Add-Component picker.");
+        }
     }
 }

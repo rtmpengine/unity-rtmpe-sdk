@@ -584,31 +584,36 @@ namespace RTMPE.Tests
             int received = 0;
             thread.OnPacketReceived += _ => Interlocked.Increment(ref received);
 
-            // Call the internal drain method once.  We use Start()/Stop() and a
-            // ManualResetEventSlim to get one iteration of the loop.
-            var cts = new System.Threading.CancellationTokenSource();
+            // Deterministic: poll the dispatch counter until the burst is fully
+            // drained.  SpinUntil wakes immediately on success — the 2 s ceiling
+            // is a CI-failure backstop, not a tuning knob.
             thread.Start();
-            // Wait briefly for background thread to run at least one iteration
-            Thread.Sleep(50);
+            bool drained = SpinWait.SpinUntil(() => Volatile.Read(ref received) >= Burst, 2000);
             thread.Stop();
             thread.Dispose();
 
-            Assert.GreaterOrEqual(received, Burst,
+            Assert.IsTrue(drained,
                 $"Expected at least {Burst} packets dispatched; got {received}. " +
                 "The drain loop must consume all burst packets in one cycle.");
+            Assert.GreaterOrEqual(received, Burst);
         }
 
         [Test]
         public void TryReceive_EmptySocket_DoesNotDispatch()
         {
-            var transport = new BurstTransport(0); // nothing available
+            // BurstTransport(0) returns Poll==false forever — there is no
+            // observable signal to wait on.  Bound the run window to a short
+            // fixed budget; the assertion is "no spurious dispatch", which is
+            // an *upper* bound and therefore unaffected by scheduler jitter.
+            const int RunBudgetMs = 100;
+            var transport = new BurstTransport(0);
             var thread    = new NetworkThread(transport);
 
             int received = 0;
             thread.OnPacketReceived += _ => Interlocked.Increment(ref received);
 
             thread.Start();
-            Thread.Sleep(50);
+            SpinWait.SpinUntil(() => false, RunBudgetMs);
             thread.Stop();
             thread.Dispose();
 
@@ -683,9 +688,11 @@ namespace RTMPE.Tests
             thread.Start();
             thread.Stop();
 
-            // Brief wait for background thread to exit
-            Thread.Sleep(50);
-            Assert.IsFalse(thread.IsRunning, "IsRunning must be false after Stop().");
+            // Deterministic: wait on IsRunning's transition rather than a
+            // fixed sleep.  IsRunning flips inside the worker as part of its
+            // exit path, so spinning here is event-driven, not time-driven.
+            bool stopped = SpinWait.SpinUntil(() => !thread.IsRunning, 2000);
+            Assert.IsTrue(stopped, "Background thread did not flip IsRunning=false within 2 s.");
             thread.Dispose();
         }
     }

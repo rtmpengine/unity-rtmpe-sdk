@@ -1,10 +1,10 @@
 // RTMPE SDK — Tests/Runtime/LobbyTests.cs
 //
 // NUnit tests for the lobby system (Phase 1.3):
-//   • LobbyPacketBuilder     — JSON payload construction
-//   • LobbyPacketParser      — JSON room-list parsing
-//   • LobbyQueryOptions      — options validation / defaults
-//   • NetworkConstants       — PacketType discriminant values (0x27–0x2A)
+//  • LobbyPacketBuilder     — JSON payload construction
+//  • LobbyPacketParser      — JSON room-list parsing
+//  • LobbyQueryOptions      — options validation / defaults
+//  • NetworkConstants       — PacketType discriminant values (0x27–0x2A)
 //
 // Pure C# — no Unity engine dependencies; runs in Edit Mode Test Runner.
 

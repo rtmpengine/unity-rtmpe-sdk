@@ -260,7 +260,7 @@ namespace RTMPE.Tests
 
         // ── SDK-C3 regression: NaN/Inf fields must be rejected ────────────────
         //
-        // Before the fix, ReadF32LE could return NaN or ±Infinity for malformed
+       // Before the fix, ReadF32LE could return NaN or ±Infinity for malformed
         // server packets (any IEEE 754 bit pattern in the wire bytes decodes to a
         // float32, including NaN and Inf).  Applying those values to a Unity
         // transform crashes the physics engine.  The fix returns false whenever
@@ -351,7 +351,7 @@ namespace RTMPE.Tests
 
         // ── Quaternion magnitude validation (audit fix C-002 / C-007) ─────────
         //
-        // Quaternions handed to Unity's physics / interpolation APIs MUST be
+       // Quaternions handed to Unity's physics / interpolation APIs MUST be
         // unit-length (|q| = 1).  A corrupted or hostile packet can carry a
         // scaled quaternion; previously the parser accepted it (only NaN/Inf
         // were checked) and the engine silently degraded.  The parser now

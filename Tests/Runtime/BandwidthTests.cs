@@ -8,22 +8,22 @@
 // 50 KB/s (51,200 bytes/s) at the specified 30 Hz tick rate.
 //
 // Corrections vs. original plan (P-5, P-7):
-//   P-5  The plan mixed up "60 Hz" in a comment, but the RTMPE spec is 30 Hz.
-//        All calculations here use TickRate = 30.
-//   P-7  "50 KB/s budget" — correctly interpreted as 50 × 1 024 = 51,200 bytes/s,
-//        NOT 50 000 bytes/s.
+//  P-5  The plan mixed up "60 Hz" in a comment, but the RTMPE spec is 30 Hz.
+//       All calculations here use TickRate = 30.
+//  P-7  "50 KB/s budget" — correctly interpreted as 50 × 1 024 = 51,200 bytes/s,
+//       NOT 50 000 bytes/s.
 //
 // Byte-size constants used throughout:
-//   FullStatePayload  = 48 bytes  (TransformPacketBuilder.PAYLOAD_SIZE)
-//     Layout: ObjectID(8) + Position(12) + Rotation(16) + Scale(12)
+//  FullStatePayload  = 48 bytes  (TransformPacketBuilder.PAYLOAD_SIZE)
+//    Layout: ObjectID(8) + Position(12) + Rotation(16) + Scale(12)
 //
-//   DeltaPayload (server → client, variable length):
-//     HeaderOnly   =  9 bytes  (ObjectID=8 + ChangedMask=1)
-//     PositionOnly = 21 bytes  (9 + pos 12)
-//     PosRot       = 37 bytes  (9 + pos 12 + rot 16)   ← most common 3D case
-//     MaxDelta     = 49 bytes  (9 + pos 12 + rot 16 + scale 12)
+//  DeltaPayload (server → client, variable length):
+//    HeaderOnly   =  9 bytes  (ObjectID=8 + ChangedMask=1)
+//    PositionOnly = 21 bytes  (9 + pos 12)
+//    PosRot       = 37 bytes  (9 + pos 12 + rot 16)   ← most common 3D case
+//    MaxDelta     = 49 bytes  (9 + pos 12 + rot 16 + scale 12)
 //
-//   RTMPE packet header = 13 bytes per packet (PacketHeader fixed size)
+//  RTMPE packet header = 13 bytes per packet (PacketHeader fixed size)
 //
 // Budget per player per tick = bytes × players × tickRate ≤ 51,200 bytes/s
 

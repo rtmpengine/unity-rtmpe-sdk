@@ -3,9 +3,9 @@
 // Decodes the inbound Phase 2 room-management packets broadcast by the
 // gateway's RoomEventReceiver:
 //
-//   • MasterClientChanged (0x2C) — delivered by server → client
-//   • KickPlayer          (0x2E) — delivered by server → client (broadcast)
-//   • SceneLoaded         (0x2F) — delivered by server → client (all-ready)
+//  • MasterClientChanged (0x2C) — delivered by server → client
+//  • KickPlayer          (0x2E) — delivered by server → client (broadcast)
+//  • SceneLoaded         (0x2F) — delivered by server → client (all-ready)
 //
 // The wire format is the JSON shape produced by the Go Room Service event
 // publisher — see modules/room/infrastructure/messaging/nats_master_handler.go
@@ -83,7 +83,7 @@ namespace RTMPE.Rooms
 
         // ── Minimal JSON field extractor ─────────────────────────────────
         //
-        // We deliberately avoid pulling in a full JSON library — every
+       // We deliberately avoid pulling in a full JSON library — every
         // server broadcast at this layer has a fixed 1–3-field shape and a
         // single pass character scanner is cheaper than a generic parser.
         // The helper supports only string values; unknown fields or other

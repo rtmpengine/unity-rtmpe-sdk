@@ -4,11 +4,11 @@
 // Covers the T-N3-01 .. T-N3-05 acceptance criteria from docs/reports/
 // production-gaps-2026-04-21.md:
 //
-//   T-N3-01  First attempt delay is bounded by baseDelay.
-//   T-N3-02  Upper bound doubles each attempt (until clamped).
-//   T-N3-03  Delay is clamped at maxDelay.
-//   T-N3-04  Jitter produces varied delays for concurrent clients.
-//   T-N3-05  Reset() restores attempt counter to zero.
+//  T-N3-01  First attempt delay is bounded by baseDelay.
+//  T-N3-02  Upper bound doubles each attempt (until clamped).
+//  T-N3-03  Delay is clamped at maxDelay.
+//  T-N3-04  Jitter produces varied delays for concurrent clients.
+//  T-N3-05  Reset() restores attempt counter to zero.
 //
 // Pure C# — runs in Edit Mode. The tests inject a fixed RNG seed so each
 // expectation is fully deterministic.

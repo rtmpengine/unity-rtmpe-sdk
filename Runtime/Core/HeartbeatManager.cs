@@ -30,6 +30,13 @@ namespace RTMPE.Core
         private readonly int _intervalMs;
         private const    int MaxMissedAcks = 3;
 
+        // Acks arriving more than this multiple of _intervalMs after the
+        // most-recent send are treated as ghosts from a previous session and
+        // dropped without computing RTT.  Two intervals comfortably covers a
+        // legitimate three-strikes timeout (which would have already fired
+        // OnHeartbeatTimeout) while excluding cross-reconnect leakage.
+        private const    int StaleAckIntervalMultiplier = 2;
+
         // ── State ─────────────────────────────────────────────────────────────
         private bool    _running;
         private long    _lastSendTick;    // Stopwatch ticks at the time of the most-recent send (for interval tracking)
@@ -81,16 +88,28 @@ namespace RTMPE.Core
         /// <summary>
         /// Begin the heartbeat loop. No-op if already running.
         /// </summary>
+        /// <remarks>
+        /// All bookkeeping is reset unconditionally on (re-)Start so a
+        /// previously-Stopped manager that is being re-driven across a
+        /// reconnect cycle observes a clean slate (no carried-over miss
+        /// count, no stale RTT anchor, no spurious "still awaiting an Ack
+        /// from the previous session" race).  Keeping the early-return
+        /// guard while still in the running state prevents the same fields
+        /// from being clobbered if Start is called twice in succession.
+        /// </remarks>
         public void Start()
         {
             if (_running) return;
-            _running        = true;
-            _missedAcks     = 0;
-            _awaitingAck    = false;
-            _lastSendTick   = 0;
+            _running         = true;
+            _missedAcks      = 0;
+            _awaitingAck     = false;
+            _lastSendTick    = 0;
             _pendingSendTick = 0;
             _clock.Restart();
         }
+
+        /// <summary>True while the heartbeat loop is active.</summary>
+        public bool IsRunning => _running;
 
         /// <summary>
         /// Stop the heartbeat loop. No-op if not running.
@@ -159,11 +178,31 @@ namespace RTMPE.Core
             if (!_running) return;
             if (!_awaitingAck) return; // Ignore spurious/duplicate ACKs
 
-            long nowMs  = _clock.ElapsedMilliseconds;
+            // Ghost-RTT guard.  Without it, an Ack delivered after a
+            // Stop/Start reconnect cycle (or arriving very late from the
+            // previous session) would compute RTT against an uninitialised
+            // or stale _pendingSendTick — producing wildly inflated RTT
+            // spikes that cosmetically corrupt server health dashboards and
+            // confuse any adaptive client logic keyed on RTT.  Pin the
+            // invariant: RTT is only computed when an ack arrives within a
+            // small multiple of the interval after the most-recent send.
+            long nowMs = _clock.ElapsedMilliseconds;
+            if (_pendingSendTick <= 0) return;
+            long ageMs = nowMs - _pendingSendTick;
+            if (ageMs < 0 || ageMs > (long)_intervalMs * StaleAckIntervalMultiplier)
+            {
+                // Drop without firing OnRttUpdated.  We still clear
+                // _awaitingAck so the next Tick can issue a fresh
+                // heartbeat instead of being permanently parked waiting
+                // for the ghost.
+                _awaitingAck = false;
+                return;
+            }
+
             // Use _pendingSendTick (set at the start of this heartbeat cycle, never
             // overwritten on retransmits) so RTT reflects the true elapsed time from
             // the first send attempt — not just the most-recent retransmit interval.
-            float rttMs = nowMs - _pendingSendTick;
+            float rttMs = ageMs;
 
             _missedAcks  = 0;
             _awaitingAck = false;

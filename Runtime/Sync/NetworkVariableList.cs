@@ -3,52 +3,52 @@
 // Synchronised List<T> for network-replicated collections (inventory items,
 // active buffs, kill feeds, …).  Modelled on Unity Netcode's NetworkList<T>
 // and Photon's PunRPC-driven list pattern, with the RTMPE specifics:
-//   • Operates inside the existing 30 Hz NetworkVariable flush loop.
-//   • Wire format encodes a delta log (Add / Insert / RemoveAt / Set / Clear)
-//     for steady-state efficiency and a periodic full-sync for safety against
-//     a missed delta.  Late-joiner snapshot uses the FullSync op exclusively.
-//   • Per-element serialisation is delegated to a subclass hook
-//     (WriteElement / ReadElement) so the same delta machinery covers
-//     primitive ints, floats, vectors, strings, and (in future) any
-//     INetworkSerializable.
+//  • Operates inside the existing 30 Hz NetworkVariable flush loop.
+//  • Wire format encodes a delta log (Add / Insert / RemoveAt / Set / Clear)
+//    for steady-state efficiency and a periodic full-sync for safety against
+//    a missed delta.  Late-joiner snapshot uses the FullSync op exclusively.
+//  • Per-element serialisation is delegated to a subclass hook
+//    (WriteElement / ReadElement) so the same delta machinery covers
+//    primitive ints, floats, vectors, strings, and (in future) any
+//    INetworkSerializable.
 //
 // Wire format of a single payload (within the NetworkVariable value frame
 // [value_len:2 LE][bytes]):
 //
-//   [op_count : 1 u8]
-//   op record (per op_count):
-//     [op : 1 u8]
-//     followed by per-op fields (see ListOp).
+//  [op_count : 1 u8]
+//  op record (per op_count):
+//    [op : 1 u8]
+//    followed by per-op fields (see ListOp).
 //
-//   ListOp.Add        : [elem_bytes]                           (always tail-append)
-//   ListOp.Insert     : [index:2 LE ushort][elem_bytes]
-//   ListOp.RemoveAt   : [index:2 LE ushort]
-//   ListOp.Set        : [index:2 LE ushort][elem_bytes]
-//   ListOp.Clear      : (no fields)
-//   ListOp.FullSync   : [count:2 LE ushort][elem_bytes × count] (replaces the list)
+//  ListOp.Add        : [elem_bytes]                           (always tail-append)
+//  ListOp.Insert     : [index:2 LE ushort][elem_bytes]
+//  ListOp.RemoveAt   : [index:2 LE ushort]
+//  ListOp.Set        : [index:2 LE ushort][elem_bytes]
+//  ListOp.Clear      : (no fields)
+//  ListOp.FullSync   : [count:2 LE ushort][elem_bytes × count] (replaces the list)
 //
 // elem_bytes layout depends on the subclass:
-//   NetworkVariableListInt      : 4-byte LE i32
-//   NetworkVariableListFloat    : 4-byte LE f32
-//   NetworkVariableListVector3  : 12-byte LE (x,y,z)
-//   NetworkVariableListString   : 2-byte LE ushort len + UTF-8 bytes
+//  NetworkVariableListInt      : 4-byte LE i32
+//  NetworkVariableListFloat    : 4-byte LE f32
+//  NetworkVariableListVector3  : 12-byte LE (x,y,z)
+//  NetworkVariableListString   : 2-byte LE ushort len + UTF-8 bytes
 //
 // Failure handling:
-//   • Out-of-range Insert / RemoveAt / Set indices are dropped at apply time
-//     with a warning; the rest of the payload continues to apply.  This makes
-//     the receiver tolerant to a delta that was authored against a slightly
-//     newer state without crashing the gameplay layer.
-//   • op_count is a single byte — at most 255 ops per flush.  When more
-//     mutations queue up between two flushes, the surplus is split across
-//     subsequent flushes.  When the local op log exceeds a soft cap
-//     (configurable via FullSyncOpThreshold) we promote to a full-sync to
-//     bound the per-flush bandwidth.
+//  • Out-of-range Insert / RemoveAt / Set indices are dropped at apply time
+//    with a warning; the rest of the payload continues to apply.  This makes
+//    the receiver tolerant to a delta that was authored against a slightly
+//    newer state without crashing the gameplay layer.
+//  • op_count is a single byte — at most 255 ops per flush.  When more
+//    mutations queue up between two flushes, the surplus is split across
+//    subsequent flushes.  When the local op log exceeds a soft cap
+//    (configurable via FullSyncOpThreshold) we promote to a full-sync to
+//    bound the per-flush bandwidth.
 //
 // Performance:
-//   • Mutation methods record a single struct in _pendingOps without
-//     allocating per call; the change list is reused across flushes.
-//   • Serialize iterates the change log into the BinaryWriter and resets
-//     the log on success.
+//  • Mutation methods record a single struct in _pendingOps without
+//    allocating per call; the change list is reused across flushes.
+//  • Serialize iterates the change log into the BinaryWriter and resets
+//    the log on success.
 //
 // Thread safety: same as NetworkVariable<T> — Unity main-thread only for
 // mutation; the network thread reads incoming bytes and dispatches to
@@ -439,6 +439,24 @@ namespace RTMPE.Sync
                     case ListOp.FullSync:
                     {
                         ushort count = reader.ReadUInt16();
+
+                        // Defence against an attacker-controlled wire field:
+                        // pre-allocating capacity for the full uint16 range
+                        // would commit ~512 KB per variable per tick at
+                        // 16-byte elements.  Cap at the configured ceiling and
+                        // reject the entire FullSync if the wire count
+                        // exceeds it — partial application would leave owner
+                        // and receiver visibly desynchronised.
+                        int maxListSize = ResolveMaxListSize();
+                        if (count > maxListSize)
+                        {
+                            Debug.LogWarning(
+                                $"[RTMPE] NetworkVariableList<{typeof(T).Name}>: FullSync " +
+                                $"count {count} exceeds configured max " +
+                                $"{maxListSize}.  Rejecting payload.");
+                            return;
+                        }
+
                         _items.Clear();
                         _items.Capacity = Math.Max(_items.Capacity, count);
                         for (int k = 0; k < count; k++)
@@ -450,7 +468,21 @@ namespace RTMPE.Sync
                                     "payload truncated.  Stopping early.");
                                 break;
                             }
-                            _items.Add(ReadElement(reader));
+                            try
+                            {
+                                _items.Add(ReadElement(reader));
+                            }
+                            catch (Exception ex)
+                            {
+                                // A single malformed element aborts the FullSync rather
+                                // than leaving the list in a partially-populated state.
+                                Debug.LogWarning(
+                                    $"[RTMPE] NetworkVariableList<{typeof(T).Name}>: FullSync " +
+                                    $"element {k} failed deserialization ({ex.GetType().Name}).  " +
+                                    "Aborting FullSync to avoid partial state.");
+                                _items.Clear();
+                                return;
+                            }
                         }
                         Raise(new NetworkVariableListChangeEvent<T>(
                             NetworkListChangeKind.FullSync, -1, default, default));
@@ -493,6 +525,25 @@ namespace RTMPE.Sync
             }
         }
 
+        // Test seam: per-instance override of the FullSync size cap so unit
+        // tests can exercise the gate without standing up a full
+        // NetworkManager + NetworkSettings asset.  Negative leaves the
+        // setting-driven default in effect.
+        private int _testMaxListSize = -1;
+
+        internal void SetMaxListSizeForTest(int max) => _testMaxListSize = max;
+
+        private int ResolveMaxListSize()
+        {
+            if (_testMaxListSize >= 0) return _testMaxListSize;
+
+            // Look up the live setting; fall back to a conservative default
+            // when no NetworkManager is present (e.g. server-side unit tests).
+            var settings = RTMPE.Core.NetworkManager.Instance?.Settings;
+            if (settings != null && settings.maxNetworkVariableListSize > 0)
+                return settings.maxNetworkVariableListSize;
+            return 1024;
+        }
     }
 
     /// <summary>Kind of change reported by <see cref="NetworkVariableList{T}.OnListChanged"/>.</summary>

@@ -3,10 +3,10 @@
 // One frame of player input, tick-stamped and wire-serialisable.
 //
 // Wire format (13 bytes, all little-endian):
-//   [0..3]   tick   : u32  — monotone client tick counter
-//   [4..7]   move_x : f32  — horizontal movement input, clamped to [-1, 1]
-//   [8..11]  move_y : f32  — vertical   movement input, clamped to [-1, 1]
-//   [12]     flags  : u8   — bit 0 = Jump, bits 1-7 reserved
+//  [0..3]   tick   : u32  — monotone client tick counter
+//  [4..7]   move_x : f32  — horizontal movement input, clamped to [-1, 1]
+//  [8..11]  move_y : f32  — vertical   movement input, clamped to [-1, 1]
+//  [12]     flags  : u8   — bit 0 = Jump, bits 1-7 reserved
 //
 // No UnityEngine dependency so this file compiles in both Unity and plain
 // .NET xunit projects without stubs.
@@ -63,11 +63,24 @@ namespace RTMPE.Core
         public static InputPayload ReadFrom(byte[] buf, int offset)
         {
             if (buf == null) throw new ArgumentNullException(nameof(buf));
+            float moveX = ReadF32LE(buf, offset + 4);
+            float moveY = ReadF32LE(buf, offset + 8);
+            // Reject NaN / ±Inf at the parser boundary. These values would
+            // otherwise propagate into Unity transforms / physics and pin
+            // the simulation in an unrecoverable state.
+            if (float.IsNaN(moveX) || float.IsInfinity(moveX))
+            {
+                throw new InvalidOperationException("InputPayload.MoveX is not finite");
+            }
+            if (float.IsNaN(moveY) || float.IsInfinity(moveY))
+            {
+                throw new InvalidOperationException("InputPayload.MoveY is not finite");
+            }
             return new InputPayload
             {
                 Tick  = ReadU32LE(buf, offset),
-                MoveX = ReadF32LE(buf, offset + 4),
-                MoveY = ReadF32LE(buf, offset + 8),
+                MoveX = moveX,
+                MoveY = moveY,
                 Jump  = (buf[offset + 12] & FlagJump) != 0,
             };
         }

@@ -6,12 +6,12 @@
 //
 // Wire format (all little-endian, raw binary):
 //
-//   [0..1]      count : u16  — number of InputPayload entries that follow
-//   [2..2+13*N] payload entries, each 13 bytes:
-//     [+0..3] tick   : u32
-//     [+4..7] move_x : f32
-//     [+8..11] move_y : f32
-//     [+12]    flags  : u8 (bit 0 = Jump)
+//  [0..1]      count : u16  — number of InputPayload entries that follow
+//  [2..2+13*N] payload entries, each 13 bytes:
+//    [+0..3] tick   : u32
+//    [+4..7] move_x : f32
+//    [+8..11] move_y : f32
+//    [+12]    flags  : u8 (bit 0 = Jump)
 //
 // Total wire size: 2 + 13 * count bytes.
 //
@@ -22,9 +22,9 @@
 // player_id it liked on its own inputs.
 //
 // MUST stay in sync with:
-//   - PacketType.InputPayload = 0x43 (NetworkConstants.cs)
-//   - PacketType::InputPayload = 0x43 (modules/gateway/src/packet/header.rs)
-//   - InputPayloadParser (Go side, modules/synchronization/.../input_payload.go)
+//  - PacketType.InputPayload = 0x43 (NetworkConstants.cs)
+//  - PacketType::InputPayload = 0x43 (modules/gateway/src/packet/header.rs)
+//  - InputPayloadParser (Go side, modules/synchronization/.../input_payload.go)
 //
 // No UnityEngine dependency — testable from pure .NET xunit projects.
 
@@ -48,13 +48,13 @@ namespace RTMPE.Sync
         /// Maximum number of <see cref="InputPayload"/> entries that fit in a
         /// single 0x43 packet.  Bounded by:
         ///
-        /// <list type="bullet">
+       /// <list type="bullet">
         /// <item>The u16 count field (65 535 logical max).</item>
         /// <item><see cref="InputBuffer.Capacity"/> (= 64 today) — the SDK
         /// can never accumulate more than the ring buffer allows.</item>
         /// </list>
         ///
-        /// Set to <see cref="InputBuffer.Capacity"/> so any full ring buffer
+       /// Set to <see cref="InputBuffer.Capacity"/> so any full ring buffer
         /// fits in one packet without forcing the caller to loop or
         /// fragment.  At 30 Hz this caps wire size at 2 + 13×64 = 834 bytes.
         /// </summary>

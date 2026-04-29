@@ -35,12 +35,12 @@ namespace RTMPE.Tests.Performance
     /// Baseline throughput + allocation measurements for the wire-protocol
     /// path.  Each method follows the Unity.PerformanceTesting idiom:
     ///
-    ///   Measure.Method(() => { /* hot-path call */ })
-    ///       .WarmupCount(N)
-    ///       .MeasurementCount(M)
-    ///       .Run();
+   ///  Measure.Method(() => { /* hot-path call */ })
+    ///      .WarmupCount(N)
+    ///      .MeasurementCount(M)
+    ///      .Run();
     ///
-    /// Iteration counts are chosen to bring each measurement batch above the
+   /// Iteration counts are chosen to bring each measurement batch above the
     /// scheduler quantum (~1 ms on modern CPUs) so GC jitter + cache-miss
     /// variance have a chance to reveal regressions.
     /// </summary>
@@ -128,7 +128,7 @@ namespace RTMPE.Tests.Performance
                 .Run();
         }
 
-        // ── NetworkVariable hot path (covers the ArrayPool adoption M-5) ────
+        // ── NetworkVariable hot path (covers the ArrayPool adoption ) ────
 
         [Test, Performance]
         public void Perf_NetworkVariable_SerializeWithId_Int()

@@ -10,7 +10,7 @@
 //
 // Internal members (Initialize, SetSpawned, SetOwner, SetLocalPlayerStringId)
 // are accessible because AssemblyInfo.cs declares:
-//   [assembly: InternalsVisibleTo("RTMPE.SDK.Tests")]
+//  [assembly: InternalsVisibleTo("RTMPE.SDK.Tests")]
 
 using NUnit.Framework;
 using UnityEngine;
@@ -301,6 +301,68 @@ namespace RTMPE.Tests
         public void NetworkManager_LocalPlayerStringId_NullByDefault()
         {
             Assert.IsNull(_manager.LocalPlayerStringId);
+        }
+
+        // ── Cached local-player snapshot ───────────────────────────────────────
+
+        [Test]
+        [Description("IsOwner returns true after Initialize captures the local-player UUID, even " +
+                     "if NetworkManager.Instance is later torn down (OnDestroy/OnApplicationQuit).")]
+        public void IsOwner_RemainsTrue_AfterInstanceTeardown()
+        {
+            _manager.SetLocalPlayerStringId("player-uuid-abc");
+            _testObject = new GameObject("obj");
+            var nb = _testObject.AddComponent<ConcreteNetworkBehaviour>();
+            nb.Initialize(1UL, "player-uuid-abc");
+            // Confirm the precondition.
+            Assert.IsTrue(nb.IsOwner);
+
+            // Tear down the manager — NetworkManager.Instance now returns null.
+            Object.DestroyImmediate(_nmGo);
+            _nmGo = null;
+            Assert.IsNull(NetworkManager.Instance,
+                "Precondition: Instance must be null after manager destruction.");
+
+            // IsOwner must still return true so OnDestroy can take owner cleanup.
+            Assert.IsTrue(nb.IsOwner,
+                "IsOwner must remain true post-Instance-teardown using the cached snapshot.");
+        }
+
+        [Test]
+        [Description("IsOwner returns false post-Instance-teardown when the captured local-player " +
+                     "UUID does not match the owner.")]
+        public void IsOwner_FalseAfterInstanceTeardown_WhenOwnerMismatch()
+        {
+            _manager.SetLocalPlayerStringId("player-uuid-self");
+            _testObject = new GameObject("obj");
+            var nb = _testObject.AddComponent<ConcreteNetworkBehaviour>();
+            nb.Initialize(1UL, "player-uuid-other");
+
+            Object.DestroyImmediate(_nmGo);
+            _nmGo = null;
+            Assert.IsNull(NetworkManager.Instance);
+
+            Assert.IsFalse(nb.IsOwner,
+                "Cached snapshot must still differentiate non-owner objects post-teardown.");
+        }
+
+        [Test]
+        [Description("SetSpawned(true) refreshes the cached local-player UUID so a reconnect that " +
+                     "minted a new local id between Initialize and Spawn is observable.")]
+        public void SetSpawned_RefreshesCachedLocalPlayerId()
+        {
+            _manager.SetLocalPlayerStringId("old-id");
+            _testObject = new GameObject("obj");
+            var nb = _testObject.AddComponent<ConcreteNetworkBehaviour>();
+            nb.Initialize(1UL, "new-id");
+            Assert.IsFalse(nb.IsOwner, "Pre-spawn cache should reflect the old local id.");
+
+            // Reconnect produces a new local player id before spawn fires.
+            _manager.SetLocalPlayerStringId("new-id");
+            nb.SetSpawned(true);
+
+            Assert.IsTrue(nb.IsOwner,
+                "SetSpawned(true) must refresh the cache so the post-reconnect id is observable.");
         }
 
         // ── Concrete test double ───────────────────────────────────────────────

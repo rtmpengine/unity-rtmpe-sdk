@@ -5,11 +5,11 @@
 // the full wire packet (13-byte standard header + RPC payload).
 //
 // Wire format (all little-endian):
-//   [method_id  : 4 LE u32]   — identifies the registered handler
-//   [sender_id  : 8 LE u64]   — player/session ID (verified by server JWT)
-//   [request_id : 4 LE u32]   — client correlation ID for async response matching
-//   [payload_len: 2 LE u16]   — length of the variable method-specific payload
-//   [payload    : N bytes]    — method-specific data (max 4096 bytes)
+//  [method_id  : 4 LE u32]   — identifies the registered handler
+//  [sender_id  : 8 LE u64]   — player/session ID (verified by server JWT)
+//  [request_id : 4 LE u32]   — client correlation ID for async response matching
+//  [payload_len: 2 LE u16]   — length of the variable method-specific payload
+//  [payload    : N bytes]    — method-specific data (max 4096 bytes)
 //
 // Total overhead: 18 bytes + N.
 

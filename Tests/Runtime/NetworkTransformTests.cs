@@ -12,8 +12,8 @@
 // The send path is covered by integration tests.
 //
 // Setup/Teardown pattern matches NetworkBehaviourTests.cs:
-//   SetUp   — create a minimal NetworkManager + the test GameObject.
-//   TearDown — DestroyImmediate both so the singleton is clean.
+//  SetUp   — create a minimal NetworkManager + the test GameObject.
+//  TearDown — DestroyImmediate both so the singleton is clean.
 
 using NUnit.Framework;
 using UnityEngine;
@@ -144,6 +144,62 @@ namespace RTMPE.Tests
             Assert.AreEqual(expectedPos,   _go.transform.position,   "Position should be applied");
             Assert.AreEqual(expectedRot,   _go.transform.rotation,   "Rotation should be applied");
             Assert.AreEqual(originalScale, _go.transform.localScale, "Scale must NOT change (syncScale=false)");
+        }
+
+        // ── Owner velocity cap (anti-cheat scaffold) ─────────────────────
+
+        [Test]
+        [Description("ClampOwnerVelocity passes a candidate through unchanged when no baseline has been captured yet (first send after spawn).")]
+        public void ClampOwnerVelocity_NoBaseline_ReturnsCandidateUnchanged()
+        {
+            // No PrimeVelocityBaselineForTest call → _hasLastSent stays false.
+            var candidate = new Vector3(1000f, 0f, 0f);
+            var result    = _nt.ClampOwnerVelocityForTest(candidate);
+            Assert.AreEqual(candidate, result);
+        }
+
+        [Test]
+        [Description("ClampOwnerVelocity clamps a candidate that exceeds the configured cap to the maximum permitted distance from the previous send.")]
+        public void ClampOwnerVelocity_ExceedsCap_ClampsToMaxDistance()
+        {
+            // Default cap is 50 m/s.  Prime the baseline at the origin; ten
+            // milliseconds later the candidate is 100 m away (10 000 m/s
+            // apparent velocity, way over).  Clamp must reduce the magnitude
+            // to at most 50 * 0.01 = 0.5 m.
+            _nt.PrimeVelocityBaselineForTest(Vector3.zero, Time.unscaledTimeAsDouble - 0.01);
+
+            var candidate = new Vector3(100f, 0f, 0f);
+            var clamped   = _nt.ClampOwnerVelocityForTest(candidate);
+
+            Assert.LessOrEqual(clamped.magnitude, 0.5f + 1e-3f);
+            Assert.GreaterOrEqual(clamped.magnitude, 0.5f - 1e-3f);
+        }
+
+        [Test]
+        [Description("ClampOwnerVelocity leaves a within-cap candidate untouched.")]
+        public void ClampOwnerVelocity_WithinCap_PassesThrough()
+        {
+            _nt.PrimeVelocityBaselineForTest(Vector3.zero, Time.unscaledTimeAsDouble - 0.5);
+            // 5 m in 500 ms = 10 m/s → well under the 50 m/s default.
+            var candidate = new Vector3(5f, 0f, 0f);
+            var result    = _nt.ClampOwnerVelocityForTest(candidate);
+            Assert.AreEqual(candidate, result);
+        }
+
+        [Test]
+        [Description("OwnerTeleportTo bypasses the velocity cap on the next clamp call by clearing the baseline-captured flag.")]
+        public void OwnerTeleportTo_BypassesCap()
+        {
+            _nt.PrimeVelocityBaselineForTest(Vector3.zero, Time.unscaledTimeAsDouble);
+
+            var teleportTarget = new Vector3(10_000f, 0f, 0f);
+            _nt.OwnerTeleportTo(teleportTarget);
+
+            // Immediately after a teleport, a candidate at the new position
+            // must pass the clamp unchanged — the next send is treated as
+            // the first send relative to the new baseline.
+            var clamped = _nt.ClampOwnerVelocityForTest(teleportTarget);
+            Assert.AreEqual(teleportTarget, clamped);
         }
     }
 }

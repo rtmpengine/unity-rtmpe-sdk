@@ -3,13 +3,13 @@
 // Narrow write API exposed to INetworkSerializable implementations.
 //
 // Why a dedicated interface (and not BinaryWriter):
-//   • BinaryWriter writes strings with a 7-bit-encoded length prefix that is
-//     incompatible with the rest of the RTMPE wire format (Go server expects
-//     2-byte LE ushort length).  Forcing implementers to use BinaryWriter
-//     would either invite that mismatch or require a manual byte-by-byte
-//     encoding everywhere.
-//   • Allows the SDK to swap the backing store (byte[] / Span<byte> /
-//     pre-rented pool buffer) without breaking author-written serializers.
+//  • BinaryWriter writes strings with a 7-bit-encoded length prefix that is
+//    incompatible with the rest of the RTMPE wire format (Go server expects
+//    2-byte LE ushort length).  Forcing implementers to use BinaryWriter
+//    would either invite that mismatch or require a manual byte-by-byte
+//    encoding everywhere.
+//  • Allows the SDK to swap the backing store (byte[] / Span<byte> /
+//    pre-rented pool buffer) without breaking author-written serializers.
 //
 // All multi-byte primitives are little-endian to match the rest of RpcSerializer.
 

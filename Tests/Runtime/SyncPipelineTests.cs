@@ -8,42 +8,42 @@
 //
 // Data flow tested:
 //
-//   SEND PATH (client → server):
-//     NetworkTransform.GetState()
-//       → TransformPacketBuilder.BuildUpdatePayload()
-//           → 48-byte UDP payload (Go server reads as ObjectState)
+//  SEND PATH (client → server):
+//    NetworkTransform.GetState()
+//      → TransformPacketBuilder.BuildUpdatePayload()
+//          → 48-byte UDP payload (Go server reads as ObjectState)
 //
-//   RECEIVE PATH (server → client):
-//     Go StateDelta.Serialize() produces 9–49 bytes (manual mock here)
-//       → TransformPacketParser.TryParseStateDelta()
-//           → NetworkTransformInterpolator.AddState()
-//               → TryInterpolate()
-//                   → GameObject.transform.position / rotation / scale
+//  RECEIVE PATH (server → client):
+//    Go StateDelta.Serialize() produces 9–49 bytes (manual mock here)
+//      → TransformPacketParser.TryParseStateDelta()
+//          → NetworkTransformInterpolator.AddState()
+//              → TryInterpolate()
+//                  → GameObject.transform.position / rotation / scale
 //
-//   VARIABLE PIPELINE (owner client):
-//     NetworkVariable<T>.Value = x   →  IsDirty = true
-//       → Serialize(BinaryWriter)
-//           → bytes transmitted
-//               → target: SetValueWithoutNotify(Deserialize(BinaryReader))
-//                   → IsDirty remains false, no event on receiver
+//  VARIABLE PIPELINE (owner client):
+//    NetworkVariable<T>.Value = x   →  IsDirty = true
+//      → Serialize(BinaryWriter)
+//          → bytes transmitted
+//              → target: SetValueWithoutNotify(Deserialize(BinaryReader))
+//                  → IsDirty remains false, no event on receiver
 //
 // Plan bugs corrected (P-1 … P-8):
-//   P-1  async Task not supported by Unity NUnit — all tests are synchronous.
-//   P-2  CreateClient() / host.CreateRoom() / etc. are undefined helpers.
-//        Integration is verified at the byte+API boundary instead.
-//   P-3  await Task.Delay(100) not available — timing tested via
-//        explicit renderTime injection into TryInterpolate().
-//   P-4  MeasureRoundTrip() undefined — Stopwatch-based throughput tests used.
-//   P-5  Bandwidth budget used 60 Hz — spec is 30 Hz; corrected in BandwidthTests.
-//   P-6  latencies[500] hardcoded index — corrected to length-relative.
-//   P-7  host.Spawn() / client.GetObject() undefined — GetState/ApplyState used.
-//   P-8  TransformPacketParser.ReadF32LE / ReadU64LE are private; test helper
-//        WriteF32LE / WriteU64LE reimplements the same LE encoding independently.
+//  P-1  async Task not supported by Unity NUnit — all tests are synchronous.
+//  P-2  CreateClient() / host.CreateRoom() / etc. are undefined helpers.
+//       Integration is verified at the byte+API boundary instead.
+//  P-3  await Task.Delay(100) not available — timing tested via
+//       explicit renderTime injection into TryInterpolate().
+//  P-4  MeasureRoundTrip() undefined — Stopwatch-based throughput tests used.
+//  P-5  Bandwidth budget used 60 Hz — spec is 30 Hz; corrected in BandwidthTests.
+//  P-6  latencies[500] hardcoded index — corrected to length-relative.
+//  P-7  host.Spawn() / client.GetObject() undefined — GetState/ApplyState used.
+//  P-8  TransformPacketParser.ReadF32LE / ReadU64LE are private; test helper
+//       WriteF32LE / WriteU64LE reimplements the same LE encoding independently.
 //
 // Test fixtures:
-//   ReceivePipelineIntegrationTests — StateDelta bytes → Parser → Interpolator
-//   NetworkVariablePipelineTests    — NetworkVariable Serialize/Deserialize chain
-//   SyncPerformanceTests            — Stopwatch throughput for hot-path ops
+//  ReceivePipelineIntegrationTests — StateDelta bytes → Parser → Interpolator
+//  NetworkVariablePipelineTests    — NetworkVariable Serialize/Deserialize chain
+//  SyncPerformanceTests            — Stopwatch throughput for hot-path ops
 
 using System;
 using System.Diagnostics;
@@ -57,7 +57,7 @@ namespace RTMPE.Tests
 {
     // ═════════════════════════════════════════════════════════════════════════
     // RECEIVE PIPELINE: StateDelta bytes → TransformPacketParser
-    //                                    → NetworkTransformInterpolator
+    //                                   → NetworkTransformInterpolator
     // ═════════════════════════════════════════════════════════════════════════
 
     /// <summary>
@@ -660,7 +660,7 @@ namespace RTMPE.Tests
         {
             // Scenario: receiver OWNS the variable locally and sets it via Value setter.
             // (Deserialize uses SetValueWithoutNotify — no event.  This test verifies
-            //  the setter path that would be used by game code reading a server ack.)
+            // the setter path that would be used by game code reading a server ack.)
             var v = new NetworkVariableInt(_owner, 0, 0);
             int callCount = 0;
             v.OnValueChanged += (_, __) => callCount++;

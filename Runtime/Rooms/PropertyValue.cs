@@ -5,9 +5,9 @@
 // (see modules/room/domain/entities/properties.go).
 //
 // Wire limits (also enforced server-side):
-//   • max 20 properties per room, 10 per player
-//   • max 32-byte UTF-8 key
-//   • max 512-byte serialised value
+//  • max 20 properties per room, 10 per player
+//  • max 32-byte UTF-8 key
+//  • max 512-byte serialised value
 
 using System;
 using UnityEngine;
@@ -56,7 +56,7 @@ namespace RTMPE.Rooms
     /// <summary>
     /// Immutable typed custom-property value.
     ///
-    /// Construct via one of the static factory methods (<see cref="OfInt"/>,
+   /// Construct via one of the static factory methods (<see cref="OfInt"/>,
     /// <see cref="OfFloat"/>, …) so the type/value coupling is always valid.
     /// Readers MAY inspect <see cref="Type"/> to dispatch on kind and then use
     /// the matching accessor — the mismatching accessors throw
@@ -115,12 +115,20 @@ namespace RTMPE.Rooms
             => new PropertyValue(PropertyType.String, s: v ?? string.Empty);
 
         /// <summary>
-        /// Construct a typed byte-array value.  The SDK does NOT copy the
-        /// supplied array — callers must treat it as owned by the value.
+        /// Construct a typed byte-array value.  The input array is
+        /// <b>defensively copied</b> so subsequent caller-side mutation
+        /// cannot break the <c>readonly struct</c> immutability contract.
         /// A null input is normalised to <c>Array.Empty&lt;byte&gt;()</c>.
         /// </summary>
         public static PropertyValue OfBytes(byte[] v)
-            => new PropertyValue(PropertyType.Bytes, bs: v ?? Array.Empty<byte>());
+        {
+            if (v == null || v.Length == 0)
+                return new PropertyValue(PropertyType.Bytes, bs: Array.Empty<byte>());
+
+            var copy = new byte[v.Length];
+            Buffer.BlockCopy(v, 0, copy, 0, v.Length);
+            return new PropertyValue(PropertyType.Bytes, bs: copy);
+        }
 
         /// <summary>Construct a typed <see cref="UnityEngine.Vector3"/> value.</summary>
         public static PropertyValue OfVector3(UnityEngine.Vector3 v)
@@ -160,8 +168,29 @@ namespace RTMPE.Rooms
             return _string ?? string.Empty;
         }
 
-        /// <summary>Returns the underlying bytes when <see cref="Type"/> is <see cref="PropertyType.Bytes"/>.</summary>
+        /// <summary>
+        /// Returns the underlying bytes as a fresh, owned <see cref="T:byte[]"/>
+        /// when <see cref="Type"/> is <see cref="PropertyType.Bytes"/>.  The
+        /// returned array is a <b>defensive copy</b>: caller-side mutation
+        /// will not affect this value or any other reader.  Prefer
+        /// <see cref="AsBytesReadOnly"/> on hot paths to skip the allocation.
+        /// </summary>
         public byte[] AsBytes()
+        {
+            Require(PropertyType.Bytes);
+            if (_bytes == null || _bytes.Length == 0) return Array.Empty<byte>();
+            var copy = new byte[_bytes.Length];
+            Buffer.BlockCopy(_bytes, 0, copy, 0, _bytes.Length);
+            return copy;
+        }
+
+        /// <summary>
+        /// Returns a read-only view over the underlying bytes when
+        /// <see cref="Type"/> is <see cref="PropertyType.Bytes"/>.  No
+        /// allocation; the caller cannot mutate the contents through the
+        /// returned <see cref="ReadOnlyMemory{T}"/>.
+        /// </summary>
+        public ReadOnlyMemory<byte> AsBytesReadOnly()
         {
             Require(PropertyType.Bytes);
             return _bytes ?? Array.Empty<byte>();
@@ -203,7 +232,7 @@ namespace RTMPE.Rooms
                 case PropertyType.Float:   return _float;
                 case PropertyType.Bool:    return _bool;
                 case PropertyType.String:  return _string ?? string.Empty;
-                case PropertyType.Bytes:   return _bytes  ?? Array.Empty<byte>();
+                case PropertyType.Bytes:   return AsBytes(); // defensive-copy to preserve immutability
                 case PropertyType.Vector3: return _vector3;
                 case PropertyType.Color:   return _color;
                 default:
@@ -247,12 +276,58 @@ namespace RTMPE.Rooms
                     case PropertyType.Float:   return h ^ _float.GetHashCode();
                     case PropertyType.Bool:    return h ^ (_bool ? 1 : 0);
                     case PropertyType.String:  return h ^ (_string?.GetHashCode() ?? 0);
-                    case PropertyType.Bytes:   return h ^ (_bytes?.Length ?? 0);
+                    // Hash CONTENT (not just length) so an attacker cannot
+                    // craft a bag of distinct same-length byte arrays that
+                    // collide into one bucket and turn an O(1) dictionary
+                    // into an O(n²) DoS surface.  FNV-1a over the full content
+                    // for arrays up to 64 bytes; sample 16 evenly-spaced bytes
+                    // plus the length for larger arrays — the sampled hash
+                    // remains crafted-collision-resistant within reason while
+                    // capping per-call cost at 16 reads.
+                    case PropertyType.Bytes:   return h ^ HashBytes(_bytes);
                     case PropertyType.Vector3: return h ^ _vector3.GetHashCode();
                     case PropertyType.Color:   return h ^ _color.GetHashCode();
                     default: return h;
                 }
             }
+        }
+
+        // FNV-1a content hash with a sampling strategy for large arrays.
+        // Bytes-keyed dictionaries built from PropertyValue are now resistant
+        // to crafted collision attacks within reason — an attacker would have
+        // to predict the (sampled) FNV-1a output, which is far harder than
+        // matching only on Length.
+        private static int HashBytes(byte[] data)
+        {
+            if (data == null || data.Length == 0) return 0;
+
+            const uint FnvOffset = 2166136261u;
+            const uint FnvPrime  = 16777619u;
+            uint hash = FnvOffset;
+
+            // Always mix length so two different-length arrays cannot collide
+            // through the byte-sampling window alone.
+            hash = (hash ^ (uint)data.Length) * FnvPrime;
+
+            int n = data.Length;
+            if (n <= 64)
+            {
+                for (int i = 0; i < n; i++)
+                    hash = (hash ^ data[i]) * FnvPrime;
+            }
+            else
+            {
+                // Evenly-spaced sample across the array so an attacker
+                // appending zeros cannot land all writes outside the
+                // sampled window.
+                const int Samples = 16;
+                for (int s = 0; s < Samples; s++)
+                {
+                    int idx = (int)((long)s * (n - 1) / (Samples - 1));
+                    hash = (hash ^ data[idx]) * FnvPrime;
+                }
+            }
+            return unchecked((int)hash);
         }
 
         private static bool BytesEqual(byte[] a, byte[] b)

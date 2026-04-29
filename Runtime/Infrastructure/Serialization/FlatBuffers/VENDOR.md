@@ -29,6 +29,33 @@ Unity does not consume `dotnet` NuGet packages directly, and the `Google.FlatBuf
 
 Total: ~125 KB of source; zero new package references.
 
+## Local hardening
+
+The vendored copy is **not byte-identical** with upstream `25.12.19`. The following
+files contain receive-path security hardening that must be carried forward whenever
+this directory is re-vendored:
+
+- `Table.cs`
+  - `__string` now caps length at `MaxStringBytes = 4096`, decodes with a
+    strict UTF-8 decoder that throws on malformed input, and rejects
+    embedded NUL bytes.
+  - `__vector_len` now caps length at `MaxVectorElements = 65536` and
+    rejects negative wire values.
+  - `__vector_as_array<T>` and `__vector_as_span<T>` no longer throw
+    `NotSupportedException` on big-endian hosts; they fall back to an
+    endian-aware element-by-element reader (`ReadTypedArrayBigEndian<T>`)
+    so a single received packet cannot crash a BE-target build.
+- `ByteBuffer.cs`
+  - `AssertOffsetAndLength` performs an unconditional in-buffer range
+    check even under `BYTEBUFFER_NO_BOUNDS_CHECK`. The build flag now
+    only opts out of strict alignment / multiple-of-T validation; it no
+    longer turns the reader into an arbitrary-read primitive when fed
+    adversarial input.
+  - `GetStringUTF8Strict` is a new accessor invoked from `Table.__string`.
+
+When upgrading, re-apply these changes by hand or rebase the upstream patch
+against this directory before the vendored copy is overwritten.
+
 ## Updating
 
 To upgrade the runtime, re-run from the repo root:

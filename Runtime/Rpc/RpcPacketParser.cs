@@ -5,13 +5,13 @@
 // transport layer — this parser operates on the RPC payload portion only.
 //
 // Wire format (all little-endian):
-//   [request_id  : 4 LE u32]   — echoed from request for correlation
-//   [method_id   : 4 LE u32]   — method that produced this response
-//   [sender_id   : 8 LE u64]   — server-verified sender ID
-//   [success     : 1 u8]       — 1=success, 0=failure
-//   [error_code  : 2 LE u16]   — 0=OK, 1-4=error (see RpcErrorCode)
-//   [payload_len : 2 LE u16]   — length of optional response payload
-//   [payload     : N bytes]    — optional method-specific response data
+//  [request_id  : 4 LE u32]   — echoed from request for correlation
+//  [method_id   : 4 LE u32]   — method that produced this response
+//  [sender_id   : 8 LE u64]   — server-verified sender ID
+//  [success     : 1 u8]       — 1=success, 0=failure
+//  [error_code  : 2 LE u16]   — 0=OK, 1-4=error (see RpcErrorCode)
+//  [payload_len : 2 LE u16]   — length of optional response payload
+//  [payload     : N bytes]    — optional method-specific response data
 //
 // Total header: 21 bytes + N.
 
@@ -163,7 +163,7 @@ namespace RTMPE.Rpc
         /// Build an RPC response payload.  This method is the server-side /
         /// test-fixture counterpart to <see cref="TryParseResponse"/>.
         ///
-        /// Visibility: <c>internal</c>.  Client code (game scripts that import
+       /// Visibility: <c>internal</c>.  Client code (game scripts that import
         /// the SDK) must NOT construct response packets — doing so bypasses the
         /// server-authoritative trust model and could corrupt a peer's state
         /// if the bytes reach the network.  Unit tests access this method via

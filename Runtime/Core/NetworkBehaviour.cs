@@ -3,19 +3,19 @@
 // Base class for all networked GameObjects in RTMPE.
 //
 // Design decisions:
-//   • _ownerPlayerId is a string (UUID) to match PlayerInfo.PlayerId and the
-//     room service player identifiers.  The gateway session ID (u64) is a
-//     DIFFERENT concept stored in NetworkManager.LocalPlayerId.
-//   • IsOwner compares string UUIDs and short-circuits on null/empty so that
-//     uninitialized objects never falsely claim ownership (unlike a ulong==0
-//     comparison which would return true for every uninitialized object).
-//   • Initialize / SetSpawned / SetOwner are internal so only the RTMPE SDK
-//     itself (SpawnManager) can mutate network object state.
-//     RTMPE.SDK.Tests can also call them via InternalsVisibleTo (AssemblyInfo.cs).
-//   • DestroyWithOwner is declared here; enforcement is implemented by
-//     SpawnManager when it handles PlayerLeft events.
-//   • IsOwner accesses NetworkManager.Instance — safe for main-thread MonoBehaviour
-//     code (OnNetworkSpawn, OnOwnershipChanged, etc. all run on main thread).
+//  • _ownerPlayerId is a string (UUID) to match PlayerInfo.PlayerId and the
+//    room service player identifiers.  The gateway session ID (u64) is a
+//    DIFFERENT concept stored in NetworkManager.LocalPlayerId.
+//  • IsOwner compares string UUIDs and short-circuits on null/empty so that
+//    uninitialized objects never falsely claim ownership (unlike a ulong==0
+//    comparison which would return true for every uninitialized object).
+//  • Initialize / SetSpawned / SetOwner are internal so only the RTMPE SDK
+//    itself (SpawnManager) can mutate network object state.
+//    RTMPE.SDK.Tests can also call them via InternalsVisibleTo (AssemblyInfo.cs).
+//  • DestroyWithOwner is declared here; enforcement is implemented by
+//    SpawnManager when it handles PlayerLeft events.
+//  • IsOwner accesses NetworkManager.Instance — safe for main-thread MonoBehaviour
+//    code (OnNetworkSpawn, OnOwnershipChanged, etc. all run on main thread).
 
 using System;
 using System.Collections.Generic;
@@ -40,6 +40,17 @@ namespace RTMPE.Core
         private ulong  _networkObjectId;
         private string _ownerPlayerId = string.Empty;
         private bool   _isSpawned;
+
+        // Captured at spawn so IsOwner remains correct after the
+        // NetworkManager singleton has been torn down (OnApplicationQuit,
+        // domain reload, scene unload).  Without this snapshot OnDestroy of a
+        // spawned prefab cannot distinguish owner-only cleanup paths from
+        // remote-replica paths once Instance returns null, and the owning
+        // client leaks any native resources owned by the IsOwner branch.
+        // Refreshed by SetSpawned(true) on every spawn transition so a
+        // reconnect that produces a new local player id picks up the latest
+        // value before user code sees IsOwner.
+        private string _cachedLocalPlayerId = string.Empty;
 
         // List of all NetworkVariables registered during OnNetworkSpawn.
         // Populated by NetworkVariableBase constructors via TrackVariable().
@@ -117,11 +128,14 @@ namespace RTMPE.Core
         /// <summary>
         /// True when this object is owned by the local player.
         ///
-        /// Compares <see cref="OwnerPlayerId"/> against
-        /// <see cref="NetworkManager.LocalPlayerStringId"/> (the room UUID set by
-        /// <c>RoomManager</c> after JoinRoom/CreateRoom succeeds).
+       /// Compares <see cref="OwnerPlayerId"/> against the local player UUID
+        /// captured at <c>OnNetworkSpawn</c> time from
+        /// <see cref="NetworkManager.LocalPlayerStringId"/>.  The captured
+        /// snapshot survives <c>NetworkManager</c> teardown so
+        /// <c>OnDestroy</c> can still take the owner-only cleanup branch
+        /// after the application has begun quitting.
         ///
-        /// Returns <see langword="false"/> when either ID is null or empty,
+       /// Returns <see langword="false"/> when either ID is null or empty,
         /// preventing false-positive ownership on uninitialized objects.
         /// </summary>
         public bool IsOwner
@@ -129,8 +143,13 @@ namespace RTMPE.Core
             get
             {
                 if (string.IsNullOrEmpty(_ownerPlayerId)) return false;
-                var localId = NetworkManager.Instance?.LocalPlayerStringId;
-                return !string.IsNullOrEmpty(localId) && _ownerPlayerId == localId;
+                // Read the cached id captured at spawn rather than reaching
+                // through NetworkManager.Instance: this is a hot-path property
+                // (sampled per-frame by NetworkVariable flush, NetworkTransform,
+                // user code) and it must remain authoritative after Instance
+                // has been torn down so OnDestroy can run owner-only cleanup.
+                if (string.IsNullOrEmpty(_cachedLocalPlayerId)) return false;
+                return _ownerPlayerId == _cachedLocalPlayerId;
             }
         }
 
@@ -156,7 +175,7 @@ namespace RTMPE.Core
         /// Delivery audience is taken from the attribute (<c>All</c>, <c>Others</c>,
         /// or <c>Server</c>).
         ///
-        /// <para>Must be called from the Unity main thread while connected and in a room.</para>
+       /// <para>Must be called from the Unity main thread while connected and in a room.</para>
         /// </summary>
         /// <param name="methodName">
         /// Name of a public, non-static method on this type decorated with
@@ -186,6 +205,26 @@ namespace RTMPE.Core
         /// </summary>
         internal void DispatchEnhancedRpc(uint methodId, object[] args)
         {
+            // Lifecycle gate: an RPC that lands after OnNetworkDespawn or
+            // before OnNetworkSpawn has no business mutating component state.
+            // Reflection-based dispatch would happily Invoke and the method
+            // body might read NetworkBehaviour.IsOwner / NetworkManager.Instance
+            // and observe a half-torn-down object.  Drop with a single warning
+            // so the operator can spot the protocol-level race in player logs.
+            if (!_isSpawned)
+            {
+                RTMPE.Core.RtmpeLog.Warning(
+                    $"[RTMPE] RPC dispatched to non-spawned NetworkBehaviour " +
+                    $"({GetType().Name}, methodId=0x{methodId:X8}); dropping.");
+                return;
+            }
+
+            // Future hook: when [RtmpeRpc] gains an OwnerOnly flag, gate the
+            // dispatch with `if (attr.OwnerOnly && !IsOwner) return;` here so
+            // server-replicated owner-side calls cannot be re-broadcast onto
+            // non-owner clients.  No such flag exists today; the comment is a
+            // navigation aid for the next protocol revision.
+
             if (!RpcRegistry.TryFindMethod(GetType(), methodId, out MethodInfo method, out _))
             {
                 Debug.LogWarning(
@@ -277,6 +316,46 @@ namespace RTMPE.Core
         /// <param name="newOwner">Player UUID of the new owner.</param>
         protected virtual void OnOwnershipChanged(string previousOwner, string newOwner) { }
 
+        /// <summary>
+        /// Reconcile SpawnManager bookkeeping when this object is destroyed
+        /// via Unity's API (e.g. <c>Object.Destroy(gameObject)</c> from user
+        /// code) without going through <see cref="SpawnManager.DestroyLocal"/>.
+        /// Without this hook the SpawnManager's live-count never decrements
+        /// for the bypass path and the per-room cap eventually saturates;
+        /// the prefab side-map and registry slot also leak.
+        /// <para>
+        /// Subclasses that override <c>OnDestroy</c> MUST call <c>base.OnDestroy()</c>
+        /// or arrange equivalent cleanup, otherwise the symptoms above return.
+        /// </para>
+        /// </summary>
+        protected virtual void OnDestroy()
+        {
+            // Idempotency flag: when DestroyLocal already ran, registry-eviction
+            // and counter decrement happened there.  SpawnManager's
+            // OnExternallyDestroyed double-checks via the registry so the
+            // counters cannot move twice — this flag is a fast-path skip.
+            if (_externallyEvicted) return;
+            _externallyEvicted = true;
+
+            // During application shutdown the singleton accessor may itself
+            // throw (object finalisation order is undefined); swallow so the
+            // shutdown path remains exception-free.
+            try
+            {
+                var nm = NetworkManager.Instance;
+                nm?.SpawnManagerInternal?.OnExternallyDestroyed(_networkObjectId);
+            }
+            catch { /* best-effort during shutdown */ }
+        }
+
+        // Set by either DestroyLocal (when SpawnManager owns the teardown)
+        // or by OnDestroy itself (when Unity destroys the GameObject before
+        // DestroyLocal runs).  Either way the second caller observes true
+        // and skips the reconciliation work.  Internal so SpawnManager can
+        // mark the flag from its DestroyLocal path.
+        private bool _externallyEvicted;
+        internal void MarkExternallyEvicted() => _externallyEvicted = true;
+
         // ── Internal SDK API (called by SpawnManager) ──────────────────────────
 
         /// <summary>
@@ -297,6 +376,16 @@ namespace RTMPE.Core
 
             _networkObjectId = objectId;
             _ownerPlayerId   = ownerId ?? string.Empty;
+
+            // Snapshot the local player UUID at construction so IsOwner remains
+            // correct after the NetworkManager singleton has been torn down
+            // (OnApplicationQuit, scene unload, domain reload).  Refreshed
+            // again at SetSpawned(true) to absorb any reconnect-driven id
+            // change that lands between Initialize and the spawn transition.
+            var nm = NetworkManager.Instance;
+            _cachedLocalPlayerId = nm != null
+                ? (nm.LocalPlayerStringId ?? string.Empty)
+                : string.Empty;
         }
 
         /// <summary>
@@ -308,6 +397,19 @@ namespace RTMPE.Core
         {
             if (spawned && !_isSpawned)
             {
+                // Snapshot the local player UUID before user code in
+                // OnNetworkSpawn observes IsOwner.  Capturing here (rather
+                // than in Initialize) ensures that a reconnect which mints a
+                // new local player id is picked up by the next spawn cycle —
+                // SetSpawned(true) is invoked after the registry adopts the
+                // post-reconnect identity.  Instance is allowed to be null
+                // here only during teardown; in that case the empty cached
+                // id correctly causes IsOwner to return false.
+                var nm = NetworkManager.Instance;
+                _cachedLocalPlayerId = nm != null
+                    ? (nm.LocalPlayerStringId ?? string.Empty)
+                    : string.Empty;
+
                 _isSpawned = true;
                 ValidateRpcMethodsOnce();
                 OnNetworkSpawn();
@@ -389,7 +491,7 @@ namespace RTMPE.Core
         /// Debugger window) to enumerate the live variable set without
         /// duplicating the bookkeeping that lives on the SDK side.
         ///
-        /// <para>The returned list is the live tracking list — do not mutate
+       /// <para>The returned list is the live tracking list — do not mutate
         /// it.  Callers must inspect on the Unity main thread.</para>
         /// </summary>
         public IReadOnlyList<NetworkVariableBase> TrackedVariables => _trackedVariables;
@@ -415,7 +517,7 @@ namespace RTMPE.Core
         /// <see cref="NetworkVariableAttribute.SendRateHz"/> is copied onto the
         /// variable instance so the per-tick flush loop can throttle it.
         ///
-        /// <para>The reflection scan is performed at most once per concrete
+       /// <para>The reflection scan is performed at most once per concrete
         /// subclass; subsequent spawns reuse the cached metadata list.</para>
         /// </summary>
         private void ApplyVariableAttributesIfAny(NetworkVariableBase variable)
@@ -509,12 +611,12 @@ namespace RTMPE.Core
 
             // ── Fast path: skip allocation when nothing is dirty AND eligible.
             //
-            // A variable is "eligible to flush this tick" when:
-            //   • IsDirty == true, AND
-            //   • either SendRateHz <= 0 (use global cadence; always eligible
-            //     while dirty), OR (now - LastFlushTimeUnscaled) >= 1/SendRateHz.
+           // A variable is "eligible to flush this tick" when:
+            //  • IsDirty == true, AND
+            //  • either SendRateHz <= 0 (use global cadence; always eligible
+            //    while dirty), OR (now - LastFlushTimeUnscaled) >= 1/SendRateHz.
             //
-            // Throttled-but-dirty variables remain dirty until the next eligible
+           // Throttled-but-dirty variables remain dirty until the next eligible
             // tick — the dirty flag is preserved across skipped flushes so the
             // most recent value is sent on the first allowed window.
             float now = UnityEngine.Time.unscaledTime;
@@ -533,13 +635,25 @@ namespace RTMPE.Core
             // (or many simultaneously dirty variables) never throw the
             // NotSupportedException that a fixed-capacity backing buffer raises.
             // InitialCapacity covers the common case without reallocation:
-            // object_id(8) + count(1) + ~15 variables at ~16 bytes each ≈ 249 bytes.
+            // object_id(8) + tick(4) + count(1) + ~15 variables at ~16 bytes each ≈ 253 bytes.
             const int InitialCapacity = 256;
             using var ms     = new MemoryStream(InitialCapacity);
             using var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
 
             // [object_id:8 LE]
             writer.Write(NetworkObjectId);
+
+            // [tick:4 LE] — sender's current LocalTick.  The receiver compares
+            // against the per-variable last-applied tick (RFC 1982 modular
+            // arithmetic) and rejects deltas whose tick is not strictly
+            // greater than the highest tick already applied for that
+            // (object, variable) pair.  Without this gate, a re-ordered or
+            // late-arriving UDP datagram from a transient routing change
+            // would silently overwrite newer state with older state.
+            uint flushTick = NetworkManager.Instance != null
+                                 ? NetworkManager.Instance.LocalTick
+                                 : 0u;
+            writer.Write(flushTick);
 
             // Reserve space for var_count; written at the end with the real count.
             long countOffset = ms.Position;
@@ -592,13 +706,13 @@ namespace RTMPE.Core
         /// dirty set so the next 30 Hz flush transmits its current value, even
         /// when the stored value has not changed since the last send.
         ///
-        /// <para>Used by the SDK to bootstrap late joiners: when another
+       /// <para>Used by the SDK to bootstrap late joiners: when another
         /// player joins the room, every existing owner client calls this on
         /// each of their owned objects so the new player sees a full state
         /// snapshot on the next tick instead of waiting for a future
         /// value-change event that may never come for static variables.</para>
         ///
-        /// <para>Safe to call on non-owned or non-spawned objects — the dirty
+       /// <para>Safe to call on non-owned or non-spawned objects — the dirty
         /// flag is still set, but <see cref="FlushDirtyVariables"/> is a no-op
         /// under those conditions so the flag will remain sticky until this
         /// object is owned + spawned again.  Callers that want to avoid that
@@ -611,14 +725,25 @@ namespace RTMPE.Core
             // the public MarkDirtyForResync hook below that each variable
             // exposes through its own public API via a new internal method.
             //
-            // Resetting the per-variable throttle state alongside the dirty
+           // Resetting the per-variable throttle state alongside the dirty
             // flag is intentional: a late joiner must see the full snapshot
             // on the next eligible tick, not be blocked behind a stale
             // throttle window inherited from an earlier private send.
-            foreach (var v in _trackedVariables)
+            //
+           // Iterate a snapshot rather than the live list so a subscriber
+            // callback that registers a NEW NetworkVariable during
+            // MarkDirtyForResync (or unregisters one) cannot mutate the
+            // underlying collection while the foreach is in progress.
+            // Defensive — the SDK does not currently hand application code a
+            // synchronous hook here, but that contract is not enforced by the
+            // type system and a future refactor that introduces one must not
+            // be able to throw InvalidOperationException out of a resync.
+            var snapshot = new NetworkVariableBase[_trackedVariables.Count];
+            _trackedVariables.CopyTo(snapshot, 0);
+            for (int i = 0; i < snapshot.Length; i++)
             {
-                v.MarkDirtyForResync();
-                v.ResetThrottleState();
+                snapshot[i].MarkDirtyForResync();
+                snapshot[i].ResetThrottleState();
             }
         }
 
@@ -638,8 +763,8 @@ namespace RTMPE.Core
             float since    = nowUnscaled - variable.LastFlushTimeUnscaled;
 
             // LastFlushTimeUnscaled == 0 covers two cases:
-            //   • freshly registered (never flushed),
-            //   • explicitly reset on ownership change / disconnect.
+            //  • freshly registered (never flushed),
+            //  • explicitly reset on ownership change / disconnect.
             // In both cases we want to flush immediately rather than wait out
             // a phantom interval against unscaled-time = 0.
             if (variable.LastFlushTimeUnscaled <= 0f) return true;
@@ -660,13 +785,36 @@ namespace RTMPE.Core
         /// client-side prediction.  Only called on the owning client by
         /// <see cref="RTMPE.Sync.NetworkTransform"/> when prediction is enabled.
         ///
-        /// <para>Leave <see cref="InputPayload.Tick"/> at its default zero —
+       /// <para>Leave <see cref="InputPayload.Tick"/> at its default zero —
         /// <see cref="CollectInput"/> stamps the correct tick before the payload
         /// is pushed to the buffer.</para>
         ///
-        /// <para>Return <c>default</c> for frames with no input.</para>
+       /// <para>Return <c>default</c> for frames with no input.</para>
         /// </summary>
         protected virtual InputPayload GatherInput() => default;
+
+        /// <summary>
+        /// Override in a subclass to deterministically apply a single
+        /// <see cref="InputPayload"/> to the local game state during a CSP
+        /// rollback / replay.  Called once per unacknowledged input by
+        /// <see cref="RTMPE.Sync.NetworkTransform.ApplyReconciliation"/> after
+        /// the transform has been snapped back to the server-authoritative
+        /// pose at the confirmed tick.
+        ///
+       /// <para>The implementation must be deterministic: the same starting
+        /// pose plus the same input must yield the same resulting pose every
+        /// time, otherwise the predicted-state divergence the replay was
+        /// meant to repair will simply re-emerge each tick.  For the same
+        /// reason it must NOT consume <see cref="UnityEngine.Time.deltaTime"/> —
+        /// the SDK passes the fixed simulation step in
+        /// <paramref name="deltaTime"/>.</para>
+        ///
+       /// <para>Default implementation is a no-op so legacy behaviours that
+        /// do not opt into prediction continue to work unchanged.</para>
+        /// </summary>
+        /// <param name="input">The input frame to apply.</param>
+        /// <param name="deltaTime">Fixed simulation step in seconds.</param>
+        protected virtual void ApplyInput(InputPayload input, float deltaTime) { }
 
         /// <summary>
         /// Collect this frame's input, stamp it with <paramref name="tick"/>,
@@ -680,6 +828,42 @@ namespace RTMPE.Core
             return p;
         }
 
+        /// <summary>
+        /// Internal entry point for the reconciliation replay loop.  Forwards
+        /// to the protected virtual <see cref="ApplyInput"/> so subclasses can
+        /// continue to define replay semantics with the standard access
+        /// modifier while the SDK still drives the loop from outside the
+        /// class hierarchy.
+        /// </summary>
+        internal void ReplayInput(InputPayload input, float deltaTime)
+            => ApplyInput(input, deltaTime);
+
+        /// <summary>
+        /// Called exactly once per simulated tick on every owned, spawned
+        /// NetworkBehaviour by the central tick driver in
+        /// <see cref="NetworkManager"/>.  Override in a subclass to perform
+        /// per-tick work that must observe a fixed cadence regardless of frame
+        /// rate: input sampling for client-side prediction, deterministic
+        /// game-logic timers, server-authoritative inputs, etc.
+        ///
+        /// <para>Hosting this work on the tick driver — instead of MonoBehaviour
+        /// <c>Update</c> — guarantees exactly one invocation per simulated
+        /// tick even on long frames.  A frame that integrates several ticks of
+        /// elapsed time fires this callback once per integrated tick; a frame
+        /// shorter than the tick interval fires zero callbacks.  The
+        /// alternative — sampling once per <c>Update</c> with a "has the tick
+        /// changed?" guard — silently drops input on stutters and produces
+        /// non-deterministic sub-tick collection at high frame rates.</para>
+        /// </summary>
+        /// <param name="deltaTime">The fixed tick interval in seconds.</param>
+        protected virtual void OnFixedTick(float deltaTime) { }
+
+        /// <summary>
+        /// SDK-internal forwarder so the tick driver can invoke the protected
+        /// virtual without exposing it on the public surface.
+        /// </summary>
+        internal void InvokeOnFixedTick(float deltaTime) => OnFixedTick(deltaTime);
+
         // ── Variable update (server → client) ────────────────────────────────
 
         /// <summary>
@@ -687,16 +871,44 @@ namespace RTMPE.Core
         /// Called by <c>NetworkManager.HandleVariableUpdatePacket</c> for each
         /// [var_id:2 LE][value_len:2 LE][value_bytes:N] entry in the payload.
         ///
-        /// <paramref name="valueLen"/> is used by the caller to advance the
+       /// <paramref name="valueLen"/> is used by the caller to advance the
         /// stream past the value bytes regardless of what this method reads,
         /// guaranteeing subsequent variables in the same packet are parsed from
         /// correct offsets even on unknown-ID or schema-mismatch scenarios.
         /// </summary>
         internal void ApplyVariableUpdate(ushort variableId, BinaryReader reader, ushort valueLen = 0)
         {
+            ApplyVariableUpdate(variableId, reader, valueLen, packetTick: 0u, hasPacketTick: false);
+        }
+
+        /// <summary>
+        /// Tick-aware overload.  Drops the deserialised value when
+        /// <paramref name="hasPacketTick"/> is set and
+        /// <paramref name="packetTick"/> is not strictly greater than the
+        /// highest tick already applied to the matching variable.  The caller
+        /// must still advance the reader past <paramref name="valueLen"/>
+        /// regardless of acceptance — this method does not seek.
+        /// </summary>
+        internal void ApplyVariableUpdate(
+            ushort       variableId,
+            BinaryReader reader,
+            ushort       valueLen,
+            uint         packetTick,
+            bool         hasPacketTick)
+        {
             foreach (var v in _trackedVariables)
             {
                 if (v.VariableId != variableId) continue;
+
+                // Reject older / duplicate deltas before touching the wire
+                // value.  Note we still let the caller advance past the
+                // valueLen bytes — the seek is owned by the dispatch loop in
+                // NetworkManager.HandleVariableUpdatePacket so all variables
+                // in the same packet are framed correctly even when one is
+                // gated out here.
+                if (hasPacketTick && !v.TryAcceptInboundTick(packetTick))
+                    return;
+
                 v.Deserialize(reader);
                 return;
             }

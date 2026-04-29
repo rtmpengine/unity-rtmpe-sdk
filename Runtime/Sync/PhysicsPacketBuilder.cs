@@ -14,31 +14,31 @@
 //
 // ── 3-D Physics wire format ───────────────────────────────────────────────────
 //
-//   [0..7]  object_id    : u64 LE
-//   [8]     changed_mask : u8  (TypeMarker3D = 0x40 always set)
-//             bit 0x01 = position        (3 × f32 LE = 12 bytes)
-//             bit 0x02 = rotation        (4 × f32 LE = 16 bytes, x y z w)
-//             bit 0x04 = velocity        (3 × f32 LE = 12 bytes)
-//             bit 0x08 = angular_velocity(3 × f32 LE = 12 bytes)
-//             bit 0x10 = is_sleeping     (u8: 0x00 = awake, 0x01 = sleeping)
-//             bit 0x20 = constraint_mask (u8: bitmask of UnityEngine.RigidbodyConstraints)
-//             bit 0x40 = TYPE MARKER     (always set; causes transform parser reject)
-//   [9+]    conditional fields in the bit-order listed above
-//   Min: 9 bytes (header only).  Max: 9 + 12 + 16 + 12 + 12 + 1 + 1 = 63 bytes.
+//  [0..7]  object_id    : u64 LE
+//  [8]     changed_mask : u8  (TypeMarker3D = 0x40 always set)
+//            bit 0x01 = position        (3 × f32 LE = 12 bytes)
+//            bit 0x02 = rotation        (4 × f32 LE = 16 bytes, x y z w)
+//            bit 0x04 = velocity        (3 × f32 LE = 12 bytes)
+//            bit 0x08 = angular_velocity(3 × f32 LE = 12 bytes)
+//            bit 0x10 = is_sleeping     (u8: 0x00 = awake, 0x01 = sleeping)
+//            bit 0x20 = constraint_mask (u8: bitmask of UnityEngine.RigidbodyConstraints)
+//            bit 0x40 = TYPE MARKER     (always set; causes transform parser reject)
+//  [9+]    conditional fields in the bit-order listed above
+//  Min: 9 bytes (header only).  Max: 9 + 12 + 16 + 12 + 12 + 1 + 1 = 63 bytes.
 //
 // ── 2-D Physics wire format ───────────────────────────────────────────────────
 //
-//   [0..7]  object_id    : u64 LE
-//   [8]     changed_mask : u8  (TypeMarker2D = 0x80 always set)
-//             bit 0x01 = position        (2 × f32 LE = 8 bytes)
-//             bit 0x02 = rotation        (1 × f32 LE = 4 bytes, degrees)
-//             bit 0x04 = velocity        (2 × f32 LE = 8 bytes)
-//             bit 0x08 = angular_velocity(1 × f32 LE = 4 bytes, deg/s)
-//             bit 0x10 = is_sleeping     (u8: 0x00 = awake, 0x01 = sleeping)
-//             bit 0x20 = constraint_mask (u8: bitmask of UnityEngine.RigidbodyConstraints2D)
-//             bit 0x80 = TYPE MARKER     (always set; also discriminates from 3-D)
-//   [9+]    conditional fields in the bit-order listed above
-//   Min: 9 bytes.  Max: 9 + 8 + 4 + 8 + 4 + 1 + 1 = 35 bytes.
+//  [0..7]  object_id    : u64 LE
+//  [8]     changed_mask : u8  (TypeMarker2D = 0x80 always set)
+//            bit 0x01 = position        (2 × f32 LE = 8 bytes)
+//            bit 0x02 = rotation        (1 × f32 LE = 4 bytes, degrees)
+//            bit 0x04 = velocity        (2 × f32 LE = 8 bytes)
+//            bit 0x08 = angular_velocity(1 × f32 LE = 4 bytes, deg/s)
+//            bit 0x10 = is_sleeping     (u8: 0x00 = awake, 0x01 = sleeping)
+//            bit 0x20 = constraint_mask (u8: bitmask of UnityEngine.RigidbodyConstraints2D)
+//            bit 0x80 = TYPE MARKER     (always set; also discriminates from 3-D)
+//  [9+]    conditional fields in the bit-order listed above
+//  Min: 9 bytes.  Max: 9 + 8 + 4 + 8 + 4 + 1 + 1 = 35 bytes.
 //
 // ── Security ──────────────────────────────────────────────────────────────────
 //
@@ -58,7 +58,7 @@ namespace RTMPE.Sync
     {
         // ── Changed-field bit constants ────────────────────────────────────────
         //
-        // Bits 0x01–0x10 are shared between 3-D and 2-D packets.
+       // Bits 0x01–0x10 are shared between 3-D and 2-D packets.
         // Bits 0x40 / 0x80 are exclusive type markers.
 
         /// <summary>

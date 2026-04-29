@@ -7,9 +7,9 @@
 // All GameObjects created per-test are destroyed in TearDown.
 //
 // Note on Object.Destroy vs Object.DestroyImmediate:
-//   Object.Destroy() is used by production code (frame-safe) but deferred in
-//   Edit Mode tests. Tests validate logical state (IsSpawned, registry) rather
-//   than physical destruction of GameObjects. TearDown uses DestroyImmediate.
+//  Object.Destroy() is used by production code (frame-safe) but deferred in
+//  Edit Mode tests. Tests validate logical state (IsSpawned, registry) rather
+//  than physical destruction of GameObjects. TearDown uses DestroyImmediate.
 
 using System.Collections.Generic;
 using NUnit.Framework;
@@ -566,6 +566,47 @@ namespace RTMPE.Tests
             Assert.AreEqual(0, _registry.GetAll().Count);
         }
 
+        [Test]
+        [Description("ClearAll tolerates user code in OnNetworkDespawn destroying its own GameObject — " +
+                     "the second pass must skip the destroyed object via Unity's null check, not throw.")]
+        public void ClearAll_UserDestroysOwnGameObjectInOnDespawn_DoesNotThrow()
+        {
+            // Use a GO with the destroy-self component so OnNetworkDespawn → DestroyImmediate(self).
+            var go = new GameObject("DespawnSelfDestroyer");
+            go.AddComponent<DespawnSelfDestroyerNB>();
+            _spawnManager.RegisterPrefab(99, go);
+            _created.Add(go);
+
+            var nb = (DespawnSelfDestroyerNB)_spawnManager.Spawn(99, Vector3.zero, Quaternion.identity, "p1");
+            // Track for TearDown — though it will be destroyed in ClearAll path.
+            if (nb != null) _created.Add(nb.gameObject);
+
+            // ClearAll path: pass 1 fires OnNetworkDespawn → user calls DestroyImmediate(self),
+            // pass 2 must skip the destroyed object via the Unity null check.
+            Assert.DoesNotThrow(() => _spawnManager.ClearAll(),
+                "ClearAll must guard against user-destroyed objects between callback and destroy passes.");
+            Assert.AreEqual(0, _registry.GetAll().Count);
+        }
+
+        [Test]
+        [Description("ClearAll fires OnNetworkDespawn exactly once per object even when user code in " +
+                     "the callback destroys the GameObject itself.")]
+        public void ClearAll_OnDespawnFiresExactlyOnce_EvenWithUserDestroy()
+        {
+            var go = new GameObject("DespawnCounting");
+            go.AddComponent<DespawnCountingNB>();
+            _spawnManager.RegisterPrefab(101, go);
+            _created.Add(go);
+
+            var nb = (DespawnCountingNB)_spawnManager.Spawn(101, Vector3.zero, Quaternion.identity, "p1");
+            if (nb != null) _created.Add(nb.gameObject);
+
+            _spawnManager.ClearAll();
+
+            Assert.AreEqual(1, nb.DespawnCount,
+                "OnNetworkDespawn must fire exactly once even when the user destroys the GO mid-callback.");
+        }
+
         // ══════════════════════════════════════════════════════════════════════
         // ── NetworkManager Integration ─────────────────────────────────────────
         // ══════════════════════════════════════════════════════════════════════
@@ -594,6 +635,192 @@ namespace RTMPE.Tests
             Assert.IsNotNull(_manager.Spawner?.Ownership);
         }
 
+        // ── Spawn admission caps ───────────────────────────────────────────────
+        //
+        // Defends the receiver from a hostile-gateway Instantiate flood.  The
+        // rate cap bounds work-per-second; the count cap bounds total memory
+        // regardless of arrival rate.  Both caps are checked at the
+        // CreateLocal entry so local AND inbound spawns are equally bounded.
+
+        [Test]
+        [Description("Spawns past maxSpawnsPerSecond in the same one-second bucket are dropped.")]
+        public void CreateLocal_RatePerSecondCap_DropsExcessSpawns()
+        {
+            _manager.Settings.maxSpawnsPerSecond = 5;
+            _manager.Settings.maxSpawnsPerRoom   = 1000;
+
+            int admitted = 0;
+            for (int i = 0; i < 20; i++)
+            {
+                var nb = _spawnManager.CreateLocal(
+                    PREFAB_ID, (ulong)(1000 + i), "p-owner",
+                    Vector3.zero, Quaternion.identity);
+                if (nb != null)
+                {
+                    _created.Add(nb.gameObject);
+                    admitted++;
+                }
+            }
+
+            Assert.AreEqual(5, admitted,
+                "rate cap must drop everything beyond maxSpawnsPerSecond inside a single bucket");
+        }
+
+        [Test]
+        [Description("Despawning frees the live-count slot for a future Spawn.")]
+        public void DestroyLocal_DecrementsCountCap_AllowingNewSpawn()
+        {
+            _manager.Settings.maxSpawnsPerSecond = 1000;
+            _manager.Settings.maxSpawnsPerRoom   = 2;
+
+            var a = _spawnManager.CreateLocal(PREFAB_ID, 10UL, "p", Vector3.zero, Quaternion.identity);
+            var b = _spawnManager.CreateLocal(PREFAB_ID, 11UL, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNotNull(a);
+            Assert.IsNotNull(b);
+            _created.Add(a.gameObject); _created.Add(b.gameObject);
+
+            var rejected = _spawnManager.CreateLocal(PREFAB_ID, 12UL, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNull(rejected, "count cap must reject when the live total is at the cap");
+
+            _spawnManager.DestroyLocal(10UL);
+            var c = _spawnManager.CreateLocal(PREFAB_ID, 13UL, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNotNull(c, "freeing one slot must restore admission");
+            _created.Add(c.gameObject);
+        }
+
+        [Test]
+        [Description("Re-entrant CreateLocal from a user OnNetworkSpawn callback is bounded by the per-room cap.")]
+        public void CreateLocal_ReentrantFromUserCallback_RespectsCountCap()
+        {
+            const int cap = 5;
+            _manager.Settings.maxSpawnsPerSecond = 1000;
+            _manager.Settings.maxSpawnsPerRoom   = cap;
+
+            // Re-entrant prefab: every OnNetworkSpawn calls back into
+            // CreateLocal up to 100 times.  The eager-increment contract must
+            // mean that the inner calls observe the outer's incremented
+            // counter, so the total registered objects can never exceed the
+            // configured maxSpawnsPerRoom.  Pre-fix this test would observe
+            // (cap × recursion-depth) live spawns.
+            var reentrantPrefab = new GameObject("ReentrantPrefab");
+            reentrantPrefab.AddComponent<ReentrantSpawnerNB>();
+            _created.Add(reentrantPrefab);
+
+            const uint reentrantId = 99;
+            _spawnManager.RegisterPrefab(reentrantId, reentrantPrefab);
+
+            ReentrantSpawnerNB.Reset(_spawnManager, reentrantId, attempts: 100);
+
+            var first = _spawnManager.CreateLocal(
+                reentrantId, 50_000UL, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNotNull(first, "the seed spawn must succeed");
+            _created.Add(first.gameObject);
+
+            int live = 0;
+            foreach (var o in _registry.GetAll()) live++;
+            Assert.LessOrEqual(live, cap,
+                $"recursive spawn must not exceed maxSpawnsPerRoom (live={live}, cap={cap})");
+        }
+
+        [Test]
+        [Description("ClearAll resets the rate-bucket and live count so a new room starts clean.")]
+        public void ClearAll_ResetsAdmissionCounters()
+        {
+            _manager.Settings.maxSpawnsPerSecond = 3;
+            _manager.Settings.maxSpawnsPerRoom   = 1000;
+
+            for (int i = 0; i < 3; i++)
+            {
+                var nb = _spawnManager.CreateLocal(
+                    PREFAB_ID, (ulong)(2000 + i), "p", Vector3.zero, Quaternion.identity);
+                if (nb != null) _created.Add(nb.gameObject);
+            }
+            Assert.IsNull(
+                _spawnManager.CreateLocal(PREFAB_ID, 2099UL, "p", Vector3.zero, Quaternion.identity),
+                "bucket must be saturated before ClearAll");
+
+            _spawnManager.ClearAll();
+
+            var fresh = _spawnManager.CreateLocal(PREFAB_ID, 3000UL, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNotNull(fresh, "ClearAll must reset the rate bucket");
+            if (fresh != null) _created.Add(fresh.gameObject);
+        }
+
+        // ── Despawn-before-Spawn (UDP reorder) ─────────────────────────────────
+        //
+        // A despawn arriving ahead of its matching spawn must NOT silently no-op
+        // and let the late spawn produce a ghost object.  The receiver records
+        // the despawn intent under a TTL; the matching spawn is then dropped.
+
+        [Test]
+        [Description("DestroyLocal for an unknown id records a pending-despawn entry.")]
+        public void DestroyLocal_BeforeSpawn_RecordsPendingDespawn()
+        {
+            Assert.AreEqual(0, _spawnManager.PendingDespawnCount);
+            _spawnManager.DestroyLocal(0xCAFE);
+            Assert.AreEqual(1, _spawnManager.PendingDespawnCount,
+                "DestroyLocal on an unknown id must record a pending-despawn entry");
+        }
+
+        [Test]
+        [Description("CreateLocal after a pending despawn for the same id drops the spawn.")]
+        public void CreateLocal_AfterPendingDespawn_DropsSpawn()
+        {
+            // 1. Despawn arrives first.
+            _spawnManager.DestroyLocal(0xBEEF);
+            Assert.AreEqual(1, _spawnManager.PendingDespawnCount);
+
+            // 2. Late Spawn for the same id: must be dropped (no GameObject).
+            var nb = _spawnManager.CreateLocal(
+                PREFAB_ID, 0xBEEF, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNull(nb, "Late spawn must be skipped when a despawn arrived first");
+
+            // 3. Pending entry must be consumed.
+            Assert.AreEqual(0, _spawnManager.PendingDespawnCount,
+                "Consuming the pending entry prevents memory growth");
+            Assert.IsNull(_spawnManager.Registry.Get(0xBEEF));
+        }
+
+        [Test]
+        [Description("Normal Despawn-after-Spawn does not leave a pending entry.")]
+        public void DestroyLocal_AfterSpawn_DoesNotCreatePendingEntry()
+        {
+            var nb = _spawnManager.CreateLocal(
+                PREFAB_ID, 0xFEED, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNotNull(nb);
+            _created.Add(nb.gameObject);
+
+            _spawnManager.DestroyLocal(0xFEED);
+            Assert.AreEqual(0, _spawnManager.PendingDespawnCount);
+        }
+
+        [Test]
+        [Description("Pending-despawn dictionary respects MaxPendingDespawns hard cap under flood.")]
+        public void DestroyLocal_BeyondCap_EvictsOldestAndStaysBounded()
+        {
+            // Flood the dictionary with cap+overflow distinct ids.  Even
+            // without the TTL elapsing, the hard cap must keep the count at
+            // or below MaxPendingDespawns.  This guards against a hostile
+            // gateway streaming Despawn(unknown_id) at line rate before the
+            // 5-second TTL window closes.
+            const int overflow = 64;
+            for (int i = 0; i < SpawnManager.MaxPendingDespawns + overflow; i++)
+            {
+                _spawnManager.DestroyLocal((ulong)(0x1_0000 + i));
+            }
+            Assert.LessOrEqual(_spawnManager.PendingDespawnCount, SpawnManager.MaxPendingDespawns,
+                "Cap must bound dictionary growth even when TTL has not yet elapsed");
+
+            // The most recently inserted ids should still be present (oldest-
+            // first eviction policy preserves the entries most likely to
+            // match a still-in-flight Spawn).  Pick one near the tail.
+            ulong recent = (ulong)(0x1_0000 + SpawnManager.MaxPendingDespawns + overflow - 1);
+            var nb = _spawnManager.CreateLocal(
+                PREFAB_ID, recent, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNull(nb,
+                "Recent pending-despawn entries must survive the cap-eviction sweep");
+        }
+
         // ══════════════════════════════════════════════════════════════════════
         // ── Test doubles ───────────────────────────────────────────────────────
         // ══════════════════════════════════════════════════════════════════════
@@ -605,6 +832,67 @@ namespace RTMPE.Tests
 
             protected override void OnNetworkSpawn()   => SpawnCalled = true;
             protected override void OnNetworkDespawn() => DespawnCalled = true;
+        }
+
+        // Re-entry probe: every OnNetworkSpawn synchronously calls
+        // CreateLocal again, which exercises the "user callback re-enters
+        // SpawnManager" path.  Static config (target manager, prefab id,
+        // attempt budget) is set by Reset() before the seed spawn.
+        private sealed class ReentrantSpawnerNB : NetworkBehaviour
+        {
+            private static SpawnManager s_target;
+            private static uint         s_prefabId;
+            private static int          s_remaining;
+            private static ulong        s_nextId;
+
+            public static void Reset(SpawnManager target, uint prefabId, int attempts)
+            {
+                s_target    = target;
+                s_prefabId  = prefabId;
+                s_remaining = attempts;
+                s_nextId    = 60_000UL;
+            }
+
+            protected override void OnNetworkSpawn()
+            {
+                if (s_target == null || s_remaining <= 0) return;
+                s_remaining--;
+                // Re-enter from inside the user callback.  When the spawn
+                // cap is enforced eagerly, most of these will return null;
+                // the assertion in the surrounding test verifies that the
+                // count of *live* registered objects never exceeds the cap.
+                s_target.CreateLocal(
+                    s_prefabId, s_nextId++, "p", Vector3.zero, Quaternion.identity);
+            }
+        }
+
+        // Test double whose OnNetworkDespawn destroys its own GameObject —
+        // exercises the two-pass guard in SpawnManager.ClearAll which must
+        // tolerate a user-destroyed GO between the callback and the destroy
+        // pass.  DestroyImmediate makes the destruction observable on the
+        // very next access (Edit Mode tests do not pump frames between calls).
+        private sealed class DespawnSelfDestroyerNB : NetworkBehaviour
+        {
+            protected override void OnNetworkDespawn()
+            {
+                if (this != null && this.gameObject != null)
+                    Object.DestroyImmediate(this.gameObject);
+            }
+        }
+
+        // Test double that counts OnNetworkDespawn invocations and destroys
+        // itself in the callback.  Validates that ClearAll fires the user
+        // callback exactly once even when the user races a destroy in.
+        private sealed class DespawnCountingNB : NetworkBehaviour
+        {
+            public int DespawnCount { get; private set; }
+
+            protected override void OnNetworkDespawn()
+            {
+                DespawnCount++;
+                if (this != null && this.gameObject != null)
+                    Object.DestroyImmediate(this.gameObject);
+            }
         }
     }
 }

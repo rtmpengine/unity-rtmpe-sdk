@@ -4,20 +4,23 @@
 // together NetworkSettings, NetworkThread, and MainThreadDispatcher.
 //
 // Threading model:
-//  • NetworkManager lives on the Unity main thread.
-//  • NetworkThread runs on a dedicated background thread.
-//  • Packets received on the background thread are delivered via MainThreadDispatcher
-//    so that all state mutations and Unity API calls occur on the main thread.
+// • NetworkManager lives on the Unity main thread.
+// • NetworkThread runs on a dedicated background thread.
+// • Packets received on the background thread are delivered via MainThreadDispatcher
+//   so that all state mutations and Unity API calls occur on the main thread.
 //
 // Singleton contract:
-//  • [DefaultExecutionOrder(-1000)] — Awake runs before all other components.
-//  • Instance getter auto-creates a persistent GameObject when no instance exists.
-//  • _applicationIsQuitting flag guards against Unity's destroy-order issues.
+// • [DefaultExecutionOrder(-1000)] — Awake runs before all other components.
+// • Instance getter returns the scene-placed NetworkManager if one exists,
+//   otherwise null. It does NOT auto-create a stand-in with empty defaults —
+//   silent auto-creation hid configuration bugs and produced sessions with
+//   blank crypto material when an unrelated component touched Instance early.
+// • _applicationIsQuitting flag guards against Unity's destroy-order issues.
 //
 // Protocol note:
-//  • All header field constants use PacketProtocol.* from NetworkConstants.cs.
-//    Do NOT introduce magic numbers here — sync failures with the Rust gateway are
-//    silent and extremely difficult to debug.
+// • All header field constants use PacketProtocol.* from NetworkConstants.cs.
+//   Do NOT introduce magic numbers here — sync failures with the Rust gateway are
+//   silent and extremely difficult to debug.
 
 using System;
 using System.Collections;
@@ -41,6 +44,7 @@ namespace RTMPE.Core
     /// All public methods must be called from the Unity main thread.
     /// </summary>
     [DefaultExecutionOrder(-1000)]
+    [AddComponentMenu("RTMPE/NetworkManager")]
     public sealed class NetworkManager : MonoBehaviour
     {
         // ── Singleton ──────────────────────────────────────────────────────────
@@ -59,6 +63,7 @@ namespace RTMPE.Core
             {
                 _instance              = null;
                 _applicationIsQuitting = false;
+                _missingInstanceWarned = 0;
                 // Do NOT clear _transportFactory here — tests and WebGL bootstraps
                 // install it once at module init, before any singleton is created.
                 // Clearing would break that install-then-play sequence.  Users
@@ -66,34 +71,144 @@ namespace RTMPE.Core
             }
         }
 
+        // One-shot warning latch so a noisy caller does not spam the console
+        // every frame.  Reset whenever a real instance becomes available.
+        private static int _missingInstanceWarned;
+
         /// <summary>
-        /// Singleton instance. Auto-creates a persistent GameObject if none exists.
+        /// Singleton instance. Returns the scene-placed <see cref="NetworkManager"/>
+        /// (or one previously assigned via Awake) if one exists; otherwise returns
+        /// <see langword="null"/> and emits a one-time warning instructing the caller
+        /// to add a NetworkManager to the scene before subscribing to events.
         /// Returns <see langword="null"/> after <c>OnApplicationQuit</c>.
         /// <b>MUST be called from the Unity main thread.</b>
         /// </summary>
+        /// <remarks>
+        /// The previous behaviour auto-created a hidden GameObject backed by
+        /// <c>NetworkSettings.CreateDefault()</c>.  That allowed any component
+        /// whose <c>Awake</c> touched <c>NetworkManager.Instance</c> (e.g. a
+        /// subscriber registering for <see cref="OnConnected"/>) to spin up a
+        /// permanent stand-in with empty crypto material — a configuration
+        /// footgun that surfaced only as silent handshake failures.
+        /// Use <see cref="TryGetInstance"/> for non-fatal probing.
+        /// </remarks>
         public static NetworkManager Instance
         {
             get
             {
                 if (_applicationIsQuitting) return null;
 
+                // Fast-path: a scene-placed Awake has already published _instance.
+                // Volatile.Read pairs with the release-barrier on the lock-protected
+                // writes (Awake / OnDestroy / ResetStaticState / the fallback below)
+                // so a background-thread reader observes the published reference
+                // without taking the Monitor.  This is the steady-state path that
+                // must remain free of cross-thread contention.
+                var cached = System.Threading.Volatile.Read(ref _instance);
+                if (cached != null) return cached;
+
+                // FindFirstObjectByType is a Unity engine call and is only
+                // valid on the main thread; calling it off-thread raises
+                // UnityException ("get_isPlayingOrWillChangePlaymode can only
+                // be called from the main thread") which is hostile to
+                // background callers (transport threads, dispatcher producers)
+                // probing the singleton during teardown.  Off-thread callers
+                // get a quiet null instead — the on-thread bootstrap is the
+                // authoritative producer of _instance via Awake.
+                if (!RTMPE.Threading.MainThreadDispatcher.IsMainThread)
+                    return null;
+
+                NetworkManager found;
                 lock (_instLock)
                 {
                     if (_applicationIsQuitting) return null;
-                    if (_instance != null)       return _instance;
+                    // Re-check inside the lock — another main-thread caller may
+                    // have populated _instance between our fast-path read and
+                    // the lock acquisition.
+                    if (_instance != null) return _instance;
 
                     // FindFirstObjectByType — Unity 6 replacement for deprecated FindObjectOfType.
-                    _instance = FindFirstObjectByType<NetworkManager>(FindObjectsInactive.Exclude);
-
-                    if (_instance == null)
+                    // Adopt a scene-placed manager whose Awake has not yet run
+                    // (e.g. an early Awake from a sibling component on the same frame).
+                    found = FindFirstObjectByType<NetworkManager>(FindObjectsInactive.Exclude);
+                    if (found != null)
                     {
-                        var go = new GameObject("[RTMPE] NetworkManager");
-                        _instance = go.AddComponent<NetworkManager>();
-                        DontDestroyOnLoad(go);
+                        _instance = found;
+                        System.Threading.Interlocked.Exchange(ref _missingInstanceWarned, 0);
+                        return found;
                     }
-
-                    return _instance;
                 }
+
+                // Outside the lock: a single warning per missing-instance episode.
+                if (System.Threading.Interlocked.CompareExchange(ref _missingInstanceWarned, 1, 0) == 0)
+                {
+                    Debug.LogWarning(
+                        "[RTMPE] NetworkManager.Instance accessed before any NetworkManager " +
+                        "exists in the scene. Add a NetworkManager component to a scene " +
+                        "GameObject (or instantiate one explicitly) before subscribing to " +
+                        "events or calling Connect(). Returning null.");
+                }
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Test-only: clear the one-shot missing-instance warning latch so each
+        /// test that exercises the no-manager path can assert exactly one
+        /// warning regardless of preceding fixtures in the same Play Mode run.
+        /// Accessible to <c>RTMPE.SDK.Tests</c> via <c>InternalsVisibleTo</c>.
+        /// </summary>
+        internal static void ResetMissingInstanceWarningForTests()
+        {
+            System.Threading.Interlocked.Exchange(ref _missingInstanceWarned, 0);
+        }
+
+        /// <summary>
+        /// Non-throwing accessor for callers that want to probe for a manager
+        /// without producing a console warning.  Returns <see langword="true"/>
+        /// when a valid instance exists and assigns it to <paramref name="manager"/>.
+        /// </summary>
+        public static bool TryGetInstance(out NetworkManager manager)
+        {
+            if (_applicationIsQuitting)
+            {
+                manager = null;
+                return false;
+            }
+
+            // Fast-path: cached publication from Awake (volatile read pairs
+            // with the lock-protected write barrier in Awake / OnDestroy).
+            var cached = System.Threading.Volatile.Read(ref _instance);
+            if (cached != null)
+            {
+                manager = cached;
+                return true;
+            }
+
+            // FindFirstObjectByType requires the main thread; a background
+            // caller that arrives here gets a quiet false rather than a
+            // UnityException from deep inside the engine.
+            if (!RTMPE.Threading.MainThreadDispatcher.IsMainThread)
+            {
+                manager = null;
+                return false;
+            }
+
+            lock (_instLock)
+            {
+                if (_applicationIsQuitting)
+                {
+                    manager = null;
+                    return false;
+                }
+                if (_instance != null)
+                {
+                    manager = _instance;
+                    return true;
+                }
+                manager = FindFirstObjectByType<NetworkManager>(FindObjectsInactive.Exclude);
+                if (manager != null) _instance = manager;
+                return manager != null;
             }
         }
 
@@ -111,27 +226,27 @@ namespace RTMPE.Core
 
         // ── Transport factory (pluggable) ──────────────────────────────────────
         //
-        // The SDK ships with a UDP-only transport that uses System.Net.Sockets
+       // The SDK ships with a UDP-only transport that uses System.Net.Sockets
         // directly.  That is correct on every standalone platform (Windows,
         // macOS, Linux, Android, iOS) because the Rust gateway speaks UDP+KCP.
         //
-        // WebGL is different: Unity WebGL runs inside the browser's JavaScript
+       // WebGL is different: Unity WebGL runs inside the browser's JavaScript
         // sandbox, which has NO access to raw UDP sockets.  The only outbound
         // network path in WebGL is WebSocket / WebRTC.  Shipping a WebGL build
         // therefore requires:
-        //   1. A WebSocket or WebRTC gateway (new server component), OR
-        //   2. A WebSocket-to-UDP bridge deployed in front of the existing UDP gateway.
+        //  1. A WebSocket or WebRTC gateway (new server component), OR
+        //  2. A WebSocket-to-UDP bridge deployed in front of the existing UDP gateway.
         //
-        // Because neither is part of the default SDK image, we expose a static
+       // Because neither is part of the default SDK image, we expose a static
         // factory delegate: games that need WebGL can install a WebSocket
         // transport at startup and the rest of NetworkManager is transport-
         // agnostic.  Tests use the same hook to inject mock transports.
         //
-        // Invariants:
-        //   • Assigning replaces any previous factory; assign before Connect().
-        //   • A null factory (the default) selects the built-in UdpTransport.
-        //   • The factory is called exactly once per InitialiseNetwork().
-        //   • The factory MUST return a non-null, ready-to-Connect() transport.
+       // Invariants:
+        //  • Assigning replaces any previous factory; assign before Connect().
+        //  • A null factory (the default) selects the built-in UdpTransport.
+        //  • The factory is called exactly once per InitialiseNetwork().
+        //  • The factory MUST return a non-null, ready-to-Connect() transport.
 
         /// <summary>
         /// Delegate signature for custom transport factories.
@@ -193,7 +308,7 @@ namespace RTMPE.Core
         // Reconnect() can rejoin automatically).  Both fields are cleared when
         // the reconnect token is cleared — they have no meaning without it.
         //
-        // LastRoomId is the RoomInfo.RoomId (UUID string) returned by the room
+       // LastRoomId is the RoomInfo.RoomId (UUID string) returned by the room
         // service at join time; it survives session teardown precisely so the
         // SDK can feed it back into RoomManager.JoinRoom on a successful
         // ReconnectInit → SessionAck.  LastRoomCode is preserved as a fallback:
@@ -209,9 +324,10 @@ namespace RTMPE.Core
         // Used by NetworkBehaviour.IsOwner for object ownership checks.
         private string _localPlayerStringId;
 
-        // Monotonic counter for RPC request correlation IDs.
-        // Incremented atomically by SendRpc(); max-value wrap is safe (uint loops).
-        private int _rpcRequestCounter;
+        // RPC request correlation IDs are sourced from the CSPRNG-backed
+        // RequestIdAllocator so that reply spoofing requires guessing a
+        // 32-bit cryptographically-random value rather than a predictable
+        // monotonic counter.
 
         // Monotone client-side tick counter for CSP (client-side prediction).
         // Incremented once per 30 Hz variable-flush cycle while in a room.
@@ -225,21 +341,63 @@ namespace RTMPE.Core
         // Reset to -1L in ClearSessionData() and in Connect() so every new session
         // begins with counter = 0.
         //
-        // Using long avoids the int→uint cast ambiguity: the counter advances from
+       // Using long avoids the int→uint cast ambiguity: the counter advances from
         // 0 to uint.MaxValue (4,294,967,295) and then hard-stops rather than
         // wrapping silently back to 0 and reusing nonces.
         //
-        // These thresholds mirror the Rust gateway's SEQUENCE_EXHAUSTION_THRESHOLD
+       // These thresholds mirror the Rust gateway's SEQUENCE_EXHAUSTION_THRESHOLD
         // and NEAR_EXHAUSTION_MARGIN (nonce.rs) so the SDK terminates sessions
         // proactively before the gateway's replay-window would reject inbound traffic.
         private const long OutboundNonceExhaustionThreshold    = (long)uint.MaxValue + 1L; // 2^32
         private const long OutboundNonceNearExhaustionMargin   = 1_048_576L;               // ~9.7 h @ 30 Hz
         private long _outboundNonceCounter = -1L;
 
+        // Application-level monotonic sequence layered on top of the AEAD nonce
+        // counter when NetworkSettings.preserveApplicationSequence is on.  The
+        // wire header's Sequence field is overwritten by the nonce counter at
+        // encryption time, so the application-level sequence travels in the
+        // AAD instead — receivers can deduplicate or order without decrypting
+        // first.  Starts at -1L so the first Increment yields 0 to match the
+        // wire Sequence convention.  Reset alongside the nonce counter on every
+        // session boundary.
+        private long _outboundAppSequenceCounter = -1L;
+
+        // Last successfully-decoded inbound application sequence.  Exposed via
+        // LastInboundApplicationSequence for receivers that want to surface
+        // dedup / ordering metadata above the AEAD layer.  Stored as a long so
+        // -1 can encode "no app-sequenced packet seen yet" without colliding
+        // with the legitimate u32 range.
+        private long _lastInboundAppSequence = -1L;
+
         // Session crypto state
         private HandshakeHandler _handshakeHandler;
         private SessionKeys      _sessionKeys;
         private PacketBuilder    _packetBuilder;
+
+        // Sliding-bitmap anti-replay window for inbound AEAD-authenticated
+        // packets.  Allocated lazily when the session keys are derived; reset
+        // by ClearSessionData so a fresh session starts with a clean slate.
+        // The gateway's own replay window protects only the gateway; the
+        // client must enforce its own to defeat capture-and-replay against
+        // ownership / spawn / RPC handlers that have observable side effects.
+        private RTMPE.Crypto.Internal.ReplayWindow _inboundReplayWindow;
+
+        // Persistent server-static-key pin store, used by the Trust-On-First-Use
+        // mode of NetworkSettings.serverPinningMode.  Lazily initialised to a
+        // PlayerPrefsPinStore on first read; tests inject a custom store via
+        // SetPinStore() before Connect() to avoid touching the player's prefs.
+        private IServerKeyPinStore _pinStore;
+
+        // Channel-binding context for the current handshake.
+        //
+       // Holds the exact bytes the client emitted as the HandshakeInit
+        // payload (the ChaCha20-Poly1305 envelope around the API key).  The
+        // gateway hashes the same bytes and folds the SHA-256 into the
+        // transcript it signs, so the SDK must keep them around between
+        // Round 1 send and Round 1 reply receipt to recompute the matching
+        // transcript.  Null in the reconnect flow (the absent-sentinel is
+        // used instead — see HandshakeHandler.ValidateChallenge).
+        private byte[]           _lastHandshakeInitCiphertext;
         private HeartbeatManager _heartbeatManager;
 
         // Room management
@@ -254,6 +412,21 @@ namespace RTMPE.Core
         // Spawn management
         private SpawnManager _spawnManager;
 
+        // Scene-event serialization.  Unity's SceneManager.sceneUnloaded and
+        // sceneLoaded callbacks both run on the main thread today, so a true
+        // data race is not the concern; the concern is reentrancy ordering.
+        // A scripted single-mode load fires sceneUnloaded for the previous
+        // scene immediately followed by sceneLoaded for the new scene, and a
+        // long-running PruneDestroyed (e.g. behind a user-supplied
+        // INetworkObjectPool destroy callback that yields back to coroutines)
+        // could interleave with RecreateRoomAndSpawnManagers triggered by
+        // reconnect logic.  Holding the lock around both handlers establishes
+        // a documented ordering: sceneUnloaded → Prune → sceneLoaded → Prune
+        // (and never overlapping with a Recreate from another code path).
+        // The handlers are idempotent so the lock is correctness theatre, not
+        // load-bearing — but documenting the invariant is the point.
+        private readonly object _sceneTransitionLock = new object();
+
         // Cached heartbeat send callback — avoids per-frame closure allocation
         // at the call site in Update().
         private System.Action<byte[]> _sendPacketCallback;
@@ -262,13 +435,49 @@ namespace RTMPE.Core
         // conversion allocates on every call unless stored in a field.
         private System.Action<byte[]> _sendVariableUpdateDelegate;
 
-        // 30 Hz accumulator for the NetworkVariable flush loop.
+        // Default-fallback tick interval used until NetworkSettings has been
+        // resolved (e.g. very early Awake reentrancy, edit-mode tests with no
+        // settings asset).  Matches the SDK's historical 30 Hz canonical rate.
+        private const float DefaultVariableFlushInterval = 1f / 30f;
+
+        // Accumulator for the NetworkVariable flush loop.  Cadence is driven
+        // by _variableFlushInterval below, which is resolved from
+        // NetworkSettings.tickRate at initialisation so tick-rate-sensitive
+        // titles (FPS / fighting / mobile RPG) can change cadence without
+        // forking the SDK.
         private float _variableFlushAccum;
-        private const float VariableFlushInterval = 1f / 30f;
+
+        // Resolved per-tick interval (seconds).  Initialised to the default
+        // so any access prior to InitialiseNetwork still sees a coherent
+        // value (the field, not a const, is read by every tick site so a
+        // later settings load propagates immediately).
+        private float _variableFlushInterval = DefaultVariableFlushInterval;
+
+        /// <summary>
+        /// Fixed simulation step (seconds) used by the global tick loop and by
+        /// CSP replay so the rollback path observes the same delta-time the
+        /// original prediction did.  Resolved from
+        /// <see cref="NetworkSettings.TickInterval"/>; defaults to 1/30 s
+        /// when no settings are configured.
+        /// </summary>
+        public float FixedTickInterval => _variableFlushInterval;
+
+        // Hard cap on the number of fixed ticks a single Update() may catch
+        // up after a long hitch.  Without this guard a 30 s editor pause
+        // would queue 900 ticks of work into one frame and produce a
+        // multi-second stutter on resume.  The cap drops the "extra" time
+        // and resyncs against wall-clock — the server is the source of truth
+        // for late-binding state, so a few lost ticks are recoverable on
+        // the next reconciliation.
+        private const int MaxTicksPerFrame = 8;
+
+        // 5-second accumulator for the periodic RPC callback purge sweep.
+        private float _rpcPurgeAccum;
+        private const float RpcPurgeInterval = 5f;
 
         // ── Telemetry counters (Feature: Network Debugger window) ──────────────
         //
-        // Atomic 64-bit counters incremented on every wire-level send and receive.
+       // Atomic 64-bit counters incremented on every wire-level send and receive.
         // Reads on 64-bit platforms (the only platforms Unity supports for
         // dedicated multiplayer titles in 2026) are atomic by construction; we
         // additionally use Interlocked.Read in the public accessors for ARM64
@@ -277,7 +486,7 @@ namespace RTMPE.Core
         // measured under 5 ns on commodity x64, well below any per-packet
         // budget.  No allocations.
         //
-        // The counters are read by the Editor-only Network Debugger window
+       // The counters are read by the Editor-only Network Debugger window
         // and (optionally) by user telemetry sinks; they are not part of any
         // wire protocol.
         private long _packetsOut;
@@ -300,6 +509,43 @@ namespace RTMPE.Core
         /// <summary>Settings asset in use (may be the built-in default).</summary>
         public NetworkSettings Settings => _settings;
 
+        /// <summary>
+        /// Persistent server-static-key pin store used in Trust-On-First-Use
+        /// mode.  Lazily initialised to a <see cref="PlayerPrefsPinStore"/>;
+        /// tests and games with custom storage requirements may replace it
+        /// via <see cref="SetPinStore"/> before calling <see cref="Connect"/>.
+        /// </summary>
+        public IServerKeyPinStore PinStore
+        {
+            get
+            {
+                if (_pinStore == null) _pinStore = new PlayerPrefsPinStore();
+                return _pinStore;
+            }
+        }
+
+        /// <summary>
+        /// Inject a custom <see cref="IServerKeyPinStore"/>.  Must be called
+        /// before <see cref="Connect"/> for the new store to be consulted on
+        /// the upcoming Challenge.  Pass <see langword="null"/> to revert to
+        /// the default <see cref="PlayerPrefsPinStore"/>.
+        /// </summary>
+        public void SetPinStore(IServerKeyPinStore store) => _pinStore = store;
+
+        /// <summary>
+        /// Forget the persisted Trust-On-First-Use pin for the configured
+        /// server endpoint.  Intended for legitimate server-rotation flows:
+        /// the operator clears the old pin, the next connect re-runs TOFU
+        /// against the new key.
+        /// </summary>
+        public void ClearPinnedKey()
+        {
+            if (_settings == null) return;
+            var endpoint = ServerKeyPinning.CanonicalEndpoint(
+                _settings.serverHost, _settings.serverPort);
+            PinStore.Clear(endpoint);
+        }
+
         /// <summary>Local player ID (gateway session ID) — valid after SessionAck.</summary>
         public ulong LocalPlayerId => _localPlayerId;
 
@@ -308,7 +554,7 @@ namespace RTMPE.Core
 
         // ── Telemetry counters (read-only) ─────────────────────────────────────
         //
-        // Snapshot accessors return the current counter value.  Subtract two
+       // Snapshot accessors return the current counter value.  Subtract two
         // sampled values across a known interval to compute a rate.  The
         // Network Debugger Editor window does this at ~250 ms cadence to
         // render packets-per-second / bytes-per-second.
@@ -361,7 +607,7 @@ namespace RTMPE.Core
         /// automatically when the server publishes a
         /// <c>master_client_changed</c> or <c>host_changed</c> event.
         ///
-        /// Returns <see langword="false"/> when not in a room, when the room
+       /// Returns <see langword="false"/> when not in a room, when the room
         /// snapshot has no master set, or when the local player ID is not yet
         /// known (e.g. during connection setup).
         /// </summary>
@@ -389,7 +635,7 @@ namespace RTMPE.Core
         /// to <see cref="RoomManager"/> and no-ops (with a log) if the session
         /// has not yet been authenticated.
         ///
-        /// Thread safety: the lazy-init uses
+       /// Thread safety: the lazy-init uses
         /// <see cref="System.Threading.Interlocked.CompareExchange{T}(ref T,T,T)"/>
         /// so concurrent access from the main thread plus a background thread
         /// (e.g. a transport callback that inadvertently touches it) only ever
@@ -403,7 +649,7 @@ namespace RTMPE.Core
             {
                 var existing = _localPlayer;
                 if (existing != null) return existing;
-                var fresh = new LocalPlayerContext(_roomManager, () => _localPlayerStringId);
+                var fresh = new LocalPlayerContext(() => _roomManager, () => _localPlayerStringId);
                 return System.Threading.Interlocked.CompareExchange(ref _localPlayer, fresh, null) ?? fresh;
             }
         }
@@ -411,6 +657,15 @@ namespace RTMPE.Core
 
         /// <summary>Spawn management API — spawn, despawn, prefab registry, owner-leave handling.</summary>
         public SpawnManager Spawner => _spawnManager;
+
+        /// <summary>
+        /// Internal accessor for editor diagnostics tooling.  The
+        /// NetworkDebuggerWindow uses this to enumerate the registry without
+        /// reflecting on private fields, which is brittle across renames.
+        /// Not part of the public API — gameplay code should use
+        /// <see cref="Spawner"/>.
+        /// </summary>
+        internal SpawnManager SpawnManagerInternal => _spawnManager;
 
         /// <summary>
         /// Networked-scene management façade.  Drives room-wide scene
@@ -426,7 +681,7 @@ namespace RTMPE.Core
                 var existing = _sceneManager;
                 if (existing != null) return existing;
                 if (_roomManager == null) return null;
-                var fresh = new NetworkSceneManager(_roomManager);
+                var fresh = new NetworkSceneManager(() => _roomManager);
                 return System.Threading.Interlocked.CompareExchange(ref _sceneManager, fresh, null) ?? fresh;
             }
         }
@@ -483,6 +738,17 @@ namespace RTMPE.Core
         /// <summary>Fired when the connection attempt fails (timeout or transport error).</summary>
         public event Action<string> OnConnectionFailed;
 
+        /// <summary>
+        /// Fired when the bounded reconnect loop kicked off by <see cref="Reconnect"/>
+        /// exhausts <see cref="NetworkSettings.maxReconnectAttempts"/> without
+        /// reaching <see cref="NetworkState.Connected"/>.  Argument is the
+        /// number of attempts actually made.  When this fires the manager has
+        /// already transitioned back to <see cref="NetworkState.Disconnected"/>
+        /// and cleared all session state — the application MUST fall back to
+        /// <see cref="Connect(string)"/> with credentials to recover.
+        /// </summary>
+        public event Action<int> OnReconnectFailed;
+
         /// <summary>Fired when the local player successfully joins a room.</summary>
         [Obsolete("Use NetworkManager.Rooms.OnRoomJoined or Rooms.OnRoomCreated instead.")]
         public event Action<ulong> OnJoinedRoom;
@@ -536,6 +802,18 @@ namespace RTMPE.Core
             if (_settings == null)
                 _settings = NetworkSettings.CreateDefault();
 
+            // Hand the active settings to the gated logger so transport-level
+            // errors honour the verbose-logs preference instead of being
+            // ingested as crashes by every reporter installed in the host app.
+            RtmpeLog.SetActiveSettings(_settings);
+
+            // Resolve the runtime tick interval from the settings' configured
+            // tickRate.  TickInterval is guarded against division by zero by
+            // NetworkSettings (Mathf.Max(1, tickRate)); the extra positive
+            // check below catches any future regression where a hand-built
+            // settings instance bypasses the inspector range.
+            ResolveTickInterval();
+
             // Subscribe to scene-load events BEFORE InitialiseNetwork so that
             // a scene load that races with the first frame doesn't leak stale
             // NetworkObject registry entries.  sceneUnloaded fires AFTER Unity
@@ -547,6 +825,20 @@ namespace RTMPE.Core
             SceneManager.sceneLoaded   += HandleSceneLoaded;
 
             InitialiseNetwork();
+        }
+
+        // Resolves _variableFlushInterval from the active NetworkSettings'
+        // configured tickRate.  Falls back to the historical 1/30 s default
+        // when no settings are configured or when a hand-built instance
+        // somehow surfaces a non-positive interval.  Centralising the
+        // resolution lets a future hot-reload path (settings asset
+        // re-imported in the editor) refresh the cadence with one call.
+        private void ResolveTickInterval()
+        {
+            float interval = (_settings != null && _settings.TickInterval > 0f)
+                ? _settings.TickInterval
+                : DefaultVariableFlushInterval;
+            _variableFlushInterval = interval;
         }
 
         private void Start()
@@ -572,17 +864,61 @@ namespace RTMPE.Core
             // Drive the heartbeat tick each frame using the pre-cached callback.
             _heartbeatManager?.Tick(_sendPacketCallback);
 
+            // Drive matchmaking timeout/cancel state machine in main-thread time
+            // so callers don't need to wire app-level Tick plumbing.
+            _matchmakingManager?.Tick(Time.unscaledTimeAsDouble);
+
             // Flush dirty NetworkVariables at 30 Hz for all owned objects.
+            //
+            // The catch-up loop drains the accumulator with a `while` rather
+            // than a single `if` so a frame that ran long (Editor breakpoint,
+            // GC stall, dropped-foreground on mobile) advances every tick it
+            // owes instead of leaking the surplus into wall-clock drift.
+            // MaxTicksPerFrame caps the worst-case work to keep a long pause
+            // from turning into a multi-second hitch on resume.
             _variableFlushAccum += Time.deltaTime;
-            if (_variableFlushAccum >= VariableFlushInterval)
+            int ticksThisFrame = 0;
+            // Snapshot the resolved interval to a local so a settings change
+            // mid-loop (e.g. on a settings-asset reimport in the editor)
+            // cannot cause divide-by-zero or infinite-loop pathologies if it
+            // races to zero between catch-up iterations.
+            float flushInterval = _variableFlushInterval;
+            if (flushInterval <= 0f) flushInterval = DefaultVariableFlushInterval;
+            while (_variableFlushAccum >= flushInterval
+                   && ticksThisFrame < MaxTicksPerFrame)
             {
-                _variableFlushAccum -= VariableFlushInterval;
-                FlushDirtyNetworkVariables();
+                _variableFlushAccum -= flushInterval;
                 // Advance the CSP tick in lock-step with the variable flush
                 // so that InputPayload.Tick and NetworkVariable deltas share
-                // the same 30 Hz cadence.  Only advance while in a room —
-                // ticks outside a room are meaningless for CSP.
+                // the same configured cadence.  Only advance while in a room
+                // — ticks outside a room are meaningless for CSP.
                 if (IsInRoom) _localTick++;
+                // Driving per-tick collectors (input sampling, etc.) from a
+                // single while-loop tick driver guarantees exactly one sample
+                // per simulated tick, even on long frames; otherwise inputs
+                // are silently lost on stutters or double-collected at
+                // sub-tick frame rates.  Dispatched BEFORE FlushDirtyNetworkVariables
+                // so any input-driven NetworkVariable mutation produced inside
+                // OnFixedTick is published in the same tick it was sampled.
+                DispatchFixedTick(flushInterval);
+                FlushDirtyNetworkVariables();
+                ticksThisFrame++;
+            }
+            if (_variableFlushAccum >= flushInterval)
+            {
+                // The cap above prevents the simulation from chasing an
+                // arbitrarily-large hitch all in one frame; surrender the
+                // residual time to wall-clock to avoid permanent backlog.
+                _variableFlushAccum = 0f;
+            }
+
+            // Sweep expired RPC callbacks every 5 seconds so pending entries
+            // from unanswered or timed-out requests do not accumulate indefinitely.
+            _rpcPurgeAccum += Time.deltaTime;
+            if (_rpcPurgeAccum >= RpcPurgeInterval)
+            {
+                _rpcPurgeAccum = 0f;
+                RequestIdAllocator.PurgeExpired();
             }
         }
 
@@ -593,12 +929,145 @@ namespace RTMPE.Core
         private void FlushDirtyNetworkVariables()
         {
             if (_spawnManager == null || !IsInRoom) return;
-            foreach (var nb in _spawnManager.Registry.GetAll())
+            // Walk via a private snapshot list — flushing a NetworkVariable
+            // can fire user value-change callbacks that may legally re-enter
+            // the registry (e.g. spawn a follower object), and the shared
+            // GetAll buffer must not be parked across that re-entry.
+            _spawnManager.Registry.GetAllSnapshot(_flushScratch);
+
+            // When variable batching is enabled, every per-object payload is
+            // diverted into _batchPending instead of being emitted as a
+            // standalone 0x41 packet.  After the iteration the accumulated
+            // payloads are encoded into one or more 0x44 batch packets.  At
+            // the cap the partial batch is flushed eagerly so the receiver
+            // never blocks waiting for more entries inside the same tick.
+            bool batching = _settings != null && _settings.enableVariableBatching;
+            int  batchCap = batching && _settings != null
+                ? UnityEngine.Mathf.Clamp(_settings.maxVariablesPerBatch, 1, VariableBatchBuilder.MaxEntries)
+                : 0;
+
+            // Read the cap into a field so the cached batch-collector
+            // delegate can consult it without re-reading _settings on every
+            // invocation (avoids torn reads if the asset is hot-reloaded
+            // mid-flush).
+            _activeBatchCap = batchCap;
+            System.Action<byte[]> sender = batching
+                ? (_batchCollectorDelegate ??= CollectIntoBatch)
+                : _sendVariableUpdateDelegate;
+
+            for (int i = 0; i < _flushScratch.Count; i++)
             {
+                var nb = _flushScratch[i];
                 if (nb == null || !nb.IsOwner || !nb.IsSpawned) continue;
-                // Use the pre-cached delegate to avoid per-call allocation.
-                nb.FlushDirtyVariables(_sendVariableUpdateDelegate);
+                nb.FlushDirtyVariables(sender);
             }
+            _flushScratch.Clear();
+
+            if (batching && _batchPending.Count > 0)
+            {
+                FlushVariableBatch();
+            }
+        }
+
+        // Pending variable-update payloads accumulated within a single tick
+        // when EnableVariableBatching is true.  Cleared on every batch flush
+        // so the same list survives across ticks without reallocation.
+        private readonly System.Collections.Generic.List<byte[]> _batchPending =
+            new System.Collections.Generic.List<byte[]>(32);
+
+        // Reusable scratch array sized to the batch cap.  Resized lazily when
+        // the configured cap grows; never shrunk because shrinking would
+        // create allocation pressure for a setting that is only ever raised
+        // as the project's variable count grows.
+        private byte[][] _batchScratch = new byte[32][];
+
+        // Cached delegate for the per-tick batch collector (mirrors the
+        // _sendVariableUpdateDelegate caching pattern).
+        private System.Action<byte[]> _batchCollectorDelegate;
+        private int _activeBatchCap;
+
+        private void CollectIntoBatch(byte[] payload)
+        {
+            if (payload == null || payload.Length == 0) return;
+            _batchPending.Add(payload);
+            if (_batchPending.Count >= _activeBatchCap)
+            {
+                FlushVariableBatch();
+            }
+        }
+
+        private void FlushVariableBatch()
+        {
+            int count = _batchPending.Count;
+            if (count == 0) return;
+            if (_batchScratch.Length < count)
+            {
+                _batchScratch = new byte[count][];
+            }
+            for (int i = 0; i < count; i++) _batchScratch[i] = _batchPending[i];
+            // Null the trailing slots so the array does not keep stale
+            // references alive across the next batch.
+            for (int i = count; i < _batchScratch.Length; i++) _batchScratch[i] = null;
+            _batchPending.Clear();
+
+            byte[] batchPayload;
+            try
+            {
+                batchPayload = VariableBatchBuilder.Build(_batchScratch, count);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] VariableBatchBuilder.Build threw {ex.GetType().Name}: {ex.Message}. " +
+                    "Falling back to per-object VariableUpdate packets for this batch.");
+                for (int i = 0; i < count; i++) SendVariableUpdate(_batchScratch[i]);
+                return;
+            }
+
+            SendVariableBatchUpdate(batchPayload);
+        }
+
+        // Pre-allocated buffers for the per-frame and per-tick dispatch loops.
+        // Kept on this NetworkManager so a user callback that triggers another
+        // GetAll cannot stomp the in-flight iteration.
+        private readonly System.Collections.Generic.List<NetworkBehaviour> _flushScratch =
+            new System.Collections.Generic.List<NetworkBehaviour>(64);
+        private readonly System.Collections.Generic.List<NetworkBehaviour> _fixedTickScratch =
+            new System.Collections.Generic.List<NetworkBehaviour>(64);
+
+        /// <summary>
+        /// Invoke <see cref="NetworkBehaviour.InvokeOnFixedTick"/> on every
+        /// owned, spawned NetworkBehaviour exactly once per simulated tick.
+        /// Centralising the call here lets a long frame (Editor breakpoint,
+        /// GC stall, dropped-foreground on mobile) run every tick it owes
+        /// rather than dropping accumulated input — Update()-hosted
+        /// collectors observe one frame's deltaTime regardless of how many
+        /// ticks the accumulator advances.
+        /// </summary>
+        private void DispatchFixedTick(float dt)
+        {
+            if (_spawnManager == null || !IsInRoom) return;
+            // Snapshot via a private list so a user OnFixedTick implementation
+            // that re-enters the registry cannot perturb the iteration order.
+            _spawnManager.Registry.GetAllSnapshot(_fixedTickScratch);
+            for (int i = 0; i < _fixedTickScratch.Count; i++)
+            {
+                var nb = _fixedTickScratch[i];
+                if (nb == null || !nb.IsOwner || !nb.IsSpawned) continue;
+                try
+                {
+                    nb.InvokeOnFixedTick(dt);
+                }
+                catch (Exception ex)
+                {
+                    // A single misbehaving subclass must not abort the rest of
+                    // the per-tick dispatch — log and move on.
+                    Debug.LogError(
+                        $"[RTMPE] NetworkBehaviour.OnFixedTick threw on " +
+                        $"{nb.GetType().Name}: {ex.GetType().Name}: {ex.Message}", nb);
+                }
+            }
+            _fixedTickScratch.Clear();
         }
 
         private void OnDestroy()
@@ -607,6 +1076,10 @@ namespace RTMPE.Core
             {
                 if (_instance == this) _instance = null;
             }
+
+            // Drop the gated logger's reference so a stale settings asset is
+            // not retained across scene reloads.
+            RtmpeLog.SetActiveSettings(null);
 
             // Unsubscribe BEFORE Cleanup so that a scene-unload fired as part
             // of shutdown doesn't re-enter our handler after fields are nulled.
@@ -634,22 +1107,30 @@ namespace RTMPE.Core
         /// </remarks>
         private void HandleSceneUnloaded(Scene scene)
         {
-            if (_spawnManager?.Registry == null) return;
-
-            int pruned;
-            try { pruned = _spawnManager.Registry.PruneDestroyed(); }
-            catch (Exception ex)
+            // Serialize against HandleSceneLoaded and RecreateRoomAndSpawnManagers.
+            // The try / finally would be load-bearing if Monitor.Enter could
+            // throw on its own — using a lock statement is equivalent and the
+            // exit is guaranteed even if PruneDestroyed throws (the inner
+            // try/catch swallows it before the lock unwinds).
+            lock (_sceneTransitionLock)
             {
-                Debug.LogWarning(
-                    $"[RTMPE] NetworkObjectRegistry.PruneDestroyed threw " +
-                    $"{ex.GetType().Name}: {ex.Message}. Skipping prune this cycle.");
-                return;
-            }
+                if (_spawnManager?.Registry == null) return;
 
-            if (pruned > 0)
-                LogDebug(
-                    $"Scene \"{scene.name}\" unloaded — pruned {pruned} stale NetworkObject entr" +
-                    (pruned == 1 ? "y" : "ies") + " from registry.");
+                int pruned;
+                try { pruned = _spawnManager.Registry.PruneDestroyed(); }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning(
+                        $"[RTMPE] NetworkObjectRegistry.PruneDestroyed threw " +
+                        $"{ex.GetType().Name}: {ex.Message}. Skipping prune this cycle.");
+                    return;
+                }
+
+                if (pruned > 0)
+                    LogDebug(
+                        $"Scene \"{scene.name}\" unloaded — pruned {pruned} stale NetworkObject entr" +
+                        (pruned == 1 ? "y" : "ies") + " from registry.");
+            }
         }
 
         /// <summary>
@@ -663,14 +1144,20 @@ namespace RTMPE.Core
         private void HandleSceneLoaded(Scene scene, LoadSceneMode mode)
         {
             if (mode != LoadSceneMode.Single) return;
-            if (_spawnManager?.Registry == null) return;
 
-            try { _spawnManager.Registry.PruneDestroyed(); }
-            catch (Exception ex)
+            // Serialize with HandleSceneUnloaded so a Single-mode load that
+            // raises both events back-to-back observes a consistent registry.
+            lock (_sceneTransitionLock)
             {
-                Debug.LogWarning(
-                    $"[RTMPE] NetworkObjectRegistry.PruneDestroyed threw " +
-                    $"{ex.GetType().Name}: {ex.Message}. Skipping prune this cycle.");
+                if (_spawnManager?.Registry == null) return;
+
+                try { _spawnManager.Registry.PruneDestroyed(); }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning(
+                        $"[RTMPE] NetworkObjectRegistry.PruneDestroyed threw " +
+                        $"{ex.GetType().Name}: {ex.Message}. Skipping prune this cycle.");
+                }
             }
         }
 
@@ -694,7 +1181,7 @@ namespace RTMPE.Core
                 try { _transport = _transportFactory(_settings); }
                 catch (Exception ex)
                 {
-                    Debug.LogError(
+                    RtmpeLog.Error(
                         $"[RTMPE] Custom transport factory threw {ex.GetType().Name}: {ex.Message}. " +
                         "Falling back to the built-in UdpTransport for this session.");
                     _transport = null;
@@ -718,8 +1205,8 @@ namespace RTMPE.Core
             }
 
             _networkThread = new NetworkThread(_transport, _settings.networkThreadBufferBytes);
-            _networkThread.OnPacketReceived += HandlePacketReceived;
-            _networkThread.OnError          += HandleTransportError;
+            _networkThread.OnPacketReceivedRented += HandlePacketReceivedRented;
+            _networkThread.OnError                += HandleTransportError;
 
             _packetBuilder = new PacketBuilder();
 
@@ -740,6 +1227,7 @@ namespace RTMPE.Core
             _handshakeHandler = null;
             _sessionKeys?.Dispose();       // Zero session keys before GC can observe it
             _sessionKeys      = null;
+            _inboundReplayWindow?.Reset();
             // Detach scene manager BEFORE tearing down the network thread so
             // any in-flight SceneLoaded callbacks don't fire into a disposed manager.
             _sceneManager?.Dispose();
@@ -747,12 +1235,21 @@ namespace RTMPE.Core
             // Unsubscribe before dispose to break delegate references.
             if (_networkThread != null)
             {
-                _networkThread.OnPacketReceived -= HandlePacketReceived;
-                _networkThread.OnError          -= HandleTransportError;
+                _networkThread.OnPacketReceivedRented -= HandlePacketReceivedRented;
+                _networkThread.OnError                -= HandleTransportError;
                 _networkThread.Dispose();
             }
             _networkThread = null;
             _transport     = null;
+
+            // Symmetric unsubscribe to defend against future re-init paths
+            // that would otherwise accumulate handlers.  InitialiseNetwork
+            // attaches HandleStateSyncPacket; the historical Cleanup path did
+            // not detach it because the manager was assumed to be re-created
+            // (not re-initialised) per session.  A future refactor that calls
+            // InitialiseNetwork twice on the same instance would silently
+            // double-fire StateSync without this line.
+            OnDataReceived -= HandleStateSyncPacket;
         }
 
         // ── Public API ─────────────────────────────────────────────────────────
@@ -785,6 +1282,10 @@ namespace RTMPE.Core
             // of every session starts at counter = 0, matching the gateway's
             // NonceGenerator which also resets to 0 for each new EstablishedSession.
             System.Threading.Interlocked.Exchange(ref _outboundNonceCounter, -1L);
+            // Mirror the reset for the application-level sequence so the first
+            // FLAG_APP_SEQUENCE packet of a fresh session starts at 0.
+            System.Threading.Interlocked.Exchange(ref _outboundAppSequenceCounter, -1L);
+            System.Threading.Interlocked.Exchange(ref _lastInboundAppSequence, -1L);
 
             // Recreate Room/Spawn managers with the fresh PacketBuilder.
             RecreateRoomAndSpawnManagers();
@@ -822,35 +1323,43 @@ namespace RTMPE.Core
         /// </summary>
         private void RecreateRoomAndSpawnManagers()
         {
-            // RoomManager shares PacketBuilder with the rest of the outbound
-            // pipeline so room packets use a single monotonic sequence counter
-            // — using an independent counter would be a protocol violation
-            // and may trigger gateway replay protection.
-            _roomManager = new RoomManager(
-                _packetBuilder,
-                packet => EncryptAndSend(packet),
-                () => _state,
-                id => SetLocalRoomPlayerId(id));
-            _roomManager.OnRoomJoined   += OnRoomManagerJoined;
-            _roomManager.OnRoomLeft     += OnRoomManagerLeft;
-            _roomManager.OnRoomCreated  += OnRoomManagerCreated;
+            // Serialize against scene-transition handlers so a Recreate
+            // triggered by reconnect cannot interleave with a PruneDestroyed
+            // from sceneUnloaded.  Documented ordering when both fire:
+            //  sceneUnloaded → Prune → sceneLoaded → Prune
+            //  (Recreate runs atomically with respect to the above.)
+            lock (_sceneTransitionLock)
+            {
+                // RoomManager shares PacketBuilder with the rest of the outbound
+                // pipeline so room packets use a single monotonic sequence counter
+                // — using an independent counter would be a protocol violation
+                // and may trigger gateway replay protection.
+                _roomManager = new RoomManager(
+                    _packetBuilder,
+                    packet => EncryptAndSend(packet),
+                    () => _state,
+                    id => SetLocalRoomPlayerId(id));
+                _roomManager.OnRoomJoined   += OnRoomManagerJoined;
+                _roomManager.OnRoomLeft     += OnRoomManagerLeft;
+                _roomManager.OnRoomCreated  += OnRoomManagerCreated;
 
-            _lobbyManager = new LobbyManager(
-                _packetBuilder,
-                packet => EncryptAndSend(packet));
+                _lobbyManager = new LobbyManager(
+                    _packetBuilder,
+                    packet => EncryptAndSend(packet));
 
-            _matchmakingManager = new MatchmakingManager(
-                _packetBuilder,
-                packet => EncryptAndSend(packet),
-                () => _state,
-                () => _localPlayerStringId ?? string.Empty);
+                _matchmakingManager = new MatchmakingManager(
+                    _packetBuilder,
+                    packet => EncryptAndSend(packet),
+                    () => _state,
+                    () => _localPlayerStringId ?? string.Empty);
 
-            var registry  = new NetworkObjectRegistry();
-            var ownership = new OwnershipManager(registry, this);
-            _spawnManager = new SpawnManager(registry, ownership, this);
+                var registry  = new NetworkObjectRegistry();
+                var ownership = new OwnershipManager(registry, this);
+                _spawnManager = new SpawnManager(registry, ownership, this);
 
-            _roomManager.OnPlayerLeft   += playerId => _spawnManager?.OnPlayerLeftRoom(playerId);
-            _roomManager.OnPlayerJoined += _ => _spawnManager?.MarkAllVariablesDirtyForResync();
+                _roomManager.OnPlayerLeft   += playerId => _spawnManager?.OnPlayerLeftRoom(playerId);
+                _roomManager.OnPlayerJoined += _ => _spawnManager?.MarkAllVariablesDirtyForResync();
+            }
         }
 
         /// <summary>
@@ -881,8 +1390,8 @@ namespace RTMPE.Core
         /// var backoff = new ReconnectBackoff();
         /// while (!nm.IsConnected &amp;&amp; backoff.Attempt &lt; 10)
         /// {
-        ///     yield return new WaitForSeconds((float)backoff.NextDelay().TotalSeconds);
-        ///     if (!nm.Reconnect()) break; // CanReconnect went false → fall back to Connect()
+        ///    yield return new WaitForSeconds((float)backoff.NextDelay().TotalSeconds);
+        ///    if (!nm.Reconnect()) break; // CanReconnect went false → fall back to Connect()
         /// }
         /// if (nm.IsConnected) backoff.Reset();
         /// </code>
@@ -911,11 +1420,105 @@ namespace RTMPE.Core
                 return false;
             }
 
+            // Reconnect drives a bounded retry loop internally so a single
+            // bad attempt cannot leave the SDK frozen in Reconnecting.  The
+            // public method still returns immediately — observers see an
+            // immediate transition to Reconnecting and the loop coroutine
+            // owns the subsequent state moves.
             TransitionTo(NetworkState.Reconnecting);
+            int budget = (_settings != null && _settings.maxReconnectAttempts > 0)
+                ? _settings.maxReconnectAttempts
+                : 1;
+            _reconnectLoopCoroutine = StartCoroutine(ReconnectLoopCoroutine(budget));
+            return true;
+        }
 
+        // Coroutine handle for the bounded retry loop.  Held so a user-driven
+        // Disconnect() or a successful SessionAck can stop the loop deterministic-
+        // ally without leaving an orphaned coroutine that would later try to
+        // mutate state on a torn-down session.
+        private Coroutine _reconnectLoopCoroutine;
+
+        /// <summary>
+        /// Bounded retry loop driven by <see cref="Reconnect"/>.
+        /// Performs up to <paramref name="maxAttempts"/> single-attempt
+        /// reconnects, spaced by <see cref="ReconnectBackoff"/>.  Exits early
+        /// on the first attempt that reaches <see cref="NetworkState.Connected"/>;
+        /// on exhaustion transitions to <see cref="NetworkState.Disconnected"/>,
+        /// clears session data, and fires <see cref="OnReconnectFailed"/>.
+        /// </summary>
+        private IEnumerator ReconnectLoopCoroutine(int maxAttempts)
+        {
+            var backoff = new ReconnectBackoff();
+            int attempts = 0;
+
+            while (attempts < maxAttempts)
+            {
+                attempts++;
+
+                // CanReconnect can flip between attempts (token cleared by
+                // a racing Disconnect, or session torn down externally).
+                // Bail out quietly if the precondition no longer holds.
+                if (!CanReconnect) break;
+
+                // Each attempt starts a fresh per-connection state.  We
+                // re-enter Reconnecting here in case a previous failed
+                // attempt transitioned us to Disconnected via the timeout
+                // coroutine — the loop owns the state lifecycle, not the
+                // individual attempt coroutines.
+                if (_state == NetworkState.Disconnected)
+                    TransitionTo(NetworkState.Reconnecting);
+
+                StartReconnectAttempt();
+
+                // Wait for the attempt to resolve: either Connected (success)
+                // or Disconnected (per-attempt timeout / transport error).
+                while (_state == NetworkState.Reconnecting)
+                    yield return null;
+
+                if (_state == NetworkState.Connected)
+                {
+                    _reconnectLoopCoroutine = null;
+                    yield break;
+                }
+
+                // Attempt failed.  Sleep with full-jitter backoff before the
+                // next attempt — prevents reconnect storms on a flapping
+                // gateway and de-correlates retry timing across clients.
+                if (attempts < maxAttempts)
+                {
+                    var delay = backoff.NextDelay();
+                    yield return new WaitForSeconds((float)delay.TotalSeconds);
+                }
+            }
+
+            // All attempts consumed.  Make the failure visible to the app —
+            // the previous behaviour silently left the manager in
+            // Reconnecting with no event surfaced to game UI.
+            if (_state != NetworkState.Disconnected)
+            {
+                _networkThread?.Stop();
+                _heartbeatManager?.Stop();
+                ClearSessionData(preserveReconnectToken: false);
+                TransitionTo(NetworkState.Disconnected, DisconnectReason.Timeout);
+            }
+            SafeRaise(OnReconnectFailed, attempts, nameof(OnReconnectFailed));
+            _reconnectLoopCoroutine = null;
+        }
+
+        /// <summary>
+        /// Drive the per-attempt portion of a reconnect: reset protocol
+        /// state, recreate managers, restart the network thread, and start
+        /// the ReconnectInit + timeout coroutines.  Called once per
+        /// iteration of <see cref="ReconnectLoopCoroutine"/>.
+        /// </summary>
+        private void StartReconnectAttempt()
+        {
             // Reset per-connection protocol state — same pattern as Connect().
             _packetBuilder = new PacketBuilder();
             System.Threading.Interlocked.Exchange(ref _outboundNonceCounter, -1L);
+            System.Threading.Interlocked.Exchange(ref _outboundAppSequenceCounter, -1L);
+            System.Threading.Interlocked.Exchange(ref _lastInboundAppSequence, -1L);
 
             // Recreate Room/Spawn managers with identical event wiring to Connect().
             RecreateRoomAndSpawnManagers();
@@ -931,6 +1534,9 @@ namespace RTMPE.Core
 
             _handshakeHandler = new HandshakeHandler();
 
+            // Re-arm the network thread.  If a previous attempt's timeout or
+            // transport error stopped and nulled the thread, recreate it.
+            EnsureNetworkThreadReady();
             _networkThread.Start();
 
             // Kick off the reconnect coroutine — waits for transport bind, sends
@@ -938,7 +1544,36 @@ namespace RTMPE.Core
             // handlers complete the flow exactly as for a fresh Connect().
             _connectCoroutine = StartCoroutine(ReconnectInitCoroutine());
             _timeoutCoroutine = StartCoroutine(ConnectionTimeoutRoutine());
-            return true;
+        }
+
+        /// <summary>
+        /// Lazily reconstruct the network thread when a previous attempt's
+        /// timeout tore it down.  The transport instance survives across
+        /// attempts (UdpTransport.Connect is re-callable; Disconnect closes
+        /// the socket without disposing the wrapper) and is re-bound by the
+        /// new RunLoop.  Manager-lifetime subscriptions such as the
+        /// state-sync data handler are NOT touched here — they were wired
+        /// once in InitialiseNetwork and must not be re-attached per
+        /// attempt or every inbound packet would multi-dispatch.
+        /// </summary>
+        private void EnsureNetworkThreadReady()
+        {
+            if (_networkThread != null) return;
+            if (_transport == null)
+            {
+                // Should not happen on the reconnect path because
+                // InitialiseNetwork ran in Awake; guard for the case where
+                // a user-installed factory or manual Disposal cleared the
+                // field, so a retry can still recover.
+                _transport = new UdpTransport(
+                    _settings.serverHost,
+                    _settings.serverPort,
+                    _settings.sendBufferBytes,
+                    _settings.receiveBufferBytes);
+            }
+            _networkThread = new NetworkThread(_transport, _settings.networkThreadBufferBytes);
+            _networkThread.OnPacketReceivedRented += HandlePacketReceivedRented;
+            _networkThread.OnError                += HandleTransportError;
         }
 
         /// <summary>
@@ -966,6 +1601,14 @@ namespace RTMPE.Core
             {
                 StopCoroutine(_connectCoroutine);
                 _connectCoroutine = null;
+            }
+            // A user-initiated disconnect must cancel any pending bounded
+            // reconnect retry so we don't see Reconnecting → Disconnected
+            // → Reconnecting flap after the user has explicitly given up.
+            if (_reconnectLoopCoroutine != null)
+            {
+                StopCoroutine(_reconnectLoopCoroutine);
+                _reconnectLoopCoroutine = null;
             }
 
             TransitionTo(NetworkState.Disconnecting);
@@ -1007,7 +1650,7 @@ namespace RTMPE.Core
         /// Wait for the UDP transport to bind (background thread sets LocalEndPoint),
         /// then build and transmit the encrypted HandshakeInit packet.
         ///
-        /// Polls LocalEndPoint each frame — the background thread calls
+       /// Polls LocalEndPoint each frame — the background thread calls
         /// _transport.Connect() which binds the socket and sets the endpoint
         /// within the first loop iteration (~1 ms after Start()).
         /// </summary>
@@ -1068,20 +1711,120 @@ namespace RTMPE.Core
 
         // ── Receive path (raised on network thread → marshalled to main thread) ─
 
-        private void HandlePacketReceived(byte[] data)
+        // Pre-resolved delegate for the per-packet main-thread dispatch.  The
+        // static lambda has no captured state so the runtime emits exactly one
+        // delegate instance for the entire process lifetime — no per-packet
+        // closure box, no captured `this` pointer.  ProcessPacketAndReturn
+        // reads `NetworkManager.Instance` to find the live receiver, which is
+        // safe because the receive path is unconditionally torn down with the
+        // singleton in OnDestroy.
+        private static readonly Action<byte[], int> s_ProcessPacketDispatch =
+            ProcessPacketAndReturn;
+
+        // Drain handler executed on the Unity main thread.  Consumes the
+        // pool-rented buffer end-to-end and unconditionally returns it to
+        // the pool — try/finally guarantees the rental does not leak on
+        // any exception path inside ProcessPacket or its callees.
+        private static void ProcessPacketAndReturn(byte[] buffer, int length)
+        {
+            var instance = System.Threading.Volatile.Read(ref _instance);
+            if (instance == null)
+            {
+                // Manager was torn down between dispatch and drain — return
+                // the rented buffer so the pool does not leak.
+                System.Buffers.ArrayPool<byte>.Shared.Return(buffer, clearArray: true);
+                return;
+            }
+
+            try
+            {
+                instance.ProcessPacket(buffer, length);
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(buffer, clearArray: true);
+            }
+        }
+
+        // Invoked SYNCHRONOUSLY on the network background thread for every
+        // datagram.  The `rented` argument is owned by NetworkThread and is
+        // returned to ArrayPool the moment this method returns, so we copy
+        // the meaningful prefix into a SEPARATE pool rental that is ours to
+        // hand off to the main thread.  Net effect: one pool rent + one
+        // pool return per packet, zero managed-heap allocation in steady
+        // state (delegate is pre-resolved, dispatcher work item carries the
+        // (buffer, length) pair inline).
+        private void HandlePacketReceivedRented(byte[] rented, int offset, int length)
         {
             // Telemetry — count wire-level inbound packets / bytes BEFORE
             // dispatching to the main thread so the metrics reflect the raw
             // socket-level traffic regardless of any decryption / decompression
             // applied later in ProcessPacket.  Interlocked.Add is lock-free
             // and safe to call from the network thread.
-            if (data != null)
+            if (length <= 0) return;
+            System.Threading.Interlocked.Increment(ref _packetsIn);
+            System.Threading.Interlocked.Add(ref _bytesIn, length);
+
+            var dispatcher = _dispatcher;
+            if (dispatcher == null) return;
+
+            // Re-rent so the buffer survives the cross-thread hop.  Rent may
+            // hand back an array larger than `length`; the dispatched length
+            // is the authoritative byte count for ProcessPacket, never
+            // `owned.Length`.
+            var owned = System.Buffers.ArrayPool<byte>.Shared.Rent(length);
+            bool accepted = false;
+            try
             {
-                System.Threading.Interlocked.Increment(ref _packetsIn);
-                System.Threading.Interlocked.Add(ref _bytesIn, data.Length);
+                Buffer.BlockCopy(rented, offset, owned, 0, length);
+                accepted = dispatcher.Enqueue(s_ProcessPacketDispatch, owned, length);
+            }
+            catch
+            {
+                // Enqueue failure (queue full + Throw policy, or OOM during
+                // segment grow) must release the rental to keep the pool
+                // honest — the dispatched drain will never run for this
+                // buffer if we throw.
+                System.Buffers.ArrayPool<byte>.Shared.Return(owned, clearArray: true);
+                throw;
             }
 
-            _dispatcher?.Enqueue(() => ProcessPacket(data));
+            // Backpressure rejection (DropTail / DropHead) returns the rental
+            // synchronously; ProcessPacketAndReturn never runs for a dropped
+            // packet so the rental would otherwise leak.  The throttled
+            // warning surfaces the drop without flooding the log under
+            // sustained backpressure.
+            if (!accepted)
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(owned, clearArray: true);
+                MaybeWarnRentedPacketDropped();
+            }
+        }
+
+        // Throttle the dropped-rented-packet warning to at most one log per
+        // second.  Stopwatch ticks are monotonic so a wall-clock adjustment
+        // cannot freeze or open the gate; the comparison is against the last
+        // emit timestamp captured in the same tick frame.
+        private long _lastRentedDropWarnTicks;
+
+        private void MaybeWarnRentedPacketDropped()
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            long last = System.Threading.Interlocked.Read(ref _lastRentedDropWarnTicks);
+            long oneSecond = System.Diagnostics.Stopwatch.Frequency;
+            if (last != 0 && now - last < oneSecond) return;
+
+            // CompareExchange so concurrent network-thread callers cannot
+            // both pass the gate; the first writer emits, others fall through.
+            if (System.Threading.Interlocked.CompareExchange(
+                    ref _lastRentedDropWarnTicks, now, last) != last)
+                return;
+
+            // Redacted: the log mentions only the bounded total, never the
+            // dropped packet's content or peer address.
+            Debug.LogWarning(
+                "[RTMPE] Inbound packet dropped by MainThreadDispatcher backpressure; " +
+                "pool rental returned.  See dispatcher.DroppedRentedPacketCount for the running total.");
         }
 
         /// <summary>
@@ -1092,13 +1835,27 @@ namespace RTMPE.Core
         /// directly route through this helper so the Network Debugger sees a
         /// complete picture of outbound traffic.
         ///
-        /// <para>The packet must be owned by the caller (defensive copies are
+       /// <para>The packet must be owned by the caller (defensive copies are
         /// the caller's responsibility, matching the original SendOwned
         /// contract).</para>
         /// </summary>
         private void SendToWire(byte[] packet)
         {
-            if (_networkThread == null || packet == null) return;
+            if (packet == null) return;
+
+            // Capture hook used by EncryptAndSendRedundant: when set, the
+            // post-encryption bytes are routed to the override instead of the
+            // real network thread.  Telemetry counters intentionally do NOT
+            // tick for the captured copy — only the actual wire copies count.
+            var capture = _wireSendOverride;
+            if (capture != null)
+            {
+                AssertWireSendOverrideMainThread(nameof(SendToWire));
+                capture(packet);
+                return;
+            }
+
+            if (_networkThread == null) return;
 
             System.Threading.Interlocked.Increment(ref _packetsOut);
             System.Threading.Interlocked.Add(ref _bytesOut, packet.Length);
@@ -1106,11 +1863,43 @@ namespace RTMPE.Core
             _networkThread.SendOwned(packet);
         }
 
-        private void ProcessPacket(byte[] data)
+        // Rate-limit malformed-packet warnings to 1Hz so a hostile flood
+        // cannot drive GC pressure via the log pipeline — each interpolated
+        // $"..." would otherwise allocate a fresh formatted System.String,
+        // and at 1 kHz of bad packets that cost dominates the receive thread
+        // and the Update-frame budget on mobile.  A separate timestamp per
+        // site means a slow-drip flow of one bad-magic + one bad-version
+        // still surfaces both warnings; the cap is per category, not global.
+        private long _lastBadHeaderWarnTicks;
+        private long _lastBadMagicWarnTicks;
+        private long _lastBadVersionWarnTicks;
+        private long _lastAeadFailWarnTicks;
+        private long _lastMissingEncryptionWarnTicks;
+
+        // Returns true when the per-site one-second gate has elapsed and the
+        // caller should emit its warning.  Stopwatch ticks are monotonic so
+        // an NTP step cannot freeze or open the gate; CompareExchange races
+        // resolve to a single emitter per epoch.
+        private static bool ShouldWarn(ref long lastWarnTicks)
         {
-            if (data == null || data.Length < PacketProtocol.HEADER_SIZE)
+            long now      = System.Diagnostics.Stopwatch.GetTimestamp();
+            long prev     = System.Threading.Interlocked.Read(ref lastWarnTicks);
+            long oneSec   = System.Diagnostics.Stopwatch.Frequency;
+            if (prev != 0 && now - prev < oneSec) return false;
+            return System.Threading.Interlocked.CompareExchange(
+                ref lastWarnTicks, now, prev) == prev;
+        }
+
+        // Length-aware overload — `data` may be a pool-rented buffer whose
+        // physical .Length exceeds the meaningful packet size.  All header
+        // and payload-bound checks therefore use the explicit
+        // <paramref name="length"/> parameter, never <c>data.Length</c>.
+        private void ProcessPacket(byte[] data, int length)
+        {
+            if (data == null || length < PacketProtocol.HEADER_SIZE)
             {
-                Debug.LogWarning("[RTMPE] Dropped packet: too short to contain a valid header.");
+                if (ShouldWarn(ref _lastBadHeaderWarnTicks))
+                    Debug.LogWarning("[RTMPE] Dropped packet: too short to contain a valid header.");
                 return;
             }
 
@@ -1120,45 +1909,81 @@ namespace RTMPE.Core
 
             if (magic != PacketProtocol.MAGIC)
             {
-                Debug.LogWarning(
-                    $"[RTMPE] Dropped packet: bad magic 0x{magic:X4} " +
-                    $"(expected 0x{PacketProtocol.MAGIC:X4}).");
+                if (ShouldWarn(ref _lastBadMagicWarnTicks))
+                    Debug.LogWarning(
+                        $"[RTMPE] Dropped packet: bad magic 0x{magic:X4} " +
+                        $"(expected 0x{PacketProtocol.MAGIC:X4}).");
                 return;
             }
 
             if (data[PacketProtocol.OFFSET_VERSION] != PacketProtocol.VERSION)
             {
-                Debug.LogWarning(
-                    $"[RTMPE] Dropped packet: unsupported protocol version " +
-                    $"{data[PacketProtocol.OFFSET_VERSION]} (expected {PacketProtocol.VERSION}).");
+                if (ShouldWarn(ref _lastBadVersionWarnTicks))
+                    Debug.LogWarning(
+                        $"[RTMPE] Dropped packet: unsupported protocol version " +
+                        $"{data[PacketProtocol.OFFSET_VERSION]} (expected {PacketProtocol.VERSION}).");
                 return;
             }
 
-            // ── AEAD decryption (Fix: inbound decrypt pipeline) ──────────────────
             // If FLAG_ENCRYPTED is set the gateway has wrapped the payload in a
             // ChaCha20-Poly1305 AEAD envelope.  Decrypt before dispatching so every
             // handler always receives plaintext — handlers are unaware of encryption.
             //
-            // Precondition: _sessionKeys must be non-null (set during Challenge/
-            // HandshakeResponse exchange) and _cryptoId must be the gateway-assigned
-            // session_id (set during OnSessionAck).  Pre-session packets (Challenge,
-            // SessionAck, HandshakeAck) are always plaintext by gateway design, so
-            // this branch is only reachable once the session is fully established.
-            if ((data[PacketProtocol.OFFSET_FLAGS] & (byte)PacketFlags.Encrypted) != 0)
+            // Pre-handshake packets (Challenge, HandshakeAck) arrive plaintext by
+            // protocol — the SDK has no key material yet.  Post-handshake packets
+            // — including SessionAck, which carries session-binding identifiers
+            // (crypto_id, JWT, reconnect token) — MUST arrive encrypted; the
+            // RequiresEncryption check below enforces that.
+            bool wasEncrypted = (data[PacketProtocol.OFFSET_FLAGS]
+                                 & (byte)PacketFlags.Encrypted) != 0;
+            int packetLength = length;
+            if (wasEncrypted)
             {
-                data = DecryptInboundPacket(data);
+                // DecryptInboundPacket returns an exact-sized plaintext byte[]
+                // (header + decrypted payload), severing the dependency on
+                // the rented buffer's physical length.  Downstream handlers
+                // can therefore continue to inspect data.Length safely.
+                data = DecryptInboundPacket(data, length);
                 if (data == null)
                 {
-                    Debug.LogWarning(
-                        "[RTMPE] Dropped packet: AEAD authentication failed " +
-                        "(tag mismatch or no session keys).");
+                    if (ShouldWarn(ref _lastAeadFailWarnTicks))
+                        Debug.LogWarning(
+                            "[RTMPE] Dropped packet: AEAD authentication failed " +
+                            "(tag mismatch, replayed counter, or no session keys).");
                     return;
                 }
+                packetLength = data.Length;
+            }
+            else if (data.Length != length)
+            {
+                // Pre-handshake unencrypted path: handlers expect data.Length
+                // == packet length.  Slice once into an exact-sized array so
+                // legacy bounds checks stay correct.  This branch is cold —
+                // only handshake bootstrap and a few protocol packets travel
+                // unencrypted, so the per-packet allocation here is amortised
+                // far below the encrypted hot path's zero-copy benefit.
+                var exact = new byte[length];
+                Buffer.BlockCopy(data, 0, exact, 0, length);
+                data = exact;
+                packetLength = length;
             }
 
             var packetType = (PacketType)data[PacketProtocol.OFFSET_TYPE];
 
-            LogDebug($"Received {packetType} ({data.Length} B).");
+            if (!wasEncrypted && RequiresEncryption(packetType))
+            {
+                if (ShouldWarn(ref _lastMissingEncryptionWarnTicks))
+                    Debug.LogWarning(
+                        $"[RTMPE] Dropped packet: {packetType} arrived without " +
+                        "FLAG_ENCRYPTED. This packet type carries session-bound " +
+                        "state and must be AEAD-protected once the session is " +
+                        "established — accepting it would let an off-path " +
+                        "attacker race a forged frame against the gateway's reply.");
+                return;
+            }
+
+            if (IsDebugLogEnabled)
+                LogDebug($"Received {packetType} ({packetLength} B).");
 
             switch (packetType)
             {
@@ -1216,11 +2041,11 @@ namespace RTMPE.Core
 
                 case PacketType.Disconnect:      OnServerDisconnect(data); break;
                 case PacketType.Data:
-                case PacketType.StateSync:        OnDataReceived?.Invoke(data); break;
+                case PacketType.StateSync:        SafeRaise(OnDataReceived, data, nameof(OnDataReceived)); break;
 
                 // DataAck is a legitimate server acknowledgement; expose it as an event.
                 case PacketType.DataAck:
-                    OnDataAcknowledged?.Invoke();
+                    SafeRaise(OnDataAcknowledged, nameof(OnDataAcknowledged));
                     LogDebug("DataAck received.");
                     break;
 
@@ -1237,7 +2062,8 @@ namespace RTMPE.Core
                 case PacketType.VariableUpdate:   HandleVariableUpdatePacket(data); break;
 
                 default:
-                    LogDebug($"No handler for packet type 0x{(byte)packetType:X2}.");
+                    if (IsDebugLogEnabled)
+                        LogDebug($"No handler for packet type 0x{(byte)packetType:X2}.");
                     break;
             }
         }
@@ -1247,7 +2073,7 @@ namespace RTMPE.Core
         /// <summary>
         /// Handle an incoming <c>Challenge</c> (0x06) from the server.
         ///
-        /// 1. Parse 128-byte payload: [ephemeral:32][static:32][sig:64].
+       /// 1. Parse 128-byte payload: [ephemeral:32][static:32][sig:64].
         /// 2. Verify Ed25519 signature — reject on failure.
         /// 3. Derive session keys via X25519 ECDH + HKDF-SHA256.
         /// 4. Send <c>HandshakeResponse</c> containing the client public key.
@@ -1263,43 +2089,66 @@ namespace RTMPE.Core
 
             var payload = PacketParser.ExtractPayload(data);
 
-            byte[] pinnedKey = null;
-            try { pinnedKey = _settings?.PinnedServerPublicKeyBytes; }
+            byte[] configuredPin = null;
+            try { configuredPin = _settings?.PinnedServerPublicKeyBytes; }
             catch (Exception ex)
             {
                 Debug.LogError($"[RTMPE] Invalid pinnedServerPublicKeyHex in settings: {ex.Message}");
                 return;
             }
 
-            // Phase 2 (2026-04-22): enforce Ed25519 server pinning when the
-            // operator has opted in via NetworkSettings.requirePinnedServerPublicKey.
+            // Resolve the pinning decision BEFORE invoking ValidateChallenge.
+            // The default (Strict + no configured pin) refuses outright: a
+            // silent "trust any signed key" path would let any rogue gateway
+            // with its own Ed25519 identity complete the handshake, which is
+            // the substituted-key MITM vector the pin is meant to close.
             //
-            // Rationale: ValidateChallenge() below always verifies the signature,
-            // but without a pinned key the verification only asserts that the
-            // server holds SOME Ed25519 private key — which is trivially true
-            // for any rogue gateway.  Requiring a pinned public key binds the
-            // session to an operator-chosen identity; a MITM with its own valid
-            // keypair is rejected.  We fail BEFORE invoking ValidateChallenge
-            // so the intent is unambiguous in logs and tests.
-            if (_settings != null && _settings.requirePinnedServerPublicKey && pinnedKey == null)
+           // Trust-On-First-Use captures the static key after — never before —
+            // ValidateChallenge succeeds, so an attacker cannot poison the pin
+            // store by sending a malformed Challenge.
+            var mode       = _settings != null ? _settings.EffectivePinningMode : ServerPinningMode.Strict;
+            var resolution = ServerKeyPinning.PreparePin(
+                mode,
+                configuredPin,
+                PinStore,
+                _settings != null ? _settings.serverHost : "",
+                _settings != null ? _settings.serverPort : 0);
+
+            switch (resolution.Decision)
             {
-                Debug.LogError(
-                    "[RTMPE] NetworkSettings.requirePinnedServerPublicKey is true but " +
-                    "pinnedServerPublicKeyHex is empty. Refusing to complete handshake — " +
-                    "any valid Ed25519 server would otherwise be accepted. Set the pinned " +
-                    "public key in your NetworkSettings asset, or disable " +
-                    "requirePinnedServerPublicKey for unpinned dev builds.");
-                return;
+                case PinDecision.RefuseStrictNoPin:
+                    Debug.LogError(
+                        "[RTMPE] Server not pinned and TOFU disabled — set " +
+                        "NetworkSettings.pinnedServerPublicKeyHex or change " +
+                        "serverPinningMode to TrustOnFirstUse. Refusing handshake.");
+                    return;
+
+                case PinDecision.ProceedUnpinned:
+                    Debug.LogWarning(
+                        "[RTMPE] ServerPinningMode.InsecureNoPinning is active — the SDK will " +
+                        "accept any valid Ed25519 signature. This is unsafe for production: a " +
+                        "rogue gateway with its own keypair will complete the handshake. " +
+                        "Configure pinnedServerPublicKeyHex (Strict) or TrustOnFirstUse instead.");
+                    break;
             }
 
+            // Pass the previously emitted HandshakeInit ciphertext
+            // (or null in the reconnect flow) so ValidateChallenge can
+            // reconstruct the same transcript the gateway signed.  A reconnect
+            // path leaves _lastHandshakeInitCiphertext == null, which the
+            // handler maps to the agreed absent-sentinel (32 × 0x00) — replay
+            // defence in that flow is provided by the single-use reconnect
+            // token instead.
             if (!_handshakeHandler.ValidateChallenge(
                     payload,
-                    out _,                  // serverEphemeralPub (stored inside handler)
-                    out _,                  // serverStaticPub    (stored inside handler)
-                    pinnedKey))
+                    _lastHandshakeInitCiphertext,
+                    out _,                                    // serverEphemeralPub (stored inside handler)
+                    out var verifiedServerStaticPub,          // captured for TOFU persistence
+                    resolution.PinToEnforce))
             {
-                Debug.LogError("[RTMPE] Challenge validation failed — Ed25519 signature invalid or " +
-                               "Challenge payload malformed. Possible MITM attack. Disconnecting.");
+                Debug.LogError("[RTMPE] Challenge validation failed — Ed25519 signature invalid, " +
+                               "pin mismatch, or Challenge payload malformed. Possible MITM " +
+                               "attack. Disconnecting.");
                 // Let the timeout coroutine fire OnConnectionFailed cleanly.
                 return;
             }
@@ -1311,6 +2160,25 @@ namespace RTMPE.Core
             {
                 Debug.LogError("[RTMPE] ECDH key derivation failed (degenerate shared secret). Disconnecting.");
                 return;
+            }
+
+            // Fresh session keys imply a fresh inbound nonce stream — reuse
+            // of an old window would falsely reject the first packet of the
+            // new session because its counter starts back at zero.
+            if (_inboundReplayWindow == null)
+                _inboundReplayWindow = new RTMPE.Crypto.Internal.ReplayWindow();
+            else
+                _inboundReplayWindow.Reset();
+
+            // Persist the captured key only AFTER both transcript verification
+            // and ECDH succeed.  Writing earlier would let a malformed
+            // Challenge — one whose signature passes parsing but whose ECDH
+            // produces a degenerate secret — poison the pin store.
+            if (ServerKeyPinning.PersistFirstUse(resolution, PinStore, verifiedServerStaticPub))
+            {
+                LogDebug(
+                    $"Captured server static key on first connect to " +
+                    $"{resolution.Endpoint} (TrustOnFirstUse).");
             }
 
             // Send the client's X25519 ephemeral public key to the server.
@@ -1347,17 +2215,47 @@ namespace RTMPE.Core
                 return;
             }
 
+            // Validate the JWT before we trust the sub claim that becomes the
+            // local session identifier.  Signature verification requires a
+            // configured public key (none is mandated today; see
+            // NetworkSettings); when absent the SDK still enforces the
+            // structural and temporal claims so a malformed or expired
+            // token cannot install garbage as `_localPlayerId` and corrupt
+            // every subsequent AEAD nonce.
+            if (!TryValidateJwt(jwtToken,
+                    expectedIssuer: _settings != null ? _settings.expectedJwtIssuer : null,
+                    expectedAudience: _settings != null ? _settings.expectedJwtAudience : null,
+                    out string subject,
+                    out string jwtError))
+            {
+                Debug.LogError(
+                    $"[RTMPE] SessionAck rejected: JWT validation failed " +
+                    $"({jwtError}). Disconnecting.");
+                DisconnectWithReason(DisconnectReason.Unknown);
+                return;
+            }
+
+            if (!ulong.TryParse(subject, out var sessionId))
+            {
+                Debug.LogError(
+                    "[RTMPE] SessionAck rejected: JWT sub claim is not a valid u64 session ID. " +
+                    "Disconnecting.");
+                DisconnectWithReason(DisconnectReason.Unknown);
+                return;
+            }
+
             _cryptoId       = cryptoId;
             _jwtToken       = jwtToken;
             _reconnectToken = reconnectToken;
+            _localPlayerId  = sessionId;
 
-            // Extract gateway session ID from the JWT sub claim (u64 as string, e.g. "123456").
-            // This is the GATEWAY session identity. The ROOM player UUID is set later
-            // by RoomManager via SetLocalRoomPlayerId() when JoinRoom completes.
-            if (ulong.TryParse(TryExtractJwtSub(jwtToken), out var sessionId))
-                _localPlayerId = sessionId;
-
-            LogDebug($"SessionAck received: crypto_id={cryptoId}, session_id={_localPlayerId}, jwt_len={jwtToken?.Length ?? 0}");
+            // Even under verbose logging we redact session-correlation identifiers
+            // so support-bundle log captures never leak a full crypto_id or session_id
+            // into third-party ticketing systems (Slack, Jira, Zendesk, etc.).
+            LogDebug(
+                $"SessionAck received: crypto_id={LogRedaction.Redact(cryptoId)}, " +
+                $"session_id={LogRedaction.Redact(_localPlayerId)}, " +
+                $"jwt_len={jwtToken?.Length ?? 0}");
 
             if (_timeoutCoroutine != null)
             {
@@ -1370,8 +2268,20 @@ namespace RTMPE.Core
             // Start keep-alive heartbeat.
             // Pass _packetBuilder so heartbeat packets share the same sequence
             // counter as all other outbound packets (prevents nonce reuse under AEAD).
+            //
+           // Lifecycle note: the OnRttUpdated lambda below captures `this` (via
+            // LastRttMs and SafeRaise on instance event fields).  This is safe
+            // because Cleanup() nulls _heartbeatManager — releasing the only
+            // outstanding reference to the HeartbeatManager and therefore the
+            // only path that could invoke the lambda — and OnDestroy() calls
+            // Cleanup() before the NetworkManager itself is finalized.  The
+            // lambda is therefore guaranteed to die with the manager it was
+            // wired to.  Do NOT replace these with named methods unless the
+            // Cleanup path is also updated to explicitly unsubscribe — the
+            // implicit "_heartbeatManager = null drops the chain" contract is
+            // load-bearing.
             _heartbeatManager = new HeartbeatManager(_settings.heartbeatIntervalMs, _packetBuilder);
-            _heartbeatManager.OnRttUpdated     += rtt => { LastRttMs = rtt; OnRttUpdated?.Invoke(rtt); };
+            _heartbeatManager.OnRttUpdated     += rtt => { LastRttMs = rtt; SafeRaise(OnRttUpdated, rtt, nameof(OnRttUpdated)); };
             _heartbeatManager.OnHeartbeatTimeout += OnHeartbeatTimeout;
             _heartbeatManager.Start();
 
@@ -1408,7 +2318,7 @@ namespace RTMPE.Core
             }
 
             LogDebug($"Reconnect: auto-rejoining last room {_lastRoomId}.");
-            OnAutoRejoinAttempt?.Invoke(_lastRoomId);
+            SafeRaise(OnAutoRejoinAttempt, _lastRoomId, nameof(OnAutoRejoinAttempt));
             _roomManager.JoinRoom(_lastRoomId);
         }
 
@@ -1469,7 +2379,11 @@ namespace RTMPE.Core
             if (_lobbyManager == null) return;
             if (type == PacketType.LobbyLeave) return; // fire-and-forget: no reply payload
             var payload = PacketParser.ExtractPayload(data);
-            _lobbyManager.HandleLobbyReply(payload);
+            // Forward the discriminating PacketType so the LobbyManager only
+            // consumes a pending JoinLobby slot when an actual LobbyJoin reply
+            // arrives — a stray LobbyList (0x29) reply must not flip
+            // IsInLobby.
+            _lobbyManager.HandleLobbyReply(type, payload);
         }
 
         /// <summary>
@@ -1490,6 +2404,16 @@ namespace RTMPE.Core
         private void OnRoomPropertyUpdateBroadcast(byte[] data)
         {
             if (_roomManager == null) return;
+
+            // Game-data packets are valid only after a successful room join;
+            // rejecting earlier traffic prevents pre-room state injection.
+            if (_state != NetworkState.InRoom)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"RoomPropertyUpdate broadcast rejected; not in a room (state={_state}).");
+                return;
+            }
+
             var payload = PacketParser.ExtractPayload(data);
             if (payload == null || payload.Length == 0) return;
             try
@@ -1500,7 +2424,8 @@ namespace RTMPE.Core
             }
             catch (Exception ex)
             {
-                LogDebug($"RoomPropertyUpdate broadcast: decode failed: {ex.Message}");
+                if (IsDebugLogEnabled)
+                    LogDebug($"RoomPropertyUpdate broadcast: decode failed: {ex.Message}");
             }
         }
 
@@ -1513,6 +2438,16 @@ namespace RTMPE.Core
         private void OnPlayerPropertyUpdateBroadcast(byte[] data)
         {
             if (_roomManager == null) return;
+
+            // Game-data packets are valid only after a successful room join;
+            // rejecting earlier traffic prevents pre-room state injection.
+            if (_state != NetworkState.InRoom)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"PlayerPropertyUpdate broadcast rejected; not in a room (state={_state}).");
+                return;
+            }
+
             var payload = PacketParser.ExtractPayload(data);
             if (payload == null || payload.Length == 0) return;
             try
@@ -1523,7 +2458,8 @@ namespace RTMPE.Core
             }
             catch (Exception ex)
             {
-                LogDebug($"PlayerPropertyUpdate broadcast: decode failed: {ex.Message}");
+                if (IsDebugLogEnabled)
+                    LogDebug($"PlayerPropertyUpdate broadcast: decode failed: {ex.Message}");
             }
         }
 
@@ -1537,6 +2473,16 @@ namespace RTMPE.Core
         private void OnSpawnPacket(byte[] data)
         {
             if (_spawnManager == null) return;
+
+            // Game-data packets are valid only after a successful room join;
+            // rejecting earlier traffic prevents pre-room state injection.
+            if (_state != NetworkState.InRoom)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"Spawn packet rejected; not in a room (state={_state}).");
+                return;
+            }
+
             var payload = PacketParser.ExtractPayload(data);
             if (!SpawnPacketParser.TryParseSpawn(payload, out var spawnData))
             {
@@ -1548,7 +2494,8 @@ namespace RTMPE.Core
             // our own Spawn back), skip to avoid creating a duplicate GameObject.
             if (_spawnManager.Registry.Get(spawnData.ObjectId) != null)
             {
-                LogDebug($"Spawn packet: objectId {spawnData.ObjectId} already exists, skipped (dedup).");
+                if (IsDebugLogEnabled)
+                    LogDebug($"Spawn packet: objectId {spawnData.ObjectId} already exists, skipped (dedup).");
                 return;
             }
 
@@ -1564,6 +2511,16 @@ namespace RTMPE.Core
         private void OnDespawnPacket(byte[] data)
         {
             if (_spawnManager == null) return;
+
+            // Game-data packets are valid only after a successful room join;
+            // rejecting earlier traffic prevents pre-room state injection.
+            if (_state != NetworkState.InRoom)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"Despawn packet rejected; not in a room (state={_state}).");
+                return;
+            }
+
             var payload = PacketParser.ExtractPayload(data);
             if (!SpawnPacketParser.TryParseDespawn(payload, out var objectId))
             {
@@ -1581,6 +2538,15 @@ namespace RTMPE.Core
         /// </summary>
         private void OnRpcRequest(byte[] data)
         {
+            // Game-data packets are valid only after a successful room join;
+            // rejecting earlier traffic prevents pre-room state injection.
+            if (_state != NetworkState.InRoom)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"RPC request rejected; not in a room (state={_state}).");
+                return;
+            }
+
             // Distinguish Enhanced RPC (27-byte header, typed params) from legacy (18-byte).
             bool isEnhanced = (data[PacketProtocol.OFFSET_FLAGS] & (byte)PacketFlags.EnhancedRpc) != 0;
 
@@ -1599,6 +2565,27 @@ namespace RTMPE.Core
                 return;
             }
 
+            // AEAD authenticates the gateway as the relay, not the originating
+            // peer.  The Enhanced RPC path already passes every inbound
+            // senderId through EnhancedRpcVerifier.IsSenderAcceptable; the
+            // legacy MethodId path must apply the same uniform gate or a
+            // hostile peer can stamp Ping (100) / ApplyDamage (301) /
+            // TransferOwnership (200) with a spoofed senderId and the
+            // receiver dispatches as if the gateway had attested origin.
+            // Per-method overrides (e.g. IsOwnershipTransferAuthorized) layer
+            // on top of this gate at the matching case below.
+            if (_settings != null
+                && _settings.requireLegacyRpcSender
+                && !LegacyRpcVerifier.IsLegacyRpcAuthorized(
+                       request.SenderId, request.MethodId))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] Legacy RPC rejected: sender " +
+                    $"{LogRedaction.Redact(request.SenderId)} not authorised " +
+                    $"for method_id {request.MethodId}.");
+                return;
+            }
+
             switch (request.MethodId)
             {
                 case RpcMethodId.TransferOwnership:
@@ -1609,7 +2596,8 @@ namespace RTMPE.Core
                     HandleApplyDamageRpc(request);
                     break;
                 default:
-                    LogDebug($"RPC request: unhandled method_id {request.MethodId}.");
+                    if (IsDebugLogEnabled)
+                        LogDebug($"RPC request: unhandled method_id {request.MethodId}.");
                     break;
             }
         }
@@ -1621,6 +2609,48 @@ namespace RTMPE.Core
         /// </summary>
         private void OnEnhancedRpcRequest(byte[] payload)
         {
+            // Game-data packets are valid only after a successful room join;
+            // rejecting earlier traffic prevents pre-room state injection.
+            if (_state != NetworkState.InRoom)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"Enhanced RPC rejected; not in a room (state={_state}).");
+                return;
+            }
+
+            // Buffered (historical) RPCs must be processed before live RPCs
+            // that arrive during the replay window; otherwise a live RPC's
+            // state mutation can be overwritten by an older buffered handler
+            // (re-entrant dispatch, or a future change that pumps the
+            // dispatcher mid-replay, would let a live RPC interleave with
+            // the replay loop and break the server-emitted ordering).
+            // Queue the live RPC payload for drainage in arrival order once
+            // the replay completes.
+            if (System.Threading.Volatile.Read(ref _replayInProgress) != 0)
+            {
+                if (_pendingLiveRpcs == null)
+                    _pendingLiveRpcs = new System.Collections.Generic.Queue<byte[]>();
+                if (_pendingLiveRpcs.Count >= MaxPendingLiveRpcsDuringReplay)
+                {
+                    LogDebug(
+                        "Enhanced RPC: pending-during-replay queue full " +
+                        $"({MaxPendingLiveRpcsDuringReplay}); dropping to bound memory.");
+                    return;
+                }
+                _pendingLiveRpcs.Enqueue(payload);
+                return;
+            }
+
+            DispatchEnhancedRpcPayload(payload);
+        }
+
+        /// <summary>
+        /// Decode and dispatch a single Enhanced RPC payload.  Shared by the
+        /// live-arrival path and the post-replay drain so both observe
+        /// identical parsing / lookup semantics.
+        /// </summary>
+        private void DispatchEnhancedRpcPayload(byte[] payload)
+        {
             if (!EnhancedRpcPacketParser.TryParse(payload, out var req))
             {
                 LogDebug("Enhanced RPC: malformed payload, dropped.");
@@ -1630,12 +2660,50 @@ namespace RTMPE.Core
             var nb = _spawnManager?.Registry?.Get(req.ObjectId);
             if (nb == null)
             {
-                LogDebug($"Enhanced RPC: no spawned object with id {req.ObjectId} — dropped.");
+                if (IsDebugLogEnabled)
+                    LogDebug($"Enhanced RPC: no spawned object with id {req.ObjectId} — dropped.");
                 return;
             }
 
             nb.DispatchEnhancedRpc(req.MethodId, req.Args);
         }
+
+        /// <summary>
+        /// Maximum number of events accepted in a single RpcBufferReplay frame.
+        /// A hostile or buggy peer can advertise <c>event_count = 0xFFFF</c>
+        /// (65 535); even with the per-event truncation check, a 65 535-iteration
+        /// loop on the main thread is a trivial CPU-stall primitive on slower
+        /// devices.  The room service legitimately buffers at most a few hundred
+        /// catch-up events, so this cap leaves ample headroom while bounding
+        /// worst-case work to a fixed budget.
+        /// </summary>
+        internal const int MaxRpcBufferReplayEvents = 4096;
+
+        // Re-entry guard: HandleRpcBufferReplay must not interleave with itself
+        // (a duplicate replay frame from a network thread retry could otherwise
+        // dispatch each catch-up RPC twice).  Set with a CAS, cleared in finally.
+        // Volatile reads from OnEnhancedRpcRequest also use this flag to gate
+        // live RPC dispatch off behind any in-progress replay.
+        private int _replayInProgress;
+
+        // Live Enhanced RPC payloads received while a buffer replay is in
+        // progress are deferred here and drained in arrival order once the
+        // replay completes.  Buffered (historical) RPCs are server-ordered by
+        // their position in the replay payload; live RPCs from the same
+        // delivery window must observe that ordering or a buffered handler's
+        // mutation can stomp the live RPC's newer state.
+        private System.Collections.Generic.Queue<byte[]> _pendingLiveRpcs;
+
+        /// <summary>
+        /// Hard cap on the number of live Enhanced RPC payloads we will queue
+        /// during a single replay window.  Bounds the worst-case memory growth
+        /// when an attacker (or a misbehaving server) emits a flood of live
+        /// RPCs concurrently with the replay frame.  4 096 mirrors
+        /// <see cref="MaxRpcBufferReplayEvents"/> — the most we would ever
+        /// expect to interleave with a single legitimate replay is one full
+        /// replay window's worth.
+        /// </summary>
+        internal const int MaxPendingLiveRpcsDuringReplay = 4096;
 
         /// <summary>
         /// Handle an <c>RpcBufferReplay</c> (0x52) packet delivered immediately after joining a room.
@@ -1644,7 +2712,7 @@ namespace RTMPE.Core
         /// <param name="payload">
         /// Binary payload: [event_count:2 LE u16][for each: [payload_len:2 LE u16][payload:N bytes]]
         /// </param>
-        private void HandleRpcBufferReplay(byte[] payload)
+        internal void HandleRpcBufferReplay(byte[] payload)
         {
             if (payload == null || payload.Length < 2)
             {
@@ -1652,43 +2720,130 @@ namespace RTMPE.Core
                 return;
             }
 
-            int offset = 0;
-            ushort eventCount = (ushort)(payload[offset] | (payload[offset + 1] << 8));
-            offset += 2;
-
-            for (int i = 0; i < eventCount; i++)
+            // Game-data packets are valid only after a successful room join;
+            // rejecting earlier traffic prevents pre-room state injection.
+            if (_state != NetworkState.InRoom)
             {
-                if (offset + 2 > payload.Length)
-                {
-                    LogDebug($"RpcBufferReplay: truncated at event {i}/{eventCount}, aborting replay.");
-                    return;
-                }
-                ushort payloadLen = (ushort)(payload[offset] | (payload[offset + 1] << 8));
+                if (IsDebugLogEnabled)
+                    LogDebug($"RpcBufferReplay rejected; not in a room (state={_state}).");
+                return;
+            }
+
+            if (System.Threading.Interlocked.CompareExchange(ref _replayInProgress, 1, 0) != 0)
+            {
+                LogDebug("RpcBufferReplay: replay already in progress, dropping concurrent frame.");
+                return;
+            }
+
+            try
+            {
+                int offset = 0;
+                ushort eventCount = (ushort)(payload[offset] | (payload[offset + 1] << 8));
                 offset += 2;
 
-                if (offset + payloadLen > payload.Length)
+                if (eventCount > MaxRpcBufferReplayEvents)
                 {
-                    LogDebug($"RpcBufferReplay: event {i} payload truncated ({payloadLen} bytes), aborting.");
+                    LogDebug(
+                        $"RpcBufferReplay: event_count {eventCount} exceeds cap " +
+                        $"{MaxRpcBufferReplayEvents}; rejecting frame to bound main-thread work.");
                     return;
                 }
 
-                var eventPayload = new byte[payloadLen];
-                Array.Copy(payload, offset, eventPayload, 0, payloadLen);
-                offset += payloadLen;
-
-                if (!EnhancedRpcPacketParser.TryParse(eventPayload, out var request))
+                for (int i = 0; i < eventCount; i++)
                 {
-                    LogDebug($"RpcBufferReplay: failed to parse event {i}, skipped.");
-                    continue;
-                }
+                    if (offset + 2 > payload.Length)
+                    {
+                        if (IsDebugLogEnabled)
+                            LogDebug($"RpcBufferReplay: truncated at event {i}/{eventCount}, aborting replay.");
+                        return;
+                    }
+                    ushort payloadLen = (ushort)(payload[offset] | (payload[offset + 1] << 8));
+                    offset += 2;
 
-                var nb = _spawnManager?.Registry?.Get(request.ObjectId);
-                if (nb == null)
-                {
-                    LogDebug($"RpcBufferReplay: no spawned object {request.ObjectId} for event {i}, skipped.");
-                    continue;
+                    if (offset + payloadLen > payload.Length)
+                    {
+                        if (IsDebugLogEnabled)
+                            LogDebug($"RpcBufferReplay: event {i} payload truncated ({payloadLen} bytes), aborting.");
+                        return;
+                    }
+
+                    var eventPayload = new byte[payloadLen];
+                    Array.Copy(payload, offset, eventPayload, 0, payloadLen);
+                    offset += payloadLen;
+
+                    if (!EnhancedRpcPacketParser.TryParse(eventPayload, out var request))
+                    {
+                        if (IsDebugLogEnabled)
+                            LogDebug($"RpcBufferReplay: failed to parse event {i}, skipped.");
+                        continue;
+                    }
+
+                    var nb = _spawnManager?.Registry?.Get(request.ObjectId);
+                    if (nb == null)
+                    {
+                        if (IsDebugLogEnabled)
+                            LogDebug($"RpcBufferReplay: no spawned object {request.ObjectId} for event {i}, skipped.");
+                        continue;
+                    }
+
+                    // DispatchEnhancedRpc consults the per-type RpcRegistry; an unknown
+                    // methodId or mismatched argument count is rejected inside the
+                    // registry's TryInvoke gate without throwing back to this loop.
+                    // We still wrap defensively so a single buggy [RtmpeRpc] handler
+                    // cannot abort the rest of the replay.
+                    try
+                    {
+                        nb.DispatchEnhancedRpc(request.MethodId, request.Args);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogDebug(
+                            $"RpcBufferReplay: dispatch threw for method {request.MethodId} on " +
+                            $"object {request.ObjectId}: {ex.GetType().Name}: {ex.Message}");
+                    }
                 }
-                nb.DispatchEnhancedRpc(request.MethodId, request.Args);
+            }
+            finally
+            {
+                // Drain inside the flag window so re-entrant inbound packets
+                // continue to queue rather than bypass the FIFO.  If a queued
+                // RPC's [RtmpeRpc] handler synchronously dispatches another
+                // inbound packet, the OnEnhancedRpcRequest fast path observes
+                // _replayInProgress = 1 and appends the new payload to the
+                // tail of _pendingLiveRpcs — exactly the desired arrival
+                // ordering.  Clearing the flag first would let the nested
+                // dispatch run immediately and stomp on the remaining queued
+                // items, breaking FIFO.
+                try
+                {
+                    if (_pendingLiveRpcs != null && _pendingLiveRpcs.Count > 0)
+                    {
+                        while (_pendingLiveRpcs.Count > 0)
+                        {
+                            var pending = _pendingLiveRpcs.Dequeue();
+                            try
+                            {
+                                DispatchEnhancedRpcPayload(pending);
+                            }
+                            catch (Exception ex)
+                            {
+                                LogDebug(
+                                    "RpcBufferReplay: post-replay drain dispatch threw: " +
+                                    $"{ex.GetType().Name}: {ex.Message}");
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    // The flag clear is the very last act so any payload
+                    // enqueued mid-drain has already been picked up by the
+                    // surrounding loop's Count check.  Volatile.Write would
+                    // also suffice on a single-thread dispatcher, but the
+                    // Interlocked form matches the CAS at the top of the
+                    // method and the Volatile.Read on the producer side.
+                    System.Threading.Interlocked.Exchange(ref _replayInProgress, 0);
+                }
             }
         }
 
@@ -1698,6 +2853,15 @@ namespace RTMPE.Core
         /// </summary>
         private void OnRpcResponse(byte[] data)
         {
+            // Game-data packets are valid only after a successful room join;
+            // rejecting earlier traffic prevents pre-room state injection.
+            if (_state != NetworkState.InRoom)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"RPC response rejected; not in a room (state={_state}).");
+                return;
+            }
+
             var payload = PacketParser.ExtractPayload(data);
             if (!RpcPacketParser.TryParseResponse(payload, out var response))
             {
@@ -1711,7 +2875,8 @@ namespace RTMPE.Core
                     HandleOwnershipTransferResponse(response);
                     break;
                 default:
-                    LogDebug($"RPC response: unhandled method_id {response.MethodId}.");
+                    if (IsDebugLogEnabled)
+                        LogDebug($"RPC response: unhandled method_id {response.MethodId}.");
                     break;
             }
         }
@@ -1721,17 +2886,28 @@ namespace RTMPE.Core
         /// to apply an ownership change (server-authoritative grant).
         /// Payload: [object_id:8 LE u64][new_owner_len:2 LE u16][new_owner:N UTF-8].
         /// </summary>
+        /// <remarks>
+        /// Authorisation policy applied here is defence-in-depth against a
+        /// peer that captures and re-emits an authentic grant frame (the
+        /// AEAD tag survives replay; the anti-replay window catches the
+        /// exact-counter case but a peer in the same room can also forge a
+        /// fresh-counter packet through a compromised gateway).  The client
+        /// rejects the grant unless one of the following holds:
+        ///   • the object's current owner is empty (initial assignment), or
+        ///   • the wire-supplied <c>senderId</c> equals the local player's
+        ///     gateway session ID and the local player currently owns the
+        ///     object (we requested this transfer ourselves), or
+        ///   • the new-owner string is a recognised member of the current
+        ///     room roster AND the local player is the room master client
+        ///     (host-authorised reassignment).
+        /// The room-membership cross-check additionally guarantees the
+        /// new-owner string is not arbitrary attacker-supplied bytes.
+        /// </remarks>
         private void HandleOwnershipTransferRpc(RpcRequest request)
         {
             if (_spawnManager == null) return;
-            if (request.Payload.Length < 10) return;   // 8 + 2 minimum
+            if (request.Payload.Length < 10) return;
 
-            // Wire protocol is little-endian.  `BitConverter.ToUInt64/ToUInt16`
-            // honour the host's native byte order, which is big-endian on some
-            // platforms — the resulting object ID would be byte-reversed and
-            // collide with a completely different spawned object, or none.
-            // Read the 10 fixed bytes explicitly LE so the decoding matches
-            // the gateway's binary.LittleEndian serialisation regardless of host.
             var p = request.Payload;
             ulong objectId =
                   (ulong)p[0]
@@ -1749,7 +2925,77 @@ namespace RTMPE.Core
                 ? System.Text.Encoding.UTF8.GetString(request.Payload, 10, ownerLen)
                 : string.Empty;
 
+            if (!IsOwnershipTransferAuthorized(objectId, newOwner, request.SenderId))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] TransferOwnership rejected: sender {LogRedaction.Redact(request.SenderId)} " +
+                    $"is not authorised to transfer object {objectId} to new owner.");
+                return;
+            }
+
             _spawnManager.Ownership.ApplyOwnershipGrant(objectId, newOwner);
+        }
+
+        /// <summary>
+        /// Authorisation predicate for an inbound TransferOwnership grant.
+        /// See the remarks on <see cref="HandleOwnershipTransferRpc"/> for the
+        /// policy table.  Returns <see langword="false"/> on any condition
+        /// the SDK cannot positively justify so a captured-and-replayed (or
+        /// peer-forged) grant cannot flip an arbitrary object.
+        /// </summary>
+        internal bool IsOwnershipTransferAuthorized(
+            ulong objectId, string newOwner, ulong senderId)
+        {
+            if (_spawnManager == null) return false;
+
+            var target = _spawnManager.Registry.Get(objectId);
+            if (target == null) return false;
+
+            // Empty new-owner is the wire encoding for "release ownership".
+            // We allow it only when the local player is the current owner
+            // (we released it) or the local player is the master client.
+            if (string.IsNullOrEmpty(newOwner))
+            {
+                bool localIsOwner = !string.IsNullOrEmpty(_localPlayerStringId)
+                                 && target.OwnerPlayerId == _localPlayerStringId;
+                return localIsOwner || IsMasterClient;
+            }
+
+            // Initial assignment from "no owner" to a roster member is
+            // permitted — the gateway authoritatively assigns ownership at
+            // spawn time and may emit a separate Transfer to bind it.
+            bool initialAssignment = string.IsNullOrEmpty(target.OwnerPlayerId);
+
+            // Self-initiated transfer: the local player asked the gateway
+            // to relay this grant on their behalf.  We tolerate the gateway
+            // echoing the request back via the same RPC channel.
+            bool selfInitiated = senderId != 0UL
+                              && senderId == _localPlayerId
+                              && !string.IsNullOrEmpty(_localPlayerStringId)
+                              && target.OwnerPlayerId == _localPlayerStringId;
+
+            // Host-authorised reassignment: the master client may grant
+            // ownership to any roster member.  The current client only
+            // applies the change if it can verify both the new owner and
+            // that the local view of the master client is unchanged from
+            // the gateway's broadcast.
+            bool hostAuthorised = IsMasterClient && IsRosterMember(newOwner);
+
+            return initialAssignment || selfInitiated || hostAuthorised;
+        }
+
+        private bool IsRosterMember(string playerId)
+        {
+            if (string.IsNullOrEmpty(playerId)) return false;
+            var room = _roomManager?.CurrentRoom;
+            if (room == null) return false;
+            var roster = room.Players;
+            if (roster == null) return false;
+            for (int i = 0; i < roster.Length; i++)
+            {
+                if (roster[i] != null && roster[i].PlayerId == playerId) return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -1759,6 +3005,15 @@ namespace RTMPE.Core
         /// </summary>
         private void HandleOwnershipTransferResponse(RpcResponse response)
         {
+            // Forgery guard: an attacker who guesses or replays a request_id
+            // can otherwise inject a fake "success" response that the SDK
+            // would log as a legitimate transfer.  The OwnershipManager
+            // tracks the ids it actually issued; a response whose id is not
+            // in that set is dropped (and a redacted warning emitted).
+            var ownership = _spawnManager?.Ownership;
+            if (ownership != null && !ownership.TryAcknowledgeResponse(response.RequestId))
+                return;
+
             if (!response.Success)
             {
                 Debug.LogWarning(
@@ -1775,7 +3030,7 @@ namespace RTMPE.Core
             {
                 TransitionTo(NetworkState.InRoom);
 #pragma warning disable CS0618 // Legacy event — users should migrate to RoomManager events
-                OnJoinedRoom?.Invoke(0);
+                SafeRaise(OnJoinedRoom, 0UL, nameof(OnJoinedRoom));
 #pragma warning restore CS0618
             }
         }
@@ -1788,7 +3043,7 @@ namespace RTMPE.Core
             {
                 TransitionTo(NetworkState.InRoom);
 #pragma warning disable CS0618
-                OnJoinedRoom?.Invoke(0);
+                SafeRaise(OnJoinedRoom, 0UL, nameof(OnJoinedRoom));
 #pragma warning restore CS0618
             }
         }
@@ -1805,7 +3060,7 @@ namespace RTMPE.Core
                 _spawnManager?.ClearAll();  // Destroy all spawned objects on room leave
                 TransitionTo(NetworkState.Connected);
 #pragma warning disable CS0618
-                OnLeftRoom?.Invoke(0);
+                SafeRaise(OnLeftRoom, 0UL, nameof(OnLeftRoom));
 #pragma warning restore CS0618
             }
         }
@@ -1839,7 +3094,7 @@ namespace RTMPE.Core
 
         private void HandleTransportError(Exception ex)
         {
-            Debug.LogError($"[RTMPE] Transport error: {ex.Message}");
+            RtmpeLog.Error($"[RTMPE] Transport error: {ex.Message}");
 
             _dispatcher?.Enqueue(() =>
             {
@@ -1857,7 +3112,7 @@ namespace RTMPE.Core
                 }
 
                 if (wasConnecting)
-                    OnConnectionFailed?.Invoke(ex.Message);
+                    SafeRaise(OnConnectionFailed, ex.Message, nameof(OnConnectionFailed));
 
                 _networkThread?.Stop();
                 _heartbeatManager?.Stop();
@@ -1877,16 +3132,16 @@ namespace RTMPE.Core
 
             _state = next;
             LogDebug($"State: {prev} \u2192 {next}");
-            OnStateChanged?.Invoke(prev, next);
+            SafeRaise(OnStateChanged, prev, next, nameof(OnStateChanged));
 
             switch (next)
             {
                 case NetworkState.Connected:
-                    OnConnected?.Invoke();
+                    SafeRaise(OnConnected, nameof(OnConnected));
                     break;
 
                 case NetworkState.Disconnected when prev != NetworkState.Disconnected:
-                    OnDisconnected?.Invoke(reason);
+                    SafeRaise(OnDisconnected, reason, nameof(OnDisconnected));
                     break;
             }
         }
@@ -1909,7 +3164,7 @@ namespace RTMPE.Core
                 var localEp = _transport.LocalEndPoint;
                 if (localEp == null)
                 {
-                    Debug.LogError("[RTMPE] SendHandshakeInit: transport not yet bound, aborting.");
+                    RtmpeLog.Error("[RTMPE] SendHandshakeInit: transport not yet bound, aborting.");
                     return;
                 }
                 encryptedPayload = ApiKeyCipher.Encrypt(psk, apiKey, localEp);
@@ -1938,6 +3193,13 @@ namespace RTMPE.Core
 #endif
             }
 
+            // Pass the previously emitted HandshakeInit ciphertext
+            // for transcript channel binding.  The gateway hashes exactly
+            // these bytes (`packet.payload`) and signs the resulting digest
+            // into the Challenge transcript; the client must recompute the
+            // same hash on Challenge receipt.
+            _lastHandshakeInitCiphertext = encryptedPayload;
+
             // Use SendOwned — packet is a freshly built array; the caller
             // does not retain a reference after this call.
             var packet = _packetBuilder.BuildHandshakeInit(encryptedPayload);
@@ -1951,8 +3213,116 @@ namespace RTMPE.Core
             var packet = _packetBuilder.BuildDisconnect();
             // Route through EncryptAndSend so the Disconnect packet is AEAD-encrypted
             // when a session is active, matching gateway expectations.
-            EncryptAndSend(packet);
+            //
+            // UDP loss models drown the single packet ~5%; threefold redundancy
+            // lifts effective delivery to >99.99%.  The encryption pass runs ONCE
+            // (one nonce burn) — only the resulting ciphertext bytes hit the wire
+            // three times via the kernel send queue.  Sending the same ciphertext
+            // is safe: the gateway's replay window accepts the first arrival and
+            // discards the duplicates by their identical nonce counter, then
+            // tears the session down on the first.  Without redundancy a single
+            // dropped Disconnect leaves the gateway holding the session open
+            // until the heartbeat timeout (~15 s) — a wasted slot the attacker
+            // (or simply a flaky link) can cheaply burn.
+            EncryptAndSendRedundant(packet, copies: 3);
             LogDebug("Sent Disconnect packet.");
+        }
+
+        /// <summary>
+        /// Encrypt-once, send-many helper for the Disconnect packet (and any
+        /// future "must-arrive" out-of-band frame).  Captures the ciphertext
+        /// produced by <see cref="EncryptAndSend"/> through a temporary
+        /// redirect of the wire-send hook so the same bytes can be queued
+        /// multiple times without re-running AEAD or burning extra nonces.
+        /// </summary>
+        private void EncryptAndSendRedundant(byte[] packet, int copies)
+        {
+            if (copies < 1) copies = 1;
+            byte[] captured = null;
+            // Temporary capture of the would-be wire bytes.  EncryptAndSend
+            // funnels every send through SendToWire; we shunt that single
+            // call through a captured-bytes sink, then queue the captured
+            // result `copies` times via the real path.
+            void Capture(byte[] b) => captured = b;
+            AssertWireSendOverrideMainThread("set");
+            _wireSendOverride = Capture;
+            try
+            {
+                EncryptAndSend(packet);
+            }
+            finally
+            {
+                AssertWireSendOverrideMainThread("clear");
+                _wireSendOverride = null;
+            }
+
+            if (captured == null)
+            {
+                // Pre-session path (no AEAD): fall back to plain send.
+                for (int i = 0; i < copies; i++) SendToWire(packet);
+                return;
+            }
+
+            for (int i = 0; i < copies; i++)
+            {
+                // Each call needs its own owned array — SendOwned keeps the
+                // reference internally for the queue.  Cloning is cheaper
+                // than re-running AEAD.
+                var copy = new byte[captured.Length];
+                Buffer.BlockCopy(captured, 0, copy, 0, captured.Length);
+                SendToWire(copy);
+            }
+        }
+
+        /// <summary>
+        /// Optional wire-send redirect used by <see cref="EncryptAndSendRedundant"/>.
+        /// When non-null, <see cref="SendToWire"/> delegates to this function
+        /// INSTEAD of pushing to the network thread.  Lets the redundant-send
+        /// helper capture the post-encryption byte payload without splitting
+        /// <see cref="EncryptAndSend"/>.
+        /// <para>
+        /// <b>Threading invariant — main-thread only.</b>  The field is
+        /// captured for the duration of a single AEAD seal cycle inside
+        /// <see cref="EncryptAndSendRedundant"/> and cleared by its
+        /// <c>finally</c> block before the call returns.  The capture/clear
+        /// pair is guaranteed to run on the Unity main thread because every
+        /// caller of <see cref="EncryptAndSendRedundant"/> originates from a
+        /// main-thread callback (<c>Disconnect</c>, <c>Update</c>-driven
+        /// heartbeat).  A future regression that triggered <see cref="SendToWire"/>
+        /// from a background thread WHILE the override is non-null could
+        /// race the <c>finally</c> clear and leak a captured ciphertext into
+        /// an unrelated send.  <see cref="AssertWireSendOverrideMainThread"/>
+        /// turns that misuse into a deterministic warning at every read/write
+        /// of the field.
+        /// </para>
+        /// <para>Volatile because future regressions could legally introduce
+        /// off-thread reads on weakly-ordered platforms (ARM64 / IL2CPP);
+        /// without an acquire fence on read, a background thread could see a
+        /// stale non-null delegate after the main thread cleared the field
+        /// in EncryptAndSendRedundant's finally block.  The field is still
+        /// expected to be mutated only on the main thread — the volatile is
+        /// pure defence-in-depth, not a relaxation of that invariant.</para>
+        /// </summary>
+        private volatile System.Action<byte[]> _wireSendOverride;
+
+        // Debug-only assertion that callers respect the
+        // <see cref="_wireSendOverride"/> main-thread invariant.  Logs a
+        // redacted warning instead of throwing because the override path is
+        // a soft optimisation — a stray off-thread access should be visible
+        // in dev/QA without taking the SDK down in production.
+        [System.Diagnostics.Conditional("DEBUG"), System.Diagnostics.Conditional("UNITY_EDITOR"), System.Diagnostics.Conditional("DEVELOPMENT_BUILD")]
+        private static void AssertWireSendOverrideMainThread(string op)
+        {
+            if (RTMPE.Threading.MainThreadDispatcher.IsMainThread) return;
+            // Redacted — message intentionally carries no payload bytes,
+            // ciphertext, or session identifiers.  Operators only need the
+            // operation name and the thread mismatch to triage.
+            Debug.LogWarning(
+                $"[RTMPE] _wireSendOverride.{op} accessed off the Unity main thread " +
+                "(invariant violated). This is a soft assertion — investigate the " +
+                "caller; the override field is not safe to mutate from a background " +
+                "thread because EncryptAndSendRedundant relies on a serial " +
+                "capture / clear pair around a single AEAD seal cycle.");
         }
 
         /// <summary>
@@ -1969,39 +3339,42 @@ namespace RTMPE.Core
         {
             if (string.IsNullOrEmpty(token))
             {
-                Debug.LogError("[RTMPE] SendReconnectInit: token is empty — aborting reconnect.");
+                RtmpeLog.Error("[RTMPE] SendReconnectInit: token is empty — aborting reconnect.");
                 return;
             }
             if (_packetBuilder == null)
             {
-                Debug.LogError("[RTMPE] SendReconnectInit: packet builder not initialised — aborting.");
+                RtmpeLog.Error("[RTMPE] SendReconnectInit: packet builder not initialised — aborting.");
                 return;
             }
 
-            // N-8: if we have an IP migration key, compute HMAC-SHA256(key, token_bytes)
-            // and include it as a 32-byte proof so the gateway can accept a reconnect
-            // from a new IP address (WiFi → 4G migration).
-            byte[] proof = null;
-            if (_ipMigrationKey != null)
-            {
-                var tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
-                using var hmac = new System.Security.Cryptography.HMACSHA256(_ipMigrationKey);
-                proof = hmac.ComputeHash(tokenBytes);
-            }
-
+            // N-8: if we have an IP migration key, compute the HMAC-SHA256 proof
+            // bound to the token so the gateway can accept a reconnect from a
+            // new IP address (WiFi → 4G migration).  Without a migration key we
+            // fall back to the no-proof variant — the gateway then accepts the
+            // reconnect only if the source IP matches the issue-time binding.
             byte[] packet;
+            bool hasProof = _ipMigrationKey != null;
             try
             {
-                packet = _packetBuilder.BuildReconnectInit(token, proof);
+                if (hasProof)
+                {
+                    var proof = RTMPE.Protocol.PacketBuilder.ComputeReconnectProof(token, _ipMigrationKey);
+                    packet = _packetBuilder.BuildReconnectInit(token, proof);
+                }
+                else
+                {
+                    packet = _packetBuilder.BuildReconnectInitWithoutProof(token);
+                }
             }
             catch (ArgumentException ex)
             {
-                Debug.LogError($"[RTMPE] SendReconnectInit: token rejected ({ex.Message}); aborting.");
+                RtmpeLog.Error($"[RTMPE] SendReconnectInit: token rejected ({ex.Message}); aborting.");
                 return;
             }
 
             SendToWire(packet);
-            LogDebug($"ReconnectInit sent ({packet.Length} B, proof={proof != null}).");
+            LogDebug($"ReconnectInit sent ({packet.Length} B, proof={hasProof}).");
         }
 
         // ── Helpers ────────────────────────────────────────────────────────────
@@ -2018,10 +3391,29 @@ namespace RTMPE.Core
             if (_state == NetworkState.Connecting || _state == NetworkState.Reconnecting)
             {
                 bool wasReconnecting = _state == NetworkState.Reconnecting;
-                OnConnectionFailed?.Invoke(
-                    wasReconnecting ? "Reconnect timeout." : "Connection timeout.");
+                SafeRaise(OnConnectionFailed,
+                    wasReconnecting ? "Reconnect timeout." : "Connection timeout.",
+                    nameof(OnConnectionFailed));
+
+                // Symmetric teardown with DisconnectWithReason: a timeout-driven
+                // shutdown must leave the manager in a state from which a
+                // subsequent retry can construct fresh thread + coroutine
+                // instances.  Without nulling _networkThread and stopping
+                // _connectCoroutine the next attempt would call Start() on a
+                // terminated thread and leak the in-flight handshake coroutine.
                 _networkThread?.Stop();
+                _networkThread = null;
+                if (_connectCoroutine != null)
+                {
+                    StopCoroutine(_connectCoroutine);
+                    _connectCoroutine = null;
+                }
                 _heartbeatManager?.Stop();
+                // Reconnect token semantics: the gateway treats it as single-
+                // use once consumed.  Clearing here matches the historical
+                // behaviour and stops a bounded retry loop from spinning on a
+                // token the gateway already accepted; the next loop iteration
+                // observes !CanReconnect and exits cleanly with OnReconnectFailed.
                 ClearSessionData(preserveReconnectToken: false);
                 TransitionTo(NetworkState.Disconnected, DisconnectReason.Timeout);
             }
@@ -2073,39 +3465,78 @@ namespace RTMPE.Core
             _currentRoomId         = 0;
             // Reset AEAD nonce counter so a future reconnect starts at counter = 0.
             System.Threading.Interlocked.Exchange(ref _outboundNonceCounter, -1L);
+            System.Threading.Interlocked.Exchange(ref _outboundAppSequenceCounter, -1L);
+            System.Threading.Interlocked.Exchange(ref _lastInboundAppSequence, -1L);
             _roomManager?.ClearState();
             _spawnManager?.ClearAll();     // Destroy all spawned objects
             _handshakeHandler?.Dispose();  // Zero key material before GC can observe it
             _handshakeHandler = null;
             _sessionKeys?.Dispose();       // Zero session keys before GC can observe it
             _sessionKeys      = null;
+            _inboundReplayWindow?.Reset();
+
+            // Drain pending payloads on session boundary so reconnect does
+            // not flush stale data into the new session's sequence/nonce
+            // stream.  _pendingLiveRpcs may hold up to MaxPendingLiveRpcs-
+            // DuringReplay (4096) Enhanced RPC byte[] from the previous room;
+            // _batchPending may hold queued variable-update payloads built
+            // against the previous PacketBuilder counter.  Either set,
+            // dispatched after reconnect, would either re-apply stale state
+            // or violate the gateway's monotonic sequence/nonce contract.
+            _pendingLiveRpcs?.Clear();
+            _pendingLiveRpcs = null;
+            _batchPending?.Clear();
+            System.Threading.Interlocked.Exchange(ref _replayInProgress, 0);
+
+            // Drop the cached HandshakeInit ciphertext.  It is no
+            // longer secret (it is on the wire), but a stale buffer would let
+            // a future Challenge be verified against an unrelated transcript.
+            _lastHandshakeInitCiphertext = null;
             LastRttMs         = -1f;
         }
 
         // ── AEAD outbound / inbound pipeline ──────────────────────────────────
 
         /// <summary>
+        /// Highest application-level monotonic sequence accepted on an inbound
+        /// encrypted packet that carried <c>FLAG_APP_SEQUENCE</c> on the
+        /// current session.  Returns <c>-1</c> when no such packet has been
+        /// received yet.  The wire <c>Sequence</c> field is the AEAD nonce
+        /// counter once a session is up, so the application-level sequence
+        /// would otherwise be reachable only after decrypting the payload —
+        /// this property exposes it post-AEAD-verification so receivers can
+        /// dedup or order without first reading the encrypted body.
+        ///
+        /// Updates use a monotonic CAS so the observable advances strictly
+        /// forward; a reordered-but-AEAD-valid frame whose sequence is below
+        /// the current high-water value cannot regress this property.
+        /// Consumers can therefore treat it as a monotonic clock.
+        /// </summary>
+        public long LastInboundApplicationSequence =>
+            System.Threading.Interlocked.Read(ref _lastInboundAppSequence);
+
+        /// <summary>
         /// Encrypts <paramref name="packet"/> with ChaCha20-Poly1305 AEAD and enqueues it
         /// for transmission on the network thread.
         ///
-        /// <para>If session keys are not yet established (pre-handshake, e.g.
+       /// <para>If session keys are not yet established (pre-handshake, e.g.
         /// <c>HandshakeInit</c>) the packet is sent as-is — the gateway expects those
         /// to arrive in plaintext.</para>
         ///
-        /// <para>When session keys are present the following transformations are applied,
+       /// <para>When session keys are present the following transformations are applied,
         /// mirroring Rust gateway <c>encrypt_outbound()</c> in
         /// <c>modules/gateway/src/crypto/pipeline.rs</c>:</para>
         /// <list type="number">
-        ///   <item>The original application <c>header.sequence</c> is saved and prepended
-        ///         as a 4-byte LE prefix to the plaintext before sealing.</item>
-        ///   <item>AAD = <c>[packet_type, flags]</c> where <c>flags</c> does <b>not</b>
-        ///         yet include <c>FLAG_ENCRYPTED</c>.</item>
-        ///   <item>A 12-byte nonce is built: <c>[counter:8 LE u64][_cryptoId:4 LE u32]</c>.
-        ///         The outbound counter is atomically incremented from
-        ///         <c>_outboundNonceCounter</c>.</item>
-        ///   <item><c>header.sequence</c> is overwritten with the nonce counter (lower
-        ///         32 bits), <c>FLAG_ENCRYPTED</c> is set, and <c>payload_len</c> is
-        ///         updated to reflect the enlarged ciphertext.</item>
+        ///  <item>The original application <c>header.sequence</c> is saved and prepended
+        ///        as a 4-byte LE prefix to the plaintext before sealing.</item>
+        ///  <item>AAD = <c>[packet_type, flags]</c> where <c>flags</c> does <b>not</b>
+        ///        yet include <c>FLAG_ENCRYPTED</c>.</item>
+        ///  <item>A 12-byte nonce is built: <c>[counter:8 LE u64][_cryptoId:4 LE u32]</c>.
+        ///        The outbound counter is atomically incremented from
+        ///        <c>_outboundNonceCounter</c>.</item>
+        ///  <item><c>header.sequence</c> is overwritten with the nonce counter (lower
+        ///        32 bits), <c>FLAG_ENCRYPTED</c> is set, and <c>payload_len</c> is
+        ///        updated to reflect the enlarged ciphertext.</item>
         /// </list>
         /// </summary>
         private void EncryptAndSend(byte[] packet)
@@ -2204,7 +3635,34 @@ namespace RTMPE.Core
             // flags now includes FLAG_COMPRESSED if compression was applied.
             // flags does NOT yet include FLAG_ENCRYPTED — this must match exactly
             // what the gateway sees as AAD on its decrypt_inbound() path.
-            var aad = new byte[] { packetType, flags };
+            //
+            // When NetworkSettings.preserveApplicationSequence is on, the AAD
+            // additionally binds a 4-byte LE u32 application sequence and the
+            // wire flags carry FLAG_APP_SEQUENCE.  The application sequence is
+            // tamper-evident through the AEAD tag — an on-path attacker who
+            // rewrites the wire bytes to a different sequence value will fail
+            // Poly1305 verification on the receiver because the AAD differs
+            // from what was sealed.
+            uint appSeqForWire = 0u;
+            bool stampAppSeq = _settings != null
+                            && _settings.preserveApplicationSequence;
+            if (stampAppSeq)
+            {
+                appSeqForWire = (uint)System.Threading.Interlocked.Increment(
+                    ref _outboundAppSequenceCounter);
+                flags |= (byte)PacketFlags.AppSequence;
+            }
+            byte[] aad = stampAppSeq
+                ? new byte[]
+                  {
+                      packetType,
+                      flags,
+                      (byte) appSeqForWire,
+                      (byte)(appSeqForWire >>  8),
+                      (byte)(appSeqForWire >> 16),
+                      (byte)(appSeqForWire >> 24),
+                  }
+                : new byte[] { packetType, flags };
 
             // ── 6. Build 12-byte nonce = [counter:8 LE][crypto_id:4 LE] ─────────
             var nonce = BuildAeadNonce(nonceCounter, _cryptoId);
@@ -2215,7 +3673,14 @@ namespace RTMPE.Core
             // ciphertext.Length == ptLen + 16  (Poly1305 tag appended)
 
             // ── 8. Assemble the encrypted packet ────────────────────────────────
-            var result = new byte[PacketProtocol.HEADER_SIZE + ciphertext.Length];
+            // Wire layout when FLAG_APP_SEQUENCE is set:
+            //   [header(13)][app_seq(4 LE)][ciphertext]
+            // The 4-byte app sequence is on the wire so the receiver can read
+            // it without first decrypting; the AAD binds the same bytes so any
+            // tampering causes Poly1305 verification to fail and the packet
+            // is silently dropped.
+            int appSeqWireBytes = stampAppSeq ? 4 : 0;
+            var result = new byte[PacketProtocol.HEADER_SIZE + appSeqWireBytes + ciphertext.Length];
             // Copy header as-is first, then patch the three affected fields.
             Buffer.BlockCopy(packet, 0, result, 0, PacketProtocol.HEADER_SIZE);
 
@@ -2225,18 +3690,29 @@ namespace RTMPE.Core
             result[PacketProtocol.OFFSET_SEQUENCE + 2] = (byte)(nonceCounter >> 16);
             result[PacketProtocol.OFFSET_SEQUENCE + 3] = (byte)(nonceCounter >> 24);
 
-            // header.flags |= FLAG_ENCRYPTED
+            // header.flags |= FLAG_ENCRYPTED  (FLAG_APP_SEQUENCE was already
+            // folded into `flags` above when stampAppSeq is true).
             result[PacketProtocol.OFFSET_FLAGS] = (byte)(flags | (byte)PacketFlags.Encrypted);
 
-            // header.payload_len = len(ciphertext)
-            uint ctLen = (uint)ciphertext.Length;
+            // header.payload_len counts every byte after the 13-byte header,
+            // i.e. the optional 4-byte app-seq prefix plus the ciphertext.
+            uint ctLen = (uint)(appSeqWireBytes + ciphertext.Length);
             result[PacketProtocol.OFFSET_PAYLOAD_LEN]     = (byte) ctLen;
             result[PacketProtocol.OFFSET_PAYLOAD_LEN + 1] = (byte)(ctLen >>  8);
             result[PacketProtocol.OFFSET_PAYLOAD_LEN + 2] = (byte)(ctLen >> 16);
             result[PacketProtocol.OFFSET_PAYLOAD_LEN + 3] = (byte)(ctLen >> 24);
 
+            if (stampAppSeq)
+            {
+                int o = PacketProtocol.HEADER_SIZE;
+                result[o    ] = (byte) appSeqForWire;
+                result[o + 1] = (byte)(appSeqForWire >>  8);
+                result[o + 2] = (byte)(appSeqForWire >> 16);
+                result[o + 3] = (byte)(appSeqForWire >> 24);
+            }
             Buffer.BlockCopy(ciphertext, 0, result,
-                             PacketProtocol.HEADER_SIZE, ciphertext.Length);
+                             PacketProtocol.HEADER_SIZE + appSeqWireBytes,
+                             ciphertext.Length);
 
             SendToWire(result);
         }
@@ -2244,33 +3720,39 @@ namespace RTMPE.Core
         /// <summary>
         /// Decrypts an inbound packet that has <c>FLAG_ENCRYPTED</c> set.
         ///
-        /// <para>Reverses the transformations applied by the gateway's
+       /// <para>Reverses the transformations applied by the gateway's
         /// <c>encrypt_outbound()</c>:</para>
         /// <list type="number">
-        ///   <item>Reconstructs the 12-byte nonce from <c>header.sequence</c> (the nonce
-        ///         counter placed there by the gateway) and <c>_cryptoId</c>.</item>
-        ///   <item>AAD = <c>[packet_type, flags &amp; ~FLAG_ENCRYPTED]</c>.</item>
-        ///   <item>Opens (decrypts + verifies) the ciphertext with
-        ///         <c>_sessionKeys.DecryptKey</c>.</item>
-        ///   <item>Recovers the original application sequence from the first 4 bytes of
-        ///         the plaintext (the SEQ prefix) and writes it back to
-        ///         <c>header.sequence</c>.</item>
-        ///   <item>Returns a rebuilt packet: decrypted payload, cleared
-        ///         <c>FLAG_ENCRYPTED</c>, corrected <c>payload_len</c>.</item>
+        ///  <item>Reconstructs the 12-byte nonce from <c>header.sequence</c> (the nonce
+        ///        counter placed there by the gateway) and <c>_cryptoId</c>.</item>
+        ///  <item>AAD = <c>[packet_type, flags &amp; ~FLAG_ENCRYPTED]</c>.</item>
+        ///  <item>Opens (decrypts + verifies) the ciphertext with
+        ///        <c>_sessionKeys.DecryptKey</c>.</item>
+        ///  <item>Recovers the original application sequence from the first 4 bytes of
+        ///        the plaintext (the SEQ prefix) and writes it back to
+        ///        <c>header.sequence</c>.</item>
+        ///  <item>Returns a rebuilt packet: decrypted payload, cleared
+        ///        <c>FLAG_ENCRYPTED</c>, corrected <c>payload_len</c>.</item>
         /// </list>
         ///
-        /// <returns>
-        ///   The decrypted packet, or <see langword="null"/> on MAC failure, missing
-        ///   session keys, or a malformed input — the caller must drop the packet silently.
+       /// <returns>
+        ///  The decrypted packet, or <see langword="null"/> on MAC failure, missing
+        ///  session keys, or a malformed input — the caller must drop the packet silently.
         /// </returns>
         /// </summary>
-        private byte[] DecryptInboundPacket(byte[] data)
+        // <paramref name="length"/> is the meaningful byte count of
+        // <paramref name="data"/>.  When <paramref name="data"/> is a rented
+        // buffer from <see cref="System.Buffers.ArrayPool{T}"/>, its physical
+        // <c>.Length</c> may exceed the packet length and MUST NOT be used to
+        // size ciphertext extraction — that would feed garbage tail bytes
+        // into Poly1305 and guarantee a tag-mismatch on every packet.
+        private byte[] DecryptInboundPacket(byte[] data, int length)
         {
             if (_sessionKeys == null) return null;
 
             // Minimum valid encrypted packet:
-            //   header(13) + SEQ_prefix(4) + Poly1305_tag(16) = 33 bytes.
-            if (data == null || data.Length < PacketProtocol.HEADER_SIZE + 4 + 16)
+            //  header(13) + SEQ_prefix(4) + Poly1305_tag(16) = 33 bytes.
+            if (data == null || length < PacketProtocol.HEADER_SIZE + 4 + 16)
                 return null;
 
             // ── 1. Read nonce counter from header.sequence ───────────────────────
@@ -2284,26 +3766,107 @@ namespace RTMPE.Core
             byte packetType = data[PacketProtocol.OFFSET_TYPE];
             byte flags      = data[PacketProtocol.OFFSET_FLAGS];
 
-            // ── 2. Build AAD = [packet_type, flags & ~FLAG_ENCRYPTED] ────────────
-            // Stripping FLAG_ENCRYPTED reproduces the AAD the gateway used when sealing.
-            var aad = new byte[] { packetType,
-                                   (byte)(flags & ~(byte)PacketFlags.Encrypted) };
+            // ── 2. Detect optional 4-byte application-sequence prefix ────────────
+            // FLAG_APP_SEQUENCE is set when the sender layered an application
+            // sequence into the AAD.  The 4-byte sequence sits between the
+            // header and the ciphertext on the wire.  When the flag is absent
+            // the packet uses the legacy AAD shape and the prefix is skipped —
+            // a peer that disabled the toggle (or a gateway that strips the
+            // bit) is still decoded correctly.
+            bool hasAppSeq = (flags & (byte)PacketFlags.AppSequence) != 0;
+            uint inboundAppSeq = 0u;
+            int  appSeqPrefixBytes = 0;
+            if (hasAppSeq)
+            {
+                if (length < PacketProtocol.HEADER_SIZE + 4 + 4 + 16)
+                    return null; // truncated: app-seq prefix + SEQ prefix + tag minimum
+                int o = PacketProtocol.HEADER_SIZE;
+                inboundAppSeq = (uint)(
+                      data[o]
+                    | (data[o + 1] << 8)
+                    | (data[o + 2] << 16)
+                    | (data[o + 3] << 24));
+                appSeqPrefixBytes = 4;
+            }
 
-            // ── 3. Build 12-byte nonce ───────────────────────────────────────────
+            // ── 3. Build AAD = [packet_type, flags & ~FLAG_ENCRYPTED] (+app_seq) ─
+            // Stripping FLAG_ENCRYPTED reproduces the AAD the gateway used when
+            // sealing.  When FLAG_APP_SEQUENCE is set the same 4-byte
+            // application sequence the sender bound is appended; an attacker
+            // that rewrites either the wire bytes or the flag bit changes the
+            // AAD and Poly1305 verification fails on the next line.
+            byte[] aad = hasAppSeq
+                ? new byte[]
+                  {
+                      packetType,
+                      (byte)(flags & ~(byte)PacketFlags.Encrypted),
+                      (byte) inboundAppSeq,
+                      (byte)(inboundAppSeq >>  8),
+                      (byte)(inboundAppSeq >> 16),
+                      (byte)(inboundAppSeq >> 24),
+                  }
+                : new byte[] { packetType,
+                               (byte)(flags & ~(byte)PacketFlags.Encrypted) };
+
+            // ── 4. Build 12-byte nonce ───────────────────────────────────────────
             var nonce = BuildAeadNonce(nonceCounter, _cryptoId);
 
-            // ── 4. Extract ciphertext (everything after the header) ──────────────
-            int ctLen = data.Length - PacketProtocol.HEADER_SIZE;
+            // ── 5. Extract ciphertext (skip header + optional app-seq prefix) ────
+            // Use the explicit <c>length</c> argument — the rented buffer's
+            // physical .Length may be larger than the meaningful packet.
+            int ctLen = length - PacketProtocol.HEADER_SIZE - appSeqPrefixBytes;
+            if (ctLen < 16) return null; // ciphertext must at least carry the Poly1305 tag
             var ciphertext = new byte[ctLen];
-            Buffer.BlockCopy(data, PacketProtocol.HEADER_SIZE, ciphertext, 0, ctLen);
+            Buffer.BlockCopy(data,
+                             PacketProtocol.HEADER_SIZE + appSeqPrefixBytes,
+                             ciphertext, 0, ctLen);
 
-            // ── 5. Open: decrypt + verify Poly1305 tag ───────────────────────────
+            // ── 6. Open: decrypt + verify Poly1305 tag ───────────────────────────
             var plaintext = ChaCha20Poly1305Impl.Open(
                 _sessionKeys.DecryptKey, nonce, ciphertext, aad);
             if (plaintext == null) return null; // MAC failure — drop
 
             // plaintext = [orig_seq:4 LE] || actual_payload (possibly LZ4-compressed)
             if (plaintext.Length < 4) return null; // should never happen
+
+            // Anti-replay admission AFTER AEAD verification.  Performing this
+            // check before Open would let an attacker burn through window
+            // bits with forged ciphertext that would fail Poly1305; doing it
+            // after means only authenticated counters can move the window
+            // head and only authenticated duplicates are rejected.
+            var window = _inboundReplayWindow;
+            if (window != null && !window.Admit(nonceCounter))
+            {
+                Debug.LogWarning(
+                    "[RTMPE] Dropped packet: replayed or out-of-window inbound counter " +
+                    $"{nonceCounter} (highest accepted is within the trailing " +
+                    $"{RTMPE.Crypto.Internal.ReplayWindow.WindowSize}-entry window).");
+                return null;
+            }
+
+            // Update the surfaced inbound application-sequence only for accepted
+            // packets; replayed-but-AEAD-valid frames must not poison the
+            // observable.  AEAD authenticates the wire bytes, but a replay
+            // carries an authenticated old sequence — exposing it via
+            // LastInboundApplicationSequence would let a passive replay rewind
+            // any consumer that uses the property as a monotonic clock.
+            //
+            // Monotonic high-water mark; reordered-but-AEAD-valid frames must
+            // not regress the surfaced inbound sequence.  ReplayWindow.Admit
+            // dedupes via its bitmap but does not enforce strict forward
+            // movement, so under UDP reorder a later-arriving lower counter
+            // would otherwise clobber the high-water value.  CAS keeps the
+            // observable monotonic without serialising the receive path on a
+            // lock.
+            if (hasAppSeq)
+            {
+                long newSeq = (long)inboundAppSeq;
+                long observed;
+                do { observed = System.Threading.Volatile.Read(ref _lastInboundAppSequence); }
+                while (newSeq > observed
+                    && System.Threading.Interlocked.CompareExchange(
+                           ref _lastInboundAppSequence, newSeq, observed) != observed);
+            }
 
             // ── 6. Recover original application sequence from SEQ prefix ─────────
             uint origSeq = (uint)(
@@ -2351,11 +3914,14 @@ namespace RTMPE.Core
             result[PacketProtocol.OFFSET_SEQUENCE + 2] = (byte)(origSeq >> 16);
             result[PacketProtocol.OFFSET_SEQUENCE + 3] = (byte)(origSeq >> 24);
 
-            // Clear FLAG_ENCRYPTED and FLAG_COMPRESSED — downstream handlers
-            // always receive plaintext uncompressed packets.
+            // Clear FLAG_ENCRYPTED, FLAG_COMPRESSED and FLAG_APP_SEQUENCE —
+            // downstream handlers always receive plaintext uncompressed
+            // packets, and the application-sequence bit is consumed at this
+            // layer (the post-decryption representation has no extra prefix).
             result[PacketProtocol.OFFSET_FLAGS] = (byte)(flags
                 & ~(byte)PacketFlags.Encrypted
-                & ~(byte)PacketFlags.Compressed);
+                & ~(byte)PacketFlags.Compressed
+                & ~(byte)PacketFlags.AppSequence);
 
             // Update payload_len: SEQ prefix, tag, and compression overhead removed.
             uint newPayloadLen = (uint)finalPayloadLen;
@@ -2380,14 +3946,14 @@ namespace RTMPE.Core
         /// <summary>
         /// Build the 12-byte ChaCha20-Poly1305 nonce shared by both directions.
         ///
-        /// <para>Layout mirrors
+       /// <para>Layout mirrors
         /// <c>NonceGenerator::build_nonce_raw(counter, session_id)</c> in the Rust
         /// gateway (<c>modules/gateway/src/crypto/nonce.rs</c>):</para>
         /// <code>
-        ///   [counter : 8 bytes LE u64] [session_id : 4 bytes LE u32]
+        ///  [counter : 8 bytes LE u64] [session_id : 4 bytes LE u32]
         /// </code>
         ///
-        /// <para><paramref name="counter"/> is a <see cref="uint"/> (zero-extended to 8
+       /// <para><paramref name="counter"/> is a <see cref="uint"/> (zero-extended to 8
         /// bytes); the high 4 bytes are therefore always <c>0x00</c> for any session
         /// within its practical lifetime.</para>
         /// </summary>
@@ -2415,21 +3981,77 @@ namespace RTMPE.Core
         /// Route incoming <c>StateSync</c>/<c>Data</c> server broadcasts to
         /// the appropriate sync component on the matching spawned object.
         ///
-        /// <para>Dispatch priority:</para>
+       /// <para>Dispatch priority:</para>
         /// <list type="number">
-        ///   <item><see cref="TransformPacketParser"/> — handles transform deltas (changed_mask bits 0x01–0x07 only).</item>
-        ///   <item><see cref="PhysicsPacketParser.IsPhysics2D"/> — handles 2-D Rigidbody2D packets (bit 0x80 set).</item>
-        ///   <item><see cref="PhysicsPacketParser.IsPhysics3D"/> — handles 3-D Rigidbody packets (bit 0x40 set, bit 0x80 clear).</item>
+        ///  <item><see cref="TransformPacketParser"/> — handles transform deltas (changed_mask bits 0x01–0x07 only).</item>
+        ///  <item><see cref="PhysicsPacketParser.IsPhysics2D"/> — handles 2-D Rigidbody2D packets (bit 0x80 set).</item>
+        ///  <item><see cref="PhysicsPacketParser.IsPhysics3D"/> — handles 3-D Rigidbody packets (bit 0x40 set, bit 0x80 clear).</item>
         /// </list>
         ///
-        /// Subscribed to <see cref="OnDataReceived"/> in <see cref="InitialiseNetwork"/>.
+       /// Subscribed to <see cref="OnDataReceived"/> in <see cref="InitialiseNetwork"/>.
         /// </summary>
         private void HandleStateSyncPacket(byte[] data)
         {
             if (_spawnManager == null) return;
 
+            // Game-data packets are valid only after a successful room join;
+            // rejecting earlier traffic prevents pre-room state injection.
+            if (_state != NetworkState.InRoom)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"StateSync packet rejected; not in a room (state={_state}).");
+                return;
+            }
+
             var payload = PacketParser.ExtractPayload(data);
             if (payload == null || payload.Length < 9) return;
+
+            // ── 1a. Try quantized transform parse ─────────────────────────────
+            // The 25-byte quantized layout encodes [flags|object_id|3×half|smallest3|3×half].
+            // Detect it BEFORE the legacy delta parser — TryParseStateDelta would
+            // otherwise mis-read object_id from bytes 0..7 (which include the
+            // flags byte) and then mask-check against byte 8 (the high byte of
+            // the real object_id in the quantized layout), silently dropping
+            // every quantized update.
+            if (payload.Length == TransformPacketParser.QUANTIZED_UPDATE_SIZE
+                && (payload[0] & TransformPacketParser.FLAG_QUANTIZED) != 0)
+            {
+                if (TransformPacketParser.TryParseQuantizedUpdate(
+                        payload, out ulong qObjectId, out TransformState qState))
+                {
+                    var qNb = _spawnManager.Registry.Get(qObjectId);
+                    if (qNb == null) return;
+
+                    // Receive-side interest filter — mirrors the legacy delta
+                    // path.  The quantized payload always carries position, so
+                    // the incoming-vs-live-transform fallback collapses to the
+                    // packet position unconditionally.
+                    if (!qNb.IsOwner && InterestManager.IsReceiveFilterActive)
+                    {
+                        var (lh1, lh2) = InterestManager.LocalPosition;
+                        Vector3 objPos = qState.Position;
+                        float dx  = objPos.x - lh1;
+                        float dh2 = (InterestManager.LocalUsesXzPlane ? objPos.z : objPos.y) - lh2;
+                        if (!InterestManager.ShouldDeliver(qObjectId, dx * dx + dh2 * dh2)) return;
+                    }
+
+                    if (qNb.IsOwner)
+                    {
+                        qNb.GetComponent<NetworkTransform>()?.ApplyReconciliation(qState);
+                        return;
+                    }
+
+                    var qInterp = qNb.GetComponent<NetworkTransformInterpolator>();
+                    if (qInterp == null) return;
+                    qInterp.AddState(qState, UnityEngine.Time.timeAsDouble);
+                    return;
+                }
+                // Malformed quantized payload — drop without falling through to
+                // the legacy parser, whose offsets do not match this layout.
+                if (IsDebugLogEnabled)
+                    LogDebug("StateSync: malformed quantized payload, dropped.");
+                return;
+            }
 
             // ── 1. Try transform parse ─────────────────────────────────────────
             if (TransformPacketParser.TryParseStateDelta(
@@ -2446,7 +4068,7 @@ namespace RTMPE.Core
                 // This is a secondary client-side guard; the gateway already
                 // performs the primary spatial cull before sending the packet.
                 //
-                // Filter against the INCOMING position when the packet carries
+               // Filter against the INCOMING position when the packet carries
                 // one — falling back to the live transform only when the delta
                 // omits a position field.  Filtering against transform.position
                 // alone would lag one tick behind: a fast-moving object entering
@@ -2454,7 +4076,6 @@ namespace RTMPE.Core
                 if (!nb.IsOwner && InterestManager.IsReceiveFilterActive)
                 {
                     var (lh1, lh2)  = InterestManager.LocalPosition;
-                    float radius     = InterestManager.LocalReceiveRadius;
                     Vector3 objPos;
                     if ((changedMask & TransformPacketParser.ChangedPosition) != 0)
                         objPos = state.Position;
@@ -2467,7 +4088,7 @@ namespace RTMPE.Core
                     // and silently rejects every packet for top-down games.
                     float dx = objPos.x - lh1;
                     float dh2 = (InterestManager.LocalUsesXzPlane ? objPos.z : objPos.y) - lh2;
-                    if (dx * dx + dh2 * dh2 > radius * radius) return;
+                    if (!InterestManager.ShouldDeliver(objectId, dx * dx + dh2 * dh2)) return;
                 }
 
                 // Build a blended state: merge only the fields present in the delta.
@@ -2533,13 +4154,12 @@ namespace RTMPE.Core
             if (!nb.IsOwner && InterestManager.IsReceiveFilterActive)
             {
                 var (lh1, lh2) = InterestManager.LocalPosition;
-                float radius   = InterestManager.LocalReceiveRadius;
                 Vector3 objPos = (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
                                  ? state.Position
                                  : nb.transform.position;
                 float dx  = objPos.x - lh1;
                 float dh2 = (InterestManager.LocalUsesXzPlane ? objPos.z : objPos.y) - lh2;
-                if (dx * dx + dh2 * dh2 > radius * radius) return;
+                if (!InterestManager.ShouldDeliver(objectId, dx * dx + dh2 * dh2)) return;
             }
 
             if (nb.IsOwner)
@@ -2570,14 +4190,13 @@ namespace RTMPE.Core
             if (!nb.IsOwner && InterestManager.IsReceiveFilterActive)
             {
                 var (lh1, lh2) = InterestManager.LocalPosition;
-                float radius   = InterestManager.LocalReceiveRadius;
                 float ox = (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
                            ? state.Position.x : nb.transform.position.x;
                 float oy = (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
                            ? state.Position.y : nb.transform.position.y;
                 float dx  = ox - lh1;
                 float dh2 = oy - lh2;
-                if (dx * dx + dh2 * dh2 > radius * radius) return;
+                if (!InterestManager.ShouldDeliver(objectId, dx * dx + dh2 * dh2)) return;
             }
 
             if (nb.IsOwner)
@@ -2594,15 +4213,30 @@ namespace RTMPE.Core
         /// <summary>
         /// Apply an inbound <c>VariableUpdate</c> (0x41) packet from the server
         /// to the matching spawned object's NetworkVariables.
-        /// Payload: [object_id:8 LE][var_count:1][for each: [var_id:2 LE][value_len:2 LE][value_bytes:N]]
+        /// Payload: <c>[object_id:8 LE][tick:4 LE][var_count:1][for each: [var_id:2 LE][value_len:2 LE][value_bytes:N]]</c>
+        ///
+        /// The 4-byte tick is the sender's LocalTick at flush time.  Each
+        /// variable on the receiver maintains its own last-applied-tick
+        /// watermark and rejects updates whose tick is not strictly greater
+        /// (RFC 1982 modular comparison) so a re-ordered datagram cannot
+        /// roll the value back.
         /// </summary>
         private void HandleVariableUpdatePacket(byte[] data)
         {
             if (_spawnManager == null) return;
 
+            // Game-data packets are valid only after a successful room join;
+            // rejecting earlier traffic prevents pre-room state injection.
+            if (_state != NetworkState.InRoom)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"VariableUpdate packet rejected; not in a room (state={_state}).");
+                return;
+            }
+
             var payload = PacketParser.ExtractPayload(data);
-            // Minimum: object_id(8) + var_count(1) = 9 bytes.
-            if (payload == null || payload.Length < 9) return;
+            // Minimum: object_id(8) + tick(4) + var_count(1) = 13 bytes.
+            if (payload == null || payload.Length < 13) return;
 
             // Wire protocol is little-endian.  `BitConverter.ToUInt64` is
             // platform-endian — see `HandleOwnershipTransferRpc` for the same
@@ -2617,7 +4251,12 @@ namespace RTMPE.Core
                 | ((ulong)payload[5] << 40)
                 | ((ulong)payload[6] << 48)
                 | ((ulong)payload[7] << 56);
-            int varCount   = payload[8];
+            uint packetTick =
+                  (uint)payload[8]
+                | ((uint)payload[9]  << 8)
+                | ((uint)payload[10] << 16)
+                | ((uint)payload[11] << 24);
+            int varCount = payload[12];
             if (varCount == 0) return;
 
             var nb = _spawnManager.Registry.Get(objectId);
@@ -2625,7 +4264,7 @@ namespace RTMPE.Core
 
             try
             {
-                using var ms     = new System.IO.MemoryStream(payload, 9, payload.Length - 9);
+                using var ms     = new System.IO.MemoryStream(payload, 13, payload.Length - 13);
                 using var reader = new System.IO.BinaryReader(ms);
 
                 for (int i = 0; i < varCount; i++)
@@ -2641,16 +4280,18 @@ namespace RTMPE.Core
                     if (ms.Length - ms.Position < valueLen) break; // truncated packet
 
                     long valueStart = ms.Position;
-                    nb.ApplyVariableUpdate(varId, reader, valueLen);
+                    nb.ApplyVariableUpdate(varId, reader, valueLen, packetTick, hasPacketTick: true);
 
                     // Ensure the reader is positioned exactly after value_bytes,
-                    // even if ApplyVariableUpdate consumed fewer or more bytes.
+                    // even if ApplyVariableUpdate consumed fewer or more bytes
+                    // (or skipped the value entirely on a stale-tick rejection).
                     ms.Position = valueStart + valueLen;
                 }
             }
             catch (Exception ex)
             {
-                LogDebug($"VariableUpdate: parse error for objectId {objectId}: {ex.Message}");
+                if (IsDebugLogEnabled)
+                    LogDebug($"VariableUpdate: parse error for objectId {objectId}: {ex.Message}");
             }
         }
 
@@ -2674,6 +4315,25 @@ namespace RTMPE.Core
             EncryptAndSend(packet);
         }
 
+        /// <summary>
+        /// Build and enqueue a coalesced VariableBatchUpdate (0x44) packet.
+        /// Invoked from the per-tick variable flush when
+        /// <c>NetworkSettings.enableVariableBatching</c> is true; the batch
+        /// payload was built by <see cref="VariableBatchBuilder.Build"/>.
+        /// </summary>
+        internal void SendVariableBatchUpdate(byte[] payload)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+            if (payload == null || payload.Length == 0) return;
+
+            var packet = _packetBuilder.Build(
+                PacketType.VariableBatchUpdate,
+                PacketFlags.Reliable,
+                payload);
+
+            EncryptAndSend(packet);
+        }
+
         // ── Position update send path (Feature #6 — Interest Management) ───
 
         /// <summary>
@@ -2681,11 +4341,11 @@ namespace RTMPE.Core
         /// client's 2-D world position so the gateway can apply zone-based
         /// interest filtering to room-wide broadcasts.
         ///
-        /// <para>Call this from <see cref="RTMPE.Rooms.InterestManager"/> at the
+       /// <para>Call this from <see cref="RTMPE.Rooms.InterestManager"/> at the
         /// configured update interval while in a room.  Sending outside a room is
         /// a no-op (the gateway has no room context to filter against).</para>
         ///
-        /// <para>Payload layout: <c>[x: f32 LE 4 B][y: f32 LE 4 B]</c> — 8 bytes.</para>
+       /// <para>Payload layout: <c>[x: f32 LE 4 B][y: f32 LE 4 B]</c> — 8 bytes.</para>
         /// </summary>
         internal void SendPositionUpdate(float x, float y)
         {
@@ -2734,7 +4394,9 @@ namespace RTMPE.Core
                 return;
             }
 
-            uint requestId = (uint)System.Threading.Interlocked.Increment(ref _rpcRequestCounter);
+            // Source the correlation ID from the CSPRNG-backed allocator so a
+            // network attacker cannot predict or race in-flight request IDs.
+            uint requestId = RequestIdAllocator.Next();
 #pragma warning disable CS0618  // intentional: built-in method IDs still use the legacy builder
             byte[] rpcMessage = RpcPacketBuilder.BuildRequest(methodId, LocalPlayerId, requestId, rpcPayload);
 #pragma warning restore CS0618
@@ -2747,7 +4409,7 @@ namespace RTMPE.Core
         /// <see cref="RtmpeRpcAttribute"/>-decorated method on a
         /// <see cref="NetworkBehaviour"/> component.
         ///
-        /// <para>Called internally by <see cref="NetworkBehaviour.RPC"/>. Game code
+       /// <para>Called internally by <see cref="NetworkBehaviour.RPC"/>. Game code
         /// should not call this directly — use <c>NetworkBehaviour.RPC()</c> instead.</para>
         /// </summary>
         /// <param name="sender">The <c>NetworkBehaviour</c> originating the call.</param>
@@ -2780,7 +4442,8 @@ namespace RTMPE.Core
             RpcRegistry.TryFindMethod(sender.GetType(), methodId, out _, out var attr);
             var target = attr?.Target ?? RpcTarget.All;
 
-            uint requestId = (uint)System.Threading.Interlocked.Increment(ref _rpcRequestCounter);
+            // CSPRNG-backed correlation ID; see RequestIdAllocator.
+            uint requestId = RequestIdAllocator.Next();
 
             byte[] rpcPayload;
             try
@@ -2791,7 +4454,7 @@ namespace RTMPE.Core
             }
             catch (Exception ex)
             {
-                Debug.LogError(
+                RtmpeLog.Error(
                     $"[RTMPE] NetworkManager.SendEnhancedRpc: failed to build packet for " +
                     $"'{sender.GetType().Name}.{methodName}': {ex.Message}");
                 return;
@@ -2834,7 +4497,8 @@ namespace RTMPE.Core
             var nb = Spawner?.Registry?.Get(objectId);
             if (nb == null)
             {
-                LogDebug($"ApplyDamage RPC: no object with id {objectId}.");
+                if (IsDebugLogEnabled)
+                    LogDebug($"ApplyDamage RPC: no object with id {objectId}.");
                 return;
             }
 
@@ -2844,7 +4508,7 @@ namespace RTMPE.Core
             var damageable = nb.GetComponentInParent<IDamageable>();
             if (damageable != null)
                 damageable.ReceiveApplyDamage(damage);
-            else
+            else if (IsDebugLogEnabled)
                 LogDebug($"ApplyDamage RPC: object {objectId} has no IDamageable component.");
         }
 
@@ -2865,7 +4529,7 @@ namespace RTMPE.Core
         /// Wrap <paramref name="payload"/> in a <see cref="PacketType.Data"/> header
         /// and enqueue it on the network thread for transmission.
         ///
-        /// Called by <c>NetworkTransform</c> and any other SDK component
+       /// Called by <c>NetworkTransform</c> and any other SDK component
         /// that needs to send a raw data payload without managing the PacketBuilder
         /// directly.  Must be called from the Unity main thread.
         /// </summary>
@@ -2890,18 +4554,18 @@ namespace RTMPE.Core
         /// Wrap <paramref name="payload"/> in a <see cref="PacketType.InputPayload"/>
         /// header (0x43) and transmit it as an unreliable UDP packet.
         ///
-        /// <para>Called by <see cref="RTMPE.Sync.NetworkTransform"/> once per
+       /// <para>Called by <see cref="RTMPE.Sync.NetworkTransform"/> once per
         /// 30 Hz tick to ship the unacknowledged-input ring buffer to the Sync
         /// Service for server-authoritative simulation.  Built by
         /// <see cref="RTMPE.Sync.InputPacketBuilder.BuildBatchPayload"/>.</para>
         ///
-        /// <para>Player identity is intentionally NOT in the payload — the
+       /// <para>Player identity is intentionally NOT in the payload — the
         /// gateway resolves session_id → authoritative player_id and embeds
         /// both in the NATS envelope before the Sync Service ever sees the
         /// bytes.  This eliminates the client-spoofing surface that would
         /// exist if a client could stamp any player_id on its inputs.</para>
         ///
-        /// <para>Unreliable on purpose: the next batch supersedes the prior
+       /// <para>Unreliable on purpose: the next batch supersedes the prior
         /// (the buffer holds every unacknowledged frame), so a dropped
         /// packet costs at most one tick of latency until the next send.</para>
         /// </summary>
@@ -2926,12 +4590,12 @@ namespace RTMPE.Core
         /// Wrap <paramref name="payload"/> in a <see cref="PacketType.StateSync"/> header
         /// and transmit it as an unreliable UDP packet.
         ///
-        /// <para>Called by <see cref="RTMPE.Sync.NetworkRigidbody"/> and
+       /// <para>Called by <see cref="RTMPE.Sync.NetworkRigidbody"/> and
         /// <see cref="RTMPE.Sync.NetworkRigidbody2D"/> to send physics-state updates.
         /// StateSync packets flow through the Sync Engine which aggregates and
         /// rebroadcasts them to all room members at the 30 Hz tick rate.</para>
         ///
-        /// <para>Sending as StateSync rather than Data means the Sync Engine
+       /// <para>Sending as StateSync rather than Data means the Sync Engine
         /// processes the payload as object state, applying interest-zone filtering
         /// and dead-client pruning before the broadcast.</para>
         /// </summary>
@@ -2958,7 +4622,7 @@ namespace RTMPE.Core
         /// atomically assigned so the gateway sees a monotonic counter regardless
         /// of which SDK component originates the packet.
         ///
-        /// Called by SpawnManager, OwnershipManager, and any other SDK component
+       /// Called by SpawnManager, OwnershipManager, and any other SDK component
         /// that needs to build a typed packet for transmission via <see cref="Send"/>.
         /// </summary>
         internal byte[] BuildPacket(PacketType type, PacketFlags flags, byte[] payload)
@@ -2970,51 +4634,419 @@ namespace RTMPE.Core
         }
 
         /// <summary>
-        /// Extract the <c>sub</c> claim from a JWT without an external JSON library.
-        /// The JWT claims segment is base64url-decoded to UTF-8 JSON, then a simple
-        /// string search locates the <c>"sub"</c> key.
-        /// Returns <see langword="null"/> if the JWT is malformed or has no sub claim.
+        /// DTO used solely as a destination for <see cref="JsonUtility.FromJson{T}"/>
+        /// when extracting the JWT <c>sub</c> claim.  All other claims are ignored
+        /// (JsonUtility does not surface unknown fields), which is what we want —
+        /// the previous substring scan could be defeated by another claim that
+        /// embedded the literal string <c>"sub":"..."</c> within its own value
+        /// (e.g. <c>"name":"sub:fakeuser"</c> is fine, but
+        /// <c>"description":"\"sub\":\"fakeuser\""</c> would have matched first
+        /// in the previous implementation).  A real JSON parse is the only
+        /// correct way to identify the actual top-level <c>sub</c> field.
         /// </summary>
-        private static string TryExtractJwtSub(string jwt)
+        [Serializable]
+        private sealed class JwtHeaderDto
         {
-            if (string.IsNullOrEmpty(jwt)) return null;
+#pragma warning disable IDE1006
+            public string alg;
+            public string typ;
+            public string kid;
+#pragma warning restore IDE1006
+        }
+
+        [Serializable]
+        private sealed class JwtClaimsDto
+        {
+            // Serialized field names must match JWT claim names exactly.
+            // ReSharper disable InconsistentNaming — JSON contract.
+#pragma warning disable IDE1006
+            public string sub;
+            public string iss;
+            public string aud;
+            public long   exp;
+            public long   nbf;
+            public long   iat;
+#pragma warning restore IDE1006
+        }
+
+        /// <summary>
+        /// Validate the structure and temporal claims of a JWT and surface
+        /// the <c>sub</c> claim on success.  Signature verification is
+        /// out of scope — the SDK does not ship with a configurable JWKS
+        /// pin today; channel binding is provided instead by the AEAD
+        /// envelope wrapped around SessionAck once the ECDH session keys
+        /// have been derived.  Even without a signature check the
+        /// structural and temporal validation below prevents a malformed
+        /// or expired token from poisoning <c>_localPlayerId</c>.
+        /// </summary>
+        /// <param name="jwt">Compact-serialised JWS (header.payload.sig).</param>
+        /// <param name="expectedIssuer">
+        /// Optional <c>iss</c> claim to enforce.  When non-empty the token
+        /// must declare the same issuer or it is rejected.
+        /// </param>
+        /// <param name="expectedAudience">
+        /// Optional <c>aud</c> claim to enforce.  When non-empty the token
+        /// must declare exactly this audience (single-value; the gateway
+        /// does not currently mint array audiences) or it is rejected.
+        /// </param>
+        /// <param name="subject">Receives the decoded <c>sub</c> claim on success.</param>
+        /// <param name="error">Receives a short reason string on failure.</param>
+        internal bool TryValidateJwt(
+            string jwt,
+            string expectedIssuer,
+            string expectedAudience,
+            out string subject,
+            out string error)
+        {
+            subject = null;
+            error   = null;
+
+            if (string.IsNullOrEmpty(jwt))
+            {
+                error = "JWT is null or empty";
+                return false;
+            }
 
             var parts = jwt.Split('.');
-            if (parts.Length != 3) return null;
-
-            // Convert base64url → base64 (replace URL-safe chars, fix padding).
-            var base64 = parts[1].Replace('-', '+').Replace('_', '/');
-            switch (base64.Length % 4)
+            if (parts.Length != 3)
             {
-                case 2: base64 += "=="; break;
-                case 3: base64 += "=";  break;
+                error = "JWT is not a three-segment compact serialisation";
+                return false;
+            }
+
+            // Header decode is unconditional so the alg can be cross-checked
+            // against the configured pin below. The `alg=none` rejection is
+            // gated on the presence of a pin: when no pin is configured the
+            // SDK preserves the prior structural-only behaviour for forward
+            // compat with deployments that have not yet rotated to signed
+            // SessionAck. Once any pin is configured, RFC 8725 §3.1 applies
+            // in full and `alg=none` is rejected outright.
+            // Per RFC 8725 §2.1, signature verification runs BEFORE any claim
+            // inspection so that an unsigned (or attacker-modified) token does
+            // not act as a probe oracle for exp / nbf / iss / aud.  A generic
+            // verification-failure string is surfaced for every pre-signature
+            // failure to deny the attacker a way to distinguish "wrong key"
+            // from "wrong claim" without a valid signature in hand.
+            const string GenericSignatureFailure = "JWT verification failed";
+
+            JwtHeaderDto header = null;
+            if (TryDecodeBase64Url(parts[0], out byte[] headerBytes))
+            {
+                try
+                {
+                    string headerJson = new System.Text.UTF8Encoding(
+                        encoderShouldEmitUTF8Identifier: false,
+                        throwOnInvalidBytes: true).GetString(headerBytes);
+                    header = JsonUtility.FromJson<JwtHeaderDto>(headerJson);
+                }
+                catch (System.Text.DecoderFallbackException) { /* header stays null */ }
+                catch (Exception)                            { /* header stays null */ }
+            }
+
+            // ── Signature verification (runs before any claim parsing) ──────
+            var algMode = _settings != null
+                ? _settings.jwtSignatureAlgorithm
+                : NetworkSettings.JwtSignatureAlgorithm.None;
+
+            if (algMode == NetworkSettings.JwtSignatureAlgorithm.None)
+            {
+                WarnJwtSignatureUnverifiedOnce();
+            }
+            else
+            {
+                if (header == null || string.IsNullOrEmpty(header.alg))
+                {
+                    error = GenericSignatureFailure;
+                    return false;
+                }
+                if (string.Equals(header.alg, "none", StringComparison.OrdinalIgnoreCase))
+                {
+                    error = GenericSignatureFailure;
+                    return false;
+                }
+
+                if (!TryDecodeBase64Url(parts[2], out byte[] sig))
+                {
+                    error = GenericSignatureFailure;
+                    return false;
+                }
+                // Signed input is the ASCII bytes of the first two segments
+                // joined by '.'. base64url is a strict ASCII subset; the
+                // ASCII encoder keeps the byte length deterministic.
+                var signedInput = System.Text.Encoding.ASCII.GetBytes(
+                    parts[0] + "." + parts[1]);
+
+                bool sigOk;
+                try
+                {
+                    sigOk = VerifyJwtSignature(algMode, header.alg, sig, signedInput, out _);
+                }
+                catch (Exception)
+                {
+                    // Defensive — RSA / Ed25519 verifiers must never throw
+                    // on attacker-controlled input; treat any unexpected
+                    // exception as verification failure with the generic
+                    // message so the exception type is not a side channel.
+                    error = GenericSignatureFailure;
+                    return false;
+                }
+                if (!sigOk)
+                {
+                    error = GenericSignatureFailure;
+                    return false;
+                }
+            }
+
+            // ── Claim parsing (post-signature) ──────────────────────────────
+            if (!TryDecodeBase64Url(parts[1], out byte[] claimBytes))
+            {
+                error = "JWT claims segment is not valid base64url";
+                return false;
             }
 
             string json;
             try
             {
-                var bytes = Convert.FromBase64String(base64);
-                json = System.Text.Encoding.UTF8.GetString(bytes);
+                json = new System.Text.UTF8Encoding(
+                    encoderShouldEmitUTF8Identifier: false,
+                    throwOnInvalidBytes: true).GetString(claimBytes);
             }
-            catch (FormatException) { return null; }
+            catch (System.Text.DecoderFallbackException)
+            {
+                error = "JWT claims segment is not valid UTF-8";
+                return false;
+            }
 
-            // Locate "sub":"<value>" — the sub claim is always a plain string.
-            // This avoids a JSON library dependency for a single string extraction.
-            const string subKey = "\"sub\":\"";
-            var start = json.IndexOf(subKey, StringComparison.Ordinal);
-            if (start < 0) return null;
+            JwtClaimsDto dto;
+            try
+            {
+                dto = JsonUtility.FromJson<JwtClaimsDto>(json);
+            }
+            catch (Exception ex)
+            {
+                error = $"JWT claims JSON parse failed: {ex.GetType().Name}";
+                return false;
+            }
 
-            start += subKey.Length;
-            var end = json.IndexOf('"', start);
-            if (end < 0 || end == start) return null;
+            if (dto == null || string.IsNullOrEmpty(dto.sub))
+            {
+                error = "JWT has no sub claim";
+                return false;
+            }
 
-            return json.Substring(start, end - start);
+            int skew = _settings != null
+                ? Math.Max(0, _settings.jwtClockSkewSeconds)
+                : 120;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            if (dto.exp != 0 && now > dto.exp + skew)
+            {
+                error = $"JWT exp {dto.exp} is in the past (now={now}, skew={skew}s)";
+                return false;
+            }
+            if (dto.nbf != 0 && now + skew < dto.nbf)
+            {
+                error = $"JWT nbf {dto.nbf} is in the future (now={now}, skew={skew}s)";
+                return false;
+            }
+
+            if (!string.IsNullOrEmpty(expectedIssuer)
+                && !string.Equals(dto.iss, expectedIssuer, StringComparison.Ordinal))
+            {
+                error = $"JWT iss '{dto.iss ?? string.Empty}' does not match expected issuer";
+                return false;
+            }
+
+            if (!string.IsNullOrEmpty(expectedAudience)
+                && !string.Equals(dto.aud, expectedAudience, StringComparison.Ordinal))
+            {
+                error = $"JWT aud '{dto.aud ?? string.Empty}' does not match expected audience";
+                return false;
+            }
+
+            subject = dto.sub;
+            return true;
+        }
+
+        // One-time advisory: emitted at first SessionAck when no JWKS pin is
+        // configured. Per-SessionAck warnings would drown the console; one
+        // is enough to be discoverable via grep / CI log scrape.
+        private static int _jwtSignatureUnverifiedWarned;
+
+        private static void WarnJwtSignatureUnverifiedOnce()
+        {
+            if (System.Threading.Interlocked.CompareExchange(
+                    ref _jwtSignatureUnverifiedWarned, 1, 0) == 0)
+            {
+                // LogError (not LogWarning) so CI log scraping that filters on
+                // error severity surfaces the unsigned-JWT condition without
+                // any extra integrator configuration.  A misconfigured
+                // production deployment that ships with the default
+                // jwtSignatureAlgorithm = None is a real-world security
+                // regression; the previous LogWarning was easy to miss in a
+                // noisy build log.
+                Debug.LogError(
+                    "[RTMPE] NetworkSettings.jwtSignatureAlgorithm is None — " +
+                    "SessionAck JWT signatures are NOT being verified. " +
+                    "Production deployments MUST configure a JWKS pin " +
+                    "(jwtSigningKeyHex for Ed25519 / jwtSigningKeyPem for RS256) " +
+                    "so a forged SessionAck cannot install attacker-chosen " +
+                    "session_id / reconnect_token / crypto_id values.");
+            }
+        }
+
+        /// <summary>
+        /// Test-hook only — resets the one-shot JWT-no-pin advisory so a
+        /// fixture can re-observe the warning. Production code never calls
+        /// this; the field is otherwise an invisible per-AppDomain latch.
+        /// </summary>
+        internal static void ResetJwtSignatureUnverifiedWarningForTests()
+            => System.Threading.Interlocked.Exchange(ref _jwtSignatureUnverifiedWarned, 0);
+
+        /// <summary>
+        /// Instance shim that resolves keying material from <see cref="_settings"/>
+        /// and forwards to <see cref="JwtSignatureVerifier.Verify"/>. Kept on
+        /// the manager so the existing TryValidateJwt call site stays terse;
+        /// the algorithm itself is in a free-standing static so headless test
+        /// harnesses can exercise it without a live MonoBehaviour.
+        /// </summary>
+        private bool VerifyJwtSignature(
+            NetworkSettings.JwtSignatureAlgorithm algMode,
+            string headerAlg,
+            byte[] signature,
+            byte[] signedInput,
+            out string error)
+        {
+            return JwtSignatureVerifier.Verify(
+                algMode,
+                headerAlg,
+                signature,
+                signedInput,
+                _settings?.jwtSigningKeyHex,
+                _settings?.jwtSigningKeyPem,
+                out error);
+        }
+
+        /// <summary>
+        /// Decode a base64url segment (RFC 7515 §2) into raw bytes.  Returns
+        /// <see langword="false"/> for malformed padding, characters outside
+        /// the base64url alphabet, or zero-length input.
+        /// </summary>
+        private static bool TryDecodeBase64Url(string input, out byte[] bytes)
+        {
+            bytes = null;
+            if (string.IsNullOrEmpty(input)) return false;
+
+            var b64 = input.Replace('-', '+').Replace('_', '/');
+            switch (b64.Length % 4)
+            {
+                case 0: break;
+                case 2: b64 += "=="; break;
+                case 3: b64 += "=";  break;
+                default: return false;
+            }
+
+            try { bytes = Convert.FromBase64String(b64); return true; }
+            catch (FormatException) { return false; }
+        }
+
+        /// <summary>
+        /// Allow-list of inbound packet types that MUST arrive AEAD-encrypted
+        /// once the session has reached SessionAck.  The handshake exchange
+        /// itself cannot be encrypted (no keys yet); everything that depends
+        /// on session-bound state (SessionAck's crypto_id / JWT, room
+        /// lifecycle, RPCs, spawn / despawn, server-pushed state, the
+        /// graceful Disconnect signal) must be authenticated under the
+        /// derived ChaCha20-Poly1305 key or it could be forged by an
+        /// off-path attacker who only sees the wire.
+        /// </summary>
+        internal static bool RequiresEncryption(PacketType type)
+        {
+            switch (type)
+            {
+                // Pre-handshake — keys do not exist yet.
+                case PacketType.Handshake:
+                case PacketType.HandshakeAck:
+                case PacketType.HandshakeInit:
+                case PacketType.Challenge:
+                case PacketType.HandshakeResponse:
+                case PacketType.ReconnectInit:
+                case PacketType.ReconnectAck:
+                    return false;
+
+                // Everything else carries session-bound semantics.
+                default:
+                    return true;
+            }
         }
 
         private void LogDebug(string message)
         {
             if (_settings != null && _settings.enableDebugLogs)
                 Debug.Log($"[RTMPE] {message}");
+        }
+
+        // Hot-path gate.  Callers building an interpolated $"..." argument
+        // for LogDebug must test this first — interpolation allocates a
+        // formatted string before LogDebug can suppress it, so a per-packet
+        // call site dominates steady-state GC even when verbose logs are
+        // off.  Cheap field-read; safe to call from any thread that reads
+        // _settings under the same publication invariants as Awake.
+        private bool IsDebugLogEnabled =>
+            _settings != null && _settings.enableDebugLogs;
+
+        // ── Resilient event multicast ─────────────────────────────────────────
+        //
+       // Default C# delegate invocation (handler?.Invoke(...)) walks the
+        // multicast chain in registration order and propagates the FIRST
+        // subscriber exception, aborting all later subscribers.  In an SDK
+        // event surface this is a denial-of-service primitive: a single
+        // misbehaving listener silences every other listener for the rest
+        // of the process lifetime.  The helpers below isolate each
+        // subscriber inside try/catch so one buggy handler cannot deafen
+        // the rest.  Exceptions are surfaced via Debug.LogException for
+        // visibility but never re-thrown — the network thread / state
+        // machine must stay live regardless of application-level bugs.
+        //
+       // Invariant: NEVER call `handler.Invoke(...)` directly on a public
+        // event.  All raise-sites in this class go through SafeRaise.
+
+        private static void SafeRaise(Action handler, string eventName)
+        {
+            if (handler == null) return;
+            foreach (var d in handler.GetInvocationList())
+            {
+                try { ((Action)d)(); }
+                catch (Exception ex) { LogSubscriberException(eventName, ex); }
+            }
+        }
+
+        private static void SafeRaise<T>(Action<T> handler, T arg, string eventName)
+        {
+            if (handler == null) return;
+            foreach (var d in handler.GetInvocationList())
+            {
+                try { ((Action<T>)d)(arg); }
+                catch (Exception ex) { LogSubscriberException(eventName, ex); }
+            }
+        }
+
+        private static void SafeRaise<T1, T2>(Action<T1, T2> handler, T1 a1, T2 a2, string eventName)
+        {
+            if (handler == null) return;
+            foreach (var d in handler.GetInvocationList())
+            {
+                try { ((Action<T1, T2>)d)(a1, a2); }
+                catch (Exception ex) { LogSubscriberException(eventName, ex); }
+            }
+        }
+
+        private static void LogSubscriberException(string eventName, Exception ex)
+        {
+            // We log via Debug.LogError with the inner exception attached so the
+            // stack trace points at the throwing subscriber, not at SafeRaise.
+            Debug.LogError($"[RTMPE] Subscriber threw in event '{eventName}': {ex.GetType().Name}: {ex.Message}");
+            Debug.LogException(ex);
         }
     }
 

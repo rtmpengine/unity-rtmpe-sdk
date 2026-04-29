@@ -3,10 +3,10 @@
 // NUnit tests for NetworkRigidbody2D (2-D physics sync component).
 //
 // Coverage mirrors NetworkRigidbodyTests but targets PhysicsState2D:
-//   GetState()          — default before spawn; position capture after spawn.
-//   ApplyRemoteState()  — partial-mask field merging, zero-mask no-op,
-//                         sleep flag, _hasReceivedState flag.
-//   ApplyReconciliation — confirmed no-op (must not throw).
+//  GetState()          — default before spawn; position capture after spawn.
+//  ApplyRemoteState()  — partial-mask field merging, zero-mask no-op,
+//                        sleep flag, _hasReceivedState flag.
+//  ApplyReconciliation — confirmed no-op (must not throw).
 //
 // Private fields are accessed via reflection — no test-only surface in production.
 

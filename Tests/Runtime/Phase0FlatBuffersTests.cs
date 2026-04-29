@@ -8,18 +8,18 @@
 //
 // What this test proves:
 //
-//   1. The vendored `Google.FlatBuffers` runtime under
-//      Runtime/Infrastructure/Serialization/FlatBuffers/ compiles inside the
-//      SDK assembly and links against the generated bindings under
-//      Runtime/Infrastructure/Serialization/Generated/.
-//   2. A round-trip encode + decode of `RTMPE.States.InputPayload` returns
-//      every field byte-for-byte intact.
+//  1. The vendored `Google.FlatBuffers` runtime under
+//     Runtime/Infrastructure/Serialization/FlatBuffers/ compiles inside the
+//     SDK assembly and links against the generated bindings under
+//     Runtime/Infrastructure/Serialization/Generated/.
+//  2. A round-trip encode + decode of `RTMPE.States.InputPayload` returns
+//     every field byte-for-byte intact.
 //
 // What this test does NOT do:
 //
-//   • It does NOT touch the network, NetworkManager, or NetworkTransform.
-//     Phase 0 ships zero wire-format change; sending FlatBuffers payloads
-//     to the gateway is Phase 1+ work.
+//  • It does NOT touch the network, NetworkManager, or NetworkTransform.
+//    Phase 0 ships zero wire-format change; sending FlatBuffers payloads
+//    to the gateway is Phase 1+ work.
 
 using NUnit.Framework;
 using Google.FlatBuffers;

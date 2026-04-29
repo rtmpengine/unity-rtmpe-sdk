@@ -48,8 +48,23 @@ namespace RTMPE.Rooms
     /// </summary>
     public sealed class NetworkSceneManager
     {
-        private readonly RoomManager _rooms;
+        // Reconnect-safe: resolved each time the RoomManager identity is
+        // checked (room-event bridging, property writes, scene-prune
+        // requests) so a Reconnect-driven swap of the underlying RoomManager
+        // is observed without dropping the long-lived public façade
+        // reference held by the application.
+        private readonly Func<RoomManager> _roomsProvider;
+
+        // Most recently observed RoomManager.  Used to detect identity
+        // changes so subscriptions are migrated atomically: unsubscribe from
+        // the old, subscribe to the new, all under the main-thread contract.
+        // Holds the dead instance across the very brief window between
+        // Reconnect's call to RecreateRoomAndSpawnManagers and the next
+        // method invocation that triggers EnsureBound().
+        private RoomManager _bound;
+
         private string _lastObservedScene = string.Empty;
+        private bool   _disposed;
 
         /// <summary>
         /// Fired when the server has accepted a new scene name and every
@@ -72,16 +87,31 @@ namespace RTMPE.Rooms
         /// empty string when no scene has been set yet.  Mirrors
         /// <see cref="RoomInfo.CurrentScene"/> for convenience.
         /// </summary>
-        public string CurrentScene =>
-            _rooms?.CurrentRoom?.CurrentScene ?? string.Empty;
+        public string CurrentScene
+        {
+            get
+            {
+                EnsureBound();
+                return _bound?.CurrentRoom?.CurrentScene ?? string.Empty;
+            }
+        }
 
+        // Provider-based ctor (preferred, reconnect-safe).
+        internal NetworkSceneManager(Func<RoomManager> roomsProvider)
+        {
+            _roomsProvider = roomsProvider ?? throw new ArgumentNullException(nameof(roomsProvider));
+            EnsureBound();
+        }
+
+        // Legacy ctor retained for back-compat with tests / out-of-tree
+        // callers that constructed with a fixed RoomManager.  The fixed
+        // reference is wrapped in a constant provider so the rest of the
+        // class can route exclusively through EnsureBound().
         internal NetworkSceneManager(RoomManager rooms)
         {
-            _rooms = rooms ?? throw new ArgumentNullException(nameof(rooms));
-            _rooms.OnRoomPropertiesChanged      += HandleRoomPropertiesChanged;
-            _rooms.OnRoomJoined                 += HandleRoomJoined;
-            _rooms.OnRoomLeft                   += HandleRoomLeft;
-            _rooms.OnAllPlayersSceneLoaded      += HandleAllReady;
+            if (rooms == null) throw new ArgumentNullException(nameof(rooms));
+            _roomsProvider = () => rooms;
+            EnsureBound();
         }
 
         /// <summary>
@@ -99,7 +129,10 @@ namespace RTMPE.Rooms
         {
             if (string.IsNullOrEmpty(sceneName))
                 throw new ArgumentException("sceneName must not be null or empty.", nameof(sceneName));
-            if (_rooms == null || !_rooms.IsInRoom)
+
+            EnsureBound();
+            var rooms = _bound;
+            if (rooms == null || !rooms.IsInRoom)
             {
                 Debug.LogWarning("[RTMPE] NetworkSceneManager.LoadScene: must be in a room.");
                 return;
@@ -114,12 +147,30 @@ namespace RTMPE.Rooms
                 return;
             }
 
+            // Robustness: prune any NetworkObjects whose GameObjects were
+            // destroyed by an out-of-band scene unload BEFORE the server
+            // broadcast lands.  Without this, a transitional gap can leave
+            // the registry holding entries that compare equal to null when
+            // the new scene's RegisterPrefab/Spawn cycle runs, producing
+            // silent ID collisions if the gateway re-uses an id near the
+            // wrap.  The host's sceneUnloaded handler already prunes; this
+            // is a second, defensive sweep tied to the network-driven
+            // transition rather than the engine's local unload event.
+            var nm = NetworkManager.Instance;
+            try { nm?.Spawner?.Registry?.PruneDestroyed(); }
+            catch (Exception ex)
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] NetworkSceneManager.LoadScene: registry prune threw " +
+                    $"{ex.GetType().Name}: {ex.Message}.  Continuing — gateway broadcast still proceeds.");
+            }
+
             var updates = new System.Collections.Generic.Dictionary<string, PropertyValue>
             {
                 { ReservedPropertyKeys.Scene,         PropertyValue.OfString(sceneName) },
                 { ReservedPropertyKeys.SceneAdditive, PropertyValue.OfBool(mode == NetworkSceneLoadMode.Additive) },
             };
-            _rooms.SetRoomProperties(updates);
+            rooms.SetRoomProperties(updates);
         }
 
         /// <summary>
@@ -129,9 +180,53 @@ namespace RTMPE.Rooms
         /// </summary>
         public void ReportReady()
         {
+            EnsureBound();
             var scene = CurrentScene;
             if (string.IsNullOrEmpty(scene)) return;
-            _rooms.ReportSceneLoaded(scene);
+            _bound?.ReportSceneLoaded(scene);
+        }
+
+        // ── Subscription management ───────────────────────────────────────
+
+        // Re-bind subscriptions if the live RoomManager is no longer the one
+        // we last subscribed to.  Called from every public/event entry
+        // point so a Reconnect that swaps the manager between calls is
+        // observed at the next interaction.  Idempotent — when the live
+        // instance equals _bound (steady state) the method returns
+        // immediately without touching the event delegates.
+        private void EnsureBound()
+        {
+            if (_disposed) return;
+            var live = _roomsProvider();
+            if (ReferenceEquals(live, _bound)) return;
+
+            // Detach from the previous instance — even if it has been
+            // discarded by NetworkManager, our delegates are still rooted
+            // in its event invocation list.  Without explicit detach the
+            // dead instance leaks until full GC sweeps both objects.
+            if (_bound != null)
+            {
+                _bound.OnRoomPropertiesChanged -= HandleRoomPropertiesChanged;
+                _bound.OnRoomJoined            -= HandleRoomJoined;
+                _bound.OnRoomLeft              -= HandleRoomLeft;
+                _bound.OnAllPlayersSceneLoaded -= HandleAllReady;
+            }
+
+            _bound = live;
+            // Reset the per-session scene-watcher: the new RoomManager has
+            // a clean CurrentRoom history, so the first OnRoomJoined or
+            // OnRoomPropertiesChanged it raises must be honoured even if
+            // the scene name happens to match the one we observed on the
+            // previous (defunct) instance.
+            _lastObservedScene = string.Empty;
+
+            if (_bound != null)
+            {
+                _bound.OnRoomPropertiesChanged += HandleRoomPropertiesChanged;
+                _bound.OnRoomJoined            += HandleRoomJoined;
+                _bound.OnRoomLeft              += HandleRoomLeft;
+                _bound.OnAllPlayersSceneLoaded += HandleAllReady;
+            }
         }
 
         // ── Room-event bridging ──────────────────────────────────────────
@@ -178,11 +273,13 @@ namespace RTMPE.Rooms
         /// </summary>
         internal void Dispose()
         {
-            if (_rooms == null) return;
-            _rooms.OnRoomPropertiesChanged -= HandleRoomPropertiesChanged;
-            _rooms.OnRoomJoined            -= HandleRoomJoined;
-            _rooms.OnRoomLeft              -= HandleRoomLeft;
-            _rooms.OnAllPlayersSceneLoaded -= HandleAllReady;
+            _disposed = true;
+            if (_bound == null) return;
+            _bound.OnRoomPropertiesChanged -= HandleRoomPropertiesChanged;
+            _bound.OnRoomJoined            -= HandleRoomJoined;
+            _bound.OnRoomLeft              -= HandleRoomLeft;
+            _bound.OnAllPlayersSceneLoaded -= HandleAllReady;
+            _bound = null;
         }
     }
 }

@@ -37,23 +37,53 @@ namespace RTMPE.Rooms
         // Current room state (null when not in a room).
         private RoomInfo _currentRoom;
 
-        // Replace the single _pendingCreateOptions field with a request-
-        // correlated FIFO queue. The old field was overwritten on rapid successive
-        // CreateRoom calls, causing early responses to be populated with the last
-        // call's options.
+        // Local player's room UUID, populated by HandleCreateResponse /
+        // HandleJoinResponse when the server echoes the assignment.  Empty
+        // string when no membership has been confirmed yet.  Used by the
+        // reserved-property guard in SetRoomProperties to determine whether
+        // the local session holds the master-client role.
+        private string _localPlayerId = string.Empty;
+
+        // Pending CreateRoom requests carry a client-generated UUID (request_id)
+        // alongside the original options and a wall-clock send timestamp.
         //
-        // A Queue is correct here because:
-        //   (a) RoomManager runs on the Unity main thread (no concurrency).
-        //   (b) The server responds to room-creation requests in FIFO order.
-        //   (c) No sequence-number echoing is required from the server.
-        // Entries are dequeued as responses arrive; any remainders are purged in
-        // ClearState() on disconnect.
+        // Correlation strategy:
+        //   • Outbound: each CreateRoom call mints a v4-class GUID and stores
+        //     the (id, options, sentAt) tuple in _pendingCreateById and the id
+        //     in _pendingCreateOrder.
+        //   • Inbound (TryMatchCreateResponse): when the server echoes a
+        //     request_id, we look it up by id directly — order-independent,
+        //     race-proof.  When the server omits it (current gateway), we fall
+        //     back to head-of-_pendingCreateOrder.  Either way the entry is
+        //     removed atomically.
+        //   • Stale entries (no response within PendingCreateTtlSeconds) are
+        //     swept on every CreateRoom and on ClearState — bounded growth.
         //
-        // Capped at MaxPendingCreates to prevent unbounded memory growth if the
-        // server stops responding to CreateRoom requests.
-        private readonly Queue<CreateRoomOptions> _pendingCreateQueue =
-            new Queue<CreateRoomOptions>();
-        private const int MaxPendingCreates = 16;
+        // Wire-protocol coordination point:
+        //   The current RoomCreate (0x20) request payload defined in
+        //   RoomPacketBuilder does NOT carry the request_id, and the response
+        //   parser in RoomPacketParser does not extract it.  Promoting this
+        //   correlator from "client-side defence-in-depth + FIFO fallback" to
+        //   "true ID-based matching" requires:
+        //     (a) Prefixing BuildCreateRoomPayload with [request_id_len:2 LE]
+        //         [request_id:16 bytes] (raw GUID bytes; or 36-byte UTF-8 form).
+        //     (b) Gateway echoes the same bytes verbatim in the response after
+        //         the existing fields.
+        //     (c) ParseCreateRoomResponse extends to surface the echoed id.
+        //   Step (a)/(c) live in RoomPacketBuilder/Parser; step (b) is
+        //   gateway-side.  Until those land, FIFO is the operative match path
+        //   and the per-id bookkeeping here is a future-proof scaffold and a
+        //   useful debugging aid (logged via OnRoomError when stale entries
+        //   are evicted).
+        private readonly PendingCreateTable<CreateRoomOptions> _pendingCreates =
+            new PendingCreateTable<CreateRoomOptions>(
+                capacity: MaxPendingCreates,
+                ttlSeconds: PendingCreateTtlSeconds);
+
+        private const int    MaxPendingCreates       = 16;
+        // 30 s is a comfortable upper bound on a healthy round trip; anything
+        // older is treated as a request the gateway will never answer.
+        private const double PendingCreateTtlSeconds = 30.0;
 
         // ── Properties ─────────────────────────────────────────────────────────
 
@@ -62,6 +92,32 @@ namespace RTMPE.Rooms
 
         /// <summary>True when the local player is in a room.</summary>
         public bool IsInRoom => _currentRoom != null;
+
+        /// <summary>
+        /// True when the local player currently holds the master-client (host)
+        /// role in <see cref="CurrentRoom"/>.  Returns <see langword="false"/>
+        /// when not in a room, when the master id is unknown, or when the
+        /// local player UUID has not yet been resolved by a successful
+        /// Create/Join response.
+        /// </summary>
+        public bool IsMasterClient
+        {
+            get
+            {
+                if (_currentRoom == null) return false;
+                if (string.IsNullOrEmpty(_localPlayerId)) return false;
+                var master = _currentRoom.MasterId;
+                return !string.IsNullOrEmpty(master) && master == _localPlayerId;
+            }
+        }
+
+        /// <summary>
+        /// Number of CreateRoom requests still awaiting a server response.
+        /// Exposed to allow tests and diagnostic tooling to assert on
+        /// in-flight book-keeping; production code should treat this as
+        /// observational only.
+        /// </summary>
+        internal int PendingCreateCount => _pendingCreates.Count;
 
         // ── Events ─────────────────────────────────────────────────────────────
 
@@ -162,18 +218,28 @@ namespace RTMPE.Rooms
         {
             if (!RequireConnected("CreateRoom")) return;
 
-            if (_pendingCreateQueue.Count >= MaxPendingCreates)
+            // Sweep first so a back-pressured client whose responses are missing
+            // does not get permanently locked out by stale book-keeping.
+            foreach (var (staleId, _) in _pendingCreates.SweepExpired(DateTime.UtcNow))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] RoomManager: CreateRoom request {staleId} timed out " +
+                    $"after {PendingCreateTtlSeconds}s with no response. Discarding.");
+                OnRoomError?.Invoke("CreateRoom timed out");
+            }
+
+            if (_pendingCreates.IsFull)
             {
                 Debug.LogError("[RTMPE] RoomManager.CreateRoom: too many in-flight room creates. " +
                                "Wait for the server to respond before calling CreateRoom again.");
                 return;
             }
 
-            var payload = RoomPacketBuilder.BuildCreateRoomPayload(options);
+            var opts      = options ?? new CreateRoomOptions();
+            var requestId = _pendingCreates.Register(opts, DateTime.UtcNow);
+
+            var payload = RoomPacketBuilder.BuildCreateRoomPayload(opts);
             var packet  = _packetBuilder.Build(PacketType.RoomCreate, PacketFlags.Reliable, payload);
-            // Enqueue options in FIFO order so each response can dequeue
-            // the matching options regardless of how many requests are in-flight.
-            _pendingCreateQueue.Enqueue(options ?? new CreateRoomOptions());
             _sendOwned(packet);
         }
 
@@ -266,6 +332,30 @@ namespace RTMPE.Rooms
         {
             if (!RequireInRoom("SetRoomProperties")) return;
             if (properties == null) throw new ArgumentNullException(nameof(properties));
+
+            // Keys with the reserved "__" prefix are server-managed (e.g.
+            // __scene, __scene_additive); the gateway silently discards
+            // unauthorised writes to them and never echoes a property update.
+            // Surfacing the rejection client-side turns an opaque "no-op"
+            // into an actionable diagnostic — the developer sees exactly
+            // which key was rejected and why, instead of debugging a missing
+            // OnRoomPropertiesChanged.  Non-master writers are blocked
+            // outright; the request is not sent.
+            if (!IsMasterClient)
+            {
+                foreach (var key in properties.Keys)
+                {
+                    if (ReservedPropertyKeys.IsReserved(key))
+                    {
+                        var error =
+                            $"SetRoomProperties: key '{key}' is reserved (prefix '{ReservedPropertyKeys.Prefix}') " +
+                            "and may only be written by the room's master client. Request not sent.";
+                        Debug.LogWarning("[RTMPE] RoomManager." + error);
+                        OnRoomError?.Invoke(error);
+                        return;
+                    }
+                }
+            }
 
             int expectedVersion = _currentRoom.PropertiesVersion + 1;
             byte[] payload = PropertyPacketBuilder.BuildRoomPayload(expectedVersion, properties);
@@ -418,8 +508,9 @@ namespace RTMPE.Rooms
         /// </summary>
         internal void ClearState()
         {
-            _currentRoom = null;
-            _pendingCreateQueue.Clear();
+            _currentRoom   = null;
+            _localPlayerId = string.Empty;
+            _pendingCreates.Clear();
         }
 
         // ── Inbound property broadcasts ────────────────────────────────────────
@@ -502,18 +593,27 @@ namespace RTMPE.Rooms
 
             if (ok)
             {
-                // Dequeue the matching options in FIFO order.
-                // RoomManager is single-threaded and the server responds in request order.
-                var opts = _pendingCreateQueue.Count > 0
-                    ? _pendingCreateQueue.Dequeue()
-                    : new CreateRoomOptions();
+                // Match by echoed request_id when present; FIFO fallback when not
+                // (current gateway omits the field — see wire-protocol coordination
+                // note above).  When the response cannot be matched at all we
+                // synthesize default options rather than dropping the response —
+                // the room metadata in the response is authoritative; only the
+                // client-supplied IsPublic/Name view is reconstructed.
+                CreateRoomOptions opts =
+                    _pendingCreates.TryMatch(echoedRequestId: null, out var matched)
+                        ? matched
+                        : new CreateRoomOptions();
+
                 _currentRoom = new RoomInfo(
                     roomId, roomCode, opts.Name ?? string.Empty, "waiting",
                     1, maxPlayers, opts.IsPublic);
 
                 // Populate LocalPlayerStringId so IsOwner checks work.
                 if (!string.IsNullOrEmpty(localPlayerId))
+                {
+                    _localPlayerId = localPlayerId;
                     _onLocalPlayerIdResolved?.Invoke(localPlayerId);
+                }
 
                 OnRoomCreated?.Invoke(_currentRoom);
             }
@@ -550,11 +650,50 @@ namespace RTMPE.Rooms
 
             if (ok)
             {
+                // An implicit room-switch (Join while still in another room
+                // without an intervening LeaveRoom call) must mirror the
+                // gateway's "leave A then join B" semantics on the client:
+                // tear down the spawn registry and fire OnRoomLeft for the
+                // displaced room before swapping in the new snapshot.
+                // Otherwise OnRoomJoined fires twice in a row, the previous
+                // room's spawned objects leak, and IsOwner comparisons
+                // straddle two rooms with diverging player rosters.
+                //
+                // OnRoomLeft is a synchronous System.Action — the
+                // NetworkManager listener (OnRoomManagerLeft) calls
+                // SpawnManager.ClearAll() on this stack frame, so the
+                // displaced room's GameObjects are destroyed before the
+                // _currentRoom assignment below makes the new room visible.
+                //
+                // Idempotent on rejoin: if the response carries the same room
+                // id we already track, skip the displaced-room cleanup so a
+                // duplicate Join (e.g. a reliable-channel retransmit echo)
+                // does not raise spurious OnRoomLeft / spawn-registry resets.
+                if (_currentRoom != null
+                    && room != null
+                    && _currentRoom.RoomId != room.RoomId)
+                {
+                    // Null the prior room before broadcasting OnRoomLeft so
+                    // listeners that consult CurrentRoom see a coherent
+                    // "between rooms" snapshot rather than the stale prior
+                    // room.  The synchronous NetworkManager listener
+                    // (OnRoomManagerLeft) transitions _state back to
+                    // Connected and runs SpawnManager.ClearAll on this stack
+                    // frame; without this assignment, user OnNetworkDespawn
+                    // callbacks would observe (state==Connected, room==A)
+                    // — an impossible-in-steady-state combination.
+                    _currentRoom = null;
+                    OnRoomLeft?.Invoke();
+                }
+
                 _currentRoom = room;
 
                 // Populate LocalPlayerStringId so IsOwner checks work.
                 if (!string.IsNullOrEmpty(localPlayerId))
+                {
+                    _localPlayerId = localPlayerId;
                     _onLocalPlayerIdResolved?.Invoke(localPlayerId);
+                }
 
                 OnRoomJoined?.Invoke(room);
             }
@@ -600,7 +739,8 @@ namespace RTMPE.Rooms
 
             if (ok)
             {
-                _currentRoom = null;
+                _currentRoom   = null;
+                _localPlayerId = string.Empty;
                 OnRoomLeft?.Invoke();
             }
             else

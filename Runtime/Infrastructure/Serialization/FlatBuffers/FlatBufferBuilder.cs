@@ -100,7 +100,7 @@ namespace Google.FlatBuffers
         /// Gets and sets a Boolean to disable the optimization when serializing
         /// default values to a Table.
         ///
-        /// In order to save space, fields that are set to their default value
+       /// In order to save space, fields that are set to their default value
         /// don't get serialized into the buffer.
         /// </summary>
         public bool ForceDefaults { get; set; }

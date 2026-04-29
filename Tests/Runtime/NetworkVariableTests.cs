@@ -838,4 +838,130 @@ namespace RTMPE.Tests
             Assert.AreEqual(longValue, dst.Value, "Round-tripped value must match the original.");
         }
     }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // INBOUND TICK GATE  (Tier-1, finding #3 — uniform per-variable enforcement)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    [TestFixture]
+    [Category("NetworkVariable")]
+    public class NetworkVariableInboundTickGateTests
+    {
+        private GameObject     _nmGo;
+        private NetworkManager _manager;
+        private GameObject     _ownerGo;
+        private StubNB         _owner;
+
+        [SetUp]
+        public void SetUp()
+        {
+            _nmGo    = new GameObject("NM_Gate");
+            _manager = _nmGo.AddComponent<NetworkManager>();
+            _ownerGo = new GameObject("Owner_Gate");
+            _owner   = _ownerGo.AddComponent<StubNB>();
+            _owner.Initialize(42UL, "owner");
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            if (_ownerGo != null) { Object.DestroyImmediate(_ownerGo); _ownerGo = null; }
+            if (_nmGo    != null) { Object.DestroyImmediate(_nmGo);    _nmGo    = null; }
+        }
+
+        private static byte[] BuildIntValueBytes(int value)
+        {
+            // Wire layout matches NetworkVariableInt.Serialize: 4 bytes LE int.
+            using var ms = new MemoryStream();
+            using var bw = new BinaryWriter(ms);
+            bw.Write(value);
+            return ms.ToArray();
+        }
+
+        // Drive ApplyVariableUpdate the way HandleVariableUpdatePacket does.
+        private void ApplyTick(NetworkVariableInt v, int newValue, uint tick)
+        {
+            byte[] bytes = BuildIntValueBytes(newValue);
+            using var ms = new MemoryStream(bytes);
+            using var br = new BinaryReader(ms);
+            _owner.ApplyVariableUpdate(v.VariableId, br, valueLen: (ushort)bytes.Length,
+                                       packetTick: tick, hasPacketTick: true);
+        }
+
+        [Test]
+        [Description("First inbound update is always accepted regardless of tick value.")]
+        public void FirstUpdate_Accepted()
+        {
+            var v = new NetworkVariableInt(_owner, 1, initialValue: 0);
+
+            ApplyTick(v, 7, tick: 100u);
+
+            Assert.AreEqual(7, v.Value, "First inbound update must apply.");
+        }
+
+        [Test]
+        [Description("A re-ordered older tick is rejected after a newer tick has been applied.")]
+        public void OutOfOrderUpdate_Rejected()
+        {
+            var v = new NetworkVariableInt(_owner, 1, initialValue: 0);
+
+            ApplyTick(v, 99, tick: 200u);
+            // Stale datagram arrives late — must NOT roll value back.
+            ApplyTick(v, -1, tick: 199u);
+
+            Assert.AreEqual(99, v.Value, "Older tick must be dropped by the gate.");
+        }
+
+        [Test]
+        [Description("A duplicate tick (same as last applied) is rejected.")]
+        public void DuplicateTick_Rejected()
+        {
+            var v = new NetworkVariableInt(_owner, 1, initialValue: 0);
+
+            ApplyTick(v, 1, tick: 5u);
+            ApplyTick(v, 2, tick: 5u);
+
+            Assert.AreEqual(1, v.Value, "Duplicate tick must not overwrite.");
+        }
+
+        [Test]
+        [Description("Tick wrap (uint.MaxValue → 0) is treated as a forward step under modular arithmetic.")]
+        public void WrapForward_Accepted()
+        {
+            var v = new NetworkVariableInt(_owner, 1, initialValue: 0);
+
+            ApplyTick(v, 10, tick: uint.MaxValue);
+            ApplyTick(v, 11, tick: 0u);
+
+            Assert.AreEqual(11, v.Value, "Forward across the uint wrap must apply.");
+        }
+
+        [Test]
+        [Description("Per-variable gates are independent: gating one variable does not stall a sibling.")]
+        public void IndependentVariables_DoNotShareGate()
+        {
+            var a = new NetworkVariableInt(_owner, 1, initialValue: 0);
+            var b = new NetworkVariableInt(_owner, 2, initialValue: 0);
+
+            ApplyTick(a, 1, tick: 100u);
+            ApplyTick(b, 2, tick: 50u); // older tick than a — but gate is per-variable
+
+            Assert.AreEqual(1, a.Value);
+            Assert.AreEqual(2, b.Value, "A sibling variable must run its own gate, " +
+                                        "not inherit the high-water tick of another.");
+        }
+
+        [Test]
+        [Description("ResetInboundTickGate clears the watermark so a fresh session restarts cleanly.")]
+        public void ResetGate_AllowsLowerTickAfterReset()
+        {
+            var v = new NetworkVariableInt(_owner, 1, initialValue: 0);
+
+            ApplyTick(v, 10, tick: 1_000u);
+            v.ResetInboundTickGate();
+            ApplyTick(v, 20, tick: 1u);
+
+            Assert.AreEqual(20, v.Value, "After reset, any tick must be acceptable on the first call.");
+        }
+    }
 }

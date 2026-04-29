@@ -392,7 +392,281 @@ namespace RTMPE.Tests
             Assert.AreEqual(seq0 + 1, seq1, "Sequence numbers should increment");
         }
 
+        // ── Reserved-key validation (room properties) ──────────────────────────
+
+        [Test]
+        [Description("Non-master client writing a reserved-prefix key is blocked client-side: " +
+                     "no packet is emitted and OnRoomError reports the rejected key.")]
+        public void SetRoomProperties_NonMasterReservedKey_BlocksAndFiresError()
+        {
+            _currentState = NetworkState.InRoom;
+            // Local player joins as a non-host on a roster where the master is a different player.
+            JoinRoomAs(localPlayerId: "player-self",
+                       players: new[] { ("player-master", "Host", true, true),
+                                        ("player-self",   "Me",   false, true) });
+            _sentPackets.Clear();
+
+            string receivedError = null;
+            _roomManager.OnRoomError += err => receivedError = err;
+
+            _roomManager.SetRoomProperties(new System.Collections.Generic.Dictionary<string, PropertyValue>
+            {
+                { "__scene", PropertyValue.OfString("Boss") },
+            });
+
+            Assert.AreEqual(0, _sentPackets.Count,
+                "No packet should be emitted when a non-master writes a reserved key.");
+            Assert.IsNotNull(receivedError, "OnRoomError should fire with a diagnostic.");
+            StringAssert.Contains("__scene", receivedError);
+            StringAssert.Contains("reserved", receivedError);
+        }
+
+        [Test]
+        [Description("Master client may write reserved-prefix keys; the request is sent.")]
+        public void SetRoomProperties_MasterReservedKey_SendsPacket()
+        {
+            _currentState = NetworkState.InRoom;
+            JoinRoomAs(localPlayerId: "player-host",
+                       players: new[] { ("player-host", "Host", true, true) });
+            _sentPackets.Clear();
+
+            _roomManager.SetRoomProperties(new System.Collections.Generic.Dictionary<string, PropertyValue>
+            {
+                { "__scene", PropertyValue.OfString("Lobby") },
+            });
+
+            Assert.AreEqual(1, _sentPackets.Count,
+                "Master client should be permitted to write reserved keys.");
+        }
+
+        [Test]
+        [Description("Reserved-key block fails-fast — non-reserved keys in the same payload are " +
+                     "NOT smuggled past the guard via partial submission.")]
+        public void SetRoomProperties_NonMasterMixedReservedKeys_BlocksEntirePayload()
+        {
+            _currentState = NetworkState.InRoom;
+            JoinRoomAs(localPlayerId: "player-self",
+                       players: new[] { ("player-master", "Host", true, true),
+                                        ("player-self",   "Me",   false, true) });
+            _sentPackets.Clear();
+
+            _roomManager.SetRoomProperties(new System.Collections.Generic.Dictionary<string, PropertyValue>
+            {
+                { "score",  PropertyValue.OfInt(10) },
+                { "__scene", PropertyValue.OfString("Boss") },
+            });
+
+            Assert.AreEqual(0, _sentPackets.Count,
+                "A reserved key anywhere in the payload must reject the entire request.");
+        }
+
+        [Test]
+        [Description("Non-master writing only non-reserved keys is permitted (server enforces master).")]
+        public void SetRoomProperties_NonMasterNonReservedKey_SendsPacket()
+        {
+            _currentState = NetworkState.InRoom;
+            JoinRoomAs(localPlayerId: "player-self",
+                       players: new[] { ("player-master", "Host", true, true),
+                                        ("player-self",   "Me",   false, true) });
+            _sentPackets.Clear();
+
+            _roomManager.SetRoomProperties(new System.Collections.Generic.Dictionary<string, PropertyValue>
+            {
+                { "score", PropertyValue.OfInt(10) },
+            });
+
+            Assert.AreEqual(1, _sentPackets.Count,
+                "Non-reserved keys must still be sent; the gateway is the authority on master-only writes.");
+        }
+
+        [Test]
+        public void IsMasterClient_LocalIsHost_ReturnsTrue()
+        {
+            _currentState = NetworkState.InRoom;
+            JoinRoomAs(localPlayerId: "player-host",
+                       players: new[] { ("player-host", "Host", true, true) });
+
+            Assert.IsTrue(_roomManager.IsMasterClient);
+        }
+
+        [Test]
+        public void IsMasterClient_LocalIsNotHost_ReturnsFalse()
+        {
+            _currentState = NetworkState.InRoom;
+            JoinRoomAs(localPlayerId: "player-self",
+                       players: new[] { ("player-master", "Host", true, true),
+                                        ("player-self",   "Me",   false, true) });
+
+            Assert.IsFalse(_roomManager.IsMasterClient);
+        }
+
+        [Test]
+        public void IsMasterClient_NotInRoom_ReturnsFalse()
+        {
+            Assert.IsFalse(_roomManager.IsMasterClient);
+        }
+
+        // ── Implicit room-switch ──────────────────────────────────────────────
+
+        [Test]
+        [Description("Joining room B while still in room A fires OnRoomLeft for the displaced room " +
+                     "before OnRoomJoined for the new room — the gateway treats this as leave-then-join.")]
+        public void HandleJoinResponse_SwitchRoom_FiresOnRoomLeftForPriorRoom()
+        {
+            _currentState = NetworkState.InRoom;
+            JoinRoomAs(localPlayerId: "player-1",
+                       roomId: "room-A",
+                       players: new[] { ("player-1", "Me", true, true) });
+
+            int leftFiredCount = 0;
+            int joinedFiredCount = 0;
+            _roomManager.OnRoomLeft   += () => leftFiredCount++;
+            _roomManager.OnRoomJoined += _ => joinedFiredCount++;
+
+            // Now the server delivers a Join response for room-B.
+            var payload = BuildJoinRoomResponseOkWithLocalId(
+                "room-B", "BCODE1", "Boss", 1, 16, true,
+                new[] { ("player-1", "Me", true, true) },
+                localPlayerId: "player-1");
+            _roomManager.HandleRoomPacket(PacketType.RoomJoin, payload);
+
+            Assert.AreEqual(1, leftFiredCount,
+                "OnRoomLeft should fire exactly once for the displaced room.");
+            Assert.AreEqual(1, joinedFiredCount,
+                "OnRoomJoined fires exactly once for the new room.");
+            Assert.AreEqual("room-B", _roomManager.CurrentRoom.RoomId);
+        }
+
+        [Test]
+        [Description("On an implicit room-switch the OnRoomLeft listener chain runs synchronously and " +
+                     "completes before _currentRoom is reassigned and before OnRoomJoined fires; " +
+                     "during OnRoomLeft, CurrentRoom is null so listeners observe a coherent " +
+                     "'between rooms' snapshot rather than the stale prior room paired with a " +
+                     "post-leave _state.")]
+        public void HandleJoinResponse_SwitchRoom_OnRoomLeftRunsBeforeRoomFlipAndOnRoomJoined()
+        {
+            _currentState = NetworkState.InRoom;
+            JoinRoomAs(localPlayerId: "player-1",
+                       roomId: "room-A",
+                       players: new[] { ("player-1", "Me", true, true) });
+
+            var sequence = new List<string>();
+            bool roomVisibleInsideLeftListener = true;
+
+            // Capture the room snapshot visible to the OnRoomLeft listener.
+            // CurrentRoom is nulled before OnRoomLeft fires so listeners that
+            // run inside this stack frame (e.g. SpawnManager.ClearAll user
+            // OnNetworkDespawn callbacks) see a coherent transitional state
+            // — neither room-A nor room-B is "current".
+            _roomManager.OnRoomLeft += () =>
+            {
+                sequence.Add("left");
+                roomVisibleInsideLeftListener = _roomManager.CurrentRoom != null;
+            };
+            _roomManager.OnRoomJoined += _ =>
+            {
+                sequence.Add("joined");
+            };
+
+            var payload = BuildJoinRoomResponseOkWithLocalId(
+                "room-B", "BCODE1", "Boss", 1, 16, true,
+                new[] { ("player-1", "Me", true, true) },
+                localPlayerId: "player-1");
+            _roomManager.HandleRoomPacket(PacketType.RoomJoin, payload);
+
+            Assert.AreEqual(2, sequence.Count, "Both OnRoomLeft and OnRoomJoined must fire.");
+            Assert.AreEqual("left",   sequence[0], "OnRoomLeft must fire first.");
+            Assert.AreEqual("joined", sequence[1], "OnRoomJoined must fire after OnRoomLeft completes.");
+            Assert.IsFalse(roomVisibleInsideLeftListener,
+                "Inside the OnRoomLeft handler CurrentRoom must be null — listeners that run " +
+                "synchronously on this stack frame (e.g. SpawnManager.ClearAll user despawn " +
+                "callbacks) must see a coherent 'between rooms' snapshot, not the stale prior room.");
+            Assert.AreEqual("room-B", _roomManager.CurrentRoom.RoomId,
+                "After both listeners run, the new room must be in place.");
+        }
+
+        [Test]
+        [Description("Rejoining the same room id (e.g. reliable retransmit echo) is idempotent — no " +
+                     "OnRoomLeft fires, OnRoomJoined fires once for the unchanged membership.")]
+        public void HandleJoinResponse_SameRoomId_DoesNotFireOnRoomLeft()
+        {
+            _currentState = NetworkState.InRoom;
+            JoinRoomAs(localPlayerId: "player-1",
+                       roomId: "room-A",
+                       players: new[] { ("player-1", "Me", true, true) });
+
+            int leftFiredCount = 0;
+            _roomManager.OnRoomLeft += () => leftFiredCount++;
+
+            var payload = BuildJoinRoomResponseOkWithLocalId(
+                "room-A", "ACODE1", "Lobby", 1, 16, true,
+                new[] { ("player-1", "Me", true, true) },
+                localPlayerId: "player-1");
+            _roomManager.HandleRoomPacket(PacketType.RoomJoin, payload);
+
+            Assert.AreEqual(0, leftFiredCount,
+                "Rejoining the same room must not raise a spurious OnRoomLeft.");
+        }
+
+        [Test]
+        [Description("First Join (no prior room) does not synthesise OnRoomLeft.")]
+        public void HandleJoinResponse_FirstJoin_DoesNotFireOnRoomLeft()
+        {
+            _currentState = NetworkState.Connected;
+            int leftFiredCount = 0;
+            _roomManager.OnRoomLeft += () => leftFiredCount++;
+
+            var payload = BuildJoinRoomResponseOkWithLocalId(
+                "room-A", "ACODE1", "Lobby", 1, 16, true,
+                new[] { ("player-1", "Me", true, true) },
+                localPlayerId: "player-1");
+            _roomManager.HandleRoomPacket(PacketType.RoomJoin, payload);
+
+            Assert.AreEqual(0, leftFiredCount,
+                "First-time join must never fire OnRoomLeft.");
+        }
+
         // ── Helpers ────────────────────────────────────────────────────────────
+
+        private void JoinRoomAs(
+            string localPlayerId,
+            (string id, string display, bool host, bool ready)[] players,
+            string roomId = "room-1",
+            string roomCode = "CODE01")
+        {
+            var payload = BuildJoinRoomResponseOkWithLocalId(
+                roomId, roomCode, "Lobby", players.Length, 16, true, players, localPlayerId);
+            _roomManager.HandleRoomPacket(PacketType.RoomJoin, payload);
+            _sentPackets.Clear();
+        }
+
+        private static byte[] BuildJoinRoomResponseOkWithLocalId(
+            string roomId, string roomCode, string name,
+            int playerCount, int maxPlayers, bool isPublic,
+            (string id, string display, bool host, bool ready)[] players,
+            string localPlayerId)
+        {
+            var ms = new SimpleStream();
+            ms.WriteByte(0x00); // msg_kind = Response
+            ms.WriteByte(1);    // ok
+            ms.WriteString(roomId);
+            ms.WriteString(roomCode);
+            ms.WriteString(name);
+            ms.WriteByte((byte)playerCount);
+            ms.WriteByte((byte)maxPlayers);
+            ms.WriteByte((byte)(isPublic ? 1 : 0));
+
+            foreach (var p in players)
+            {
+                ms.WriteString(p.id);
+                ms.WriteString(p.display);
+                ms.WriteByte((byte)(p.host ? 1 : 0));
+                ms.WriteByte((byte)(p.ready ? 1 : 0));
+            }
+
+            ms.WriteString(localPlayerId ?? string.Empty);
+            return ms.ToArray();
+        }
 
         private void SimulateRoomCreated(string roomId, string roomCode)
         {

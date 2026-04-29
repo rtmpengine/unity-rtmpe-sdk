@@ -5,15 +5,15 @@
 // and assigns each a stable FNV-1a method ID derived from "TypeName.MethodName".
 //
 // Rules for [RtmpeRpc] methods:
-//   • Must be declared on a class that inherits NetworkBehaviour.
-//   • Must be public instance methods (not static, not abstract).
-//   • Parameters must be types supported by RpcSerializer:
-//       int, float, bool, string, byte[], ulong, Vector3, Color, Quaternion,
-//       or any user-defined type implementing INetworkSerializable
-//       (recommended: small structs with a public parameterless constructor).
-//   • The FNV-1a hash of "DeclaredTypeName.MethodName" must not collide with
-//     any reserved manual method ID listed in RpcMethodId (100, 200, 300, 301,
-//     400, 401).  A collision causes a startup error via RpcRegistry.Validate().
+//  • Must be declared on a class that inherits NetworkBehaviour.
+//  • Must be public instance methods (not static, not abstract).
+//  • Parameters must be types supported by RpcSerializer:
+//      int, float, bool, string, byte[], ulong, Vector3, Color, Quaternion,
+//      or any user-defined type implementing INetworkSerializable
+//      (recommended: small structs with a public parameterless constructor).
+//  • The FNV-1a hash of "DeclaredTypeName.MethodName" must not collide with
+//    any reserved manual method ID listed in RpcMethodId (100, 200, 300, 301,
+//    400, 401).  A collision causes a startup error via RpcRegistry.Validate().
 
 using System;
 

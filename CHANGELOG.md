@@ -8,6 +8,49 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
 
 ---
 
+## [Unreleased]
+
+### Compatibility
+- `package.json` — `unity` floor lowered to `2022.3` so the package
+  installs cleanly on Unity 2022.3 LTS, 2023 LTS, and Unity 6 (6000.0+).
+  Previously the UPM resolver hard-rejected the package on every Unity
+  Editor below Unity 6, locking out studios on the dominant commercial
+  LTS branches.
+- `Runtime/Sync/RigidbodyVelocityCompat.cs` — new internal extension
+  helpers around `Rigidbody.linearVelocity` / `Rigidbody2D.linearVelocity`
+  so `NetworkRigidbody` and `NetworkRigidbody2D` compile against both
+  Unity 2022.3 / 2023 LTS (`velocity`) and Unity 6 (`linearVelocity`).
+
+### Editor
+- `Editor/EditorApiKeyStore.cs` — replaced `System.Security.Cryptography
+  .AesGcm` with the package's managed `ChaCha20Poly1305Impl`. AesGcm is
+  unavailable on Unity Editor Mono, so the old code threw
+  `TypeInitializationException` the first time a developer typed an API
+  key.
+- `Editor/EditorApiKeyStore.cs` — KEK derivation no longer mixes
+  `Application.dataPath` into the HKDF input, so renaming or moving the
+  project folder no longer silently invalidates the saved API key.
+- `Editor/SetupWizard.cs` — added a Cancel button with an unsaved-changes
+  confirmation dialog and surfaced `ApiKeyStore.Save()` failures via an
+  `EditorUtility.DisplayDialog` + in-step `HelpBox` so a storage failure
+  no longer advances the wizard past the API-key step.
+
+### Documentation
+- `README.md` — Quick Start now spells out the four-step `NetworkSettings`
+  asset prerequisite that has to happen before the first `Connect()` call.
+- `Documentation~/getting-started.md` — Unity version requirement updated
+  to reflect 2022.3 LTS / 2023 LTS support and the auto-published mirror
+  repository workflow.
+
+### CI/CD
+- `.github/workflows/publish-unity-sdk-mirror.yml` — new workflow that
+  runs `git subtree split` on the package directory and pushes the
+  resulting flat tree to `Faisalzz1/unity-rtmpe-sdk` on every push to
+  `main` that touches the package, with a `dry-run` toggle on
+  `workflow_dispatch`. Eliminates monorepo-vs-mirror drift.
+
+---
+
 ## [1.1.0] — 2026-04-22
 
 **Gameplay-readiness release — five targeted fixes that close the remaining

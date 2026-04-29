@@ -36,6 +36,17 @@ namespace RTMPE.Editor
         private bool   _testPassed;
         private bool   _networkManagerFound;
 
+        // Surface to the user when ApiKeyStore.Save() throws (OS keychain
+        // quota, IPC failure with secret-tool, etc.).  Without this the
+        // wizard would silently advance past the API-key step on a Save
+        // failure and the developer would believe their key was persisted.
+        private string _lastSaveError;
+
+        // Set whenever the user has typed input in the current session;
+        // gates the Cancel-confirmation dialog so a fresh open of the
+        // wizard does not nag about discarding nothing.
+        private bool   _hasUnsavedChanges;
+
         // ── Icons ─────────────────────────────────────────────────────────────
         private Texture2D _iconOk;
         private Texture2D _iconWarn;
@@ -73,6 +84,25 @@ namespace RTMPE.Editor
         {
             LoadSettings();
             CheckNetworkManager();
+        }
+
+        // OnDestroy fires whether the wizard closes via the Cancel button (which
+        // already prompts via TryCancel) or via Unity's window-chrome X button
+        // (which bypasses the explicit Cancel path).  By the time OnDestroy
+        // runs the window has already been retired, so a confirmation dialog
+        // is too late — instead, surface a console warning so an integrator
+        // who closes the X with unsaved edits has an unmistakable trace in
+        // the editor log.  TryCancel clears _hasUnsavedChanges before scheduling
+        // Close, so this branch only fires when the user dismissed the wizard
+        // without going through the Cancel button.
+        private void OnDestroy()
+        {
+            if (_hasUnsavedChanges)
+            {
+                Debug.LogWarning(
+                    "[RTMPE] SetupWizard closed with unsaved changes; setup is incomplete. " +
+                    "Reopen via Window > RTMPE > Setup Wizard to finish.");
+            }
         }
 
         // ── GUI ───────────────────────────────────────────────────────────────
@@ -129,16 +159,31 @@ namespace RTMPE.Editor
         private void DrawStepApiKey()
         {
             EditorGUILayout.LabelField("Gateway Configuration", EditorStyles.boldLabel);
-            _apiKey      = EditorGUILayout.TextField("API Key",       _apiKey);
+            // Render the API key as a masked password field. The on-disk
+            // store is the OS credential vault via ApiKeyStore — see
+            // SaveSettings(). Masking the GUI prevents shoulder-surfing /
+            // screen-share leaks while the wizard is open.
+            EditorGUI.BeginChangeCheck();
+            _apiKey      = EditorGUILayout.PasswordField("API Key",   _apiKey);
             _gatewayHost = EditorGUILayout.TextField("Gateway Host",  _gatewayHost);
             _gatewayPort = EditorGUILayout.IntField ("Gateway Port",  _gatewayPort);
+            if (EditorGUI.EndChangeCheck())
+                _hasUnsavedChanges = true;
+
+            // Surface any prior Save() failure right next to the input that
+            // caused it so the developer knows credential persistence failed.
+            if (!string.IsNullOrEmpty(_lastSaveError))
+                EditorGUILayout.HelpBox(_lastSaveError, MessageType.Error);
         }
 
         private void DrawStepGameType()
         {
             EditorGUILayout.LabelField("Game Type Defaults", EditorStyles.boldLabel);
+            EditorGUI.BeginChangeCheck();
             _maxPlayers = EditorGUILayout.IntSlider("Max Players", _maxPlayers, 1, 100);
             _tickRate   = EditorGUILayout.IntSlider("Tick Rate (Hz)", _tickRate, 10, 60);
+            if (EditorGUI.EndChangeCheck())
+                _hasUnsavedChanges = true;
 
             EditorGUILayout.HelpBox(
                 "These defaults are used when creating rooms at runtime.\n" +
@@ -164,6 +209,16 @@ namespace RTMPE.Editor
         {
             using (new EditorGUILayout.HorizontalScope())
             {
+                // Cancel sits left-most so it is the natural target for a
+                // "get me out of here" reflex.  Closing the window via the
+                // OS chrome alone used to silently commit whatever partial
+                // state had already been saved by a previous "Next →".
+                if (GUILayout.Button("Cancel"))
+                {
+                    if (TryCancel())
+                        return;
+                }
+
                 GUI.enabled = _step > 0;
                 if (GUILayout.Button("← Back"))  { _step--;          }
                 GUI.enabled = true;
@@ -174,19 +229,80 @@ namespace RTMPE.Editor
                 {
                     if (GUILayout.Button("Next →"))
                     {
-                        SaveSettings();
-                        _step++;
+                        if (TrySaveSettings())
+                            _step++;
                     }
                 }
                 else
                 {
                     if (GUILayout.Button("Finish"))
                     {
-                        SaveSettings();
+                        if (!TrySaveSettings())
+                            return;
                         ShowNotification(new GUIContent("RTMPE setup complete! 🎮"));
+                        // After a successful Save the wizard is in a
+                        // consistent state and the unsaved-changes guard
+                        // must not fire on the imminent Close().
+                        _hasUnsavedChanges = false;
                         EditorApplication.delayCall += Close;
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Confirm with the user (when there are unsaved edits) and close
+        /// the wizard without committing the in-memory state.  Returns
+        /// <c>true</c> when the wizard is being closed so the caller can
+        /// abort the rest of the GUI pass — Unity disposes the window on
+        /// the next event tick.
+        /// </summary>
+        private bool TryCancel()
+        {
+            if (_hasUnsavedChanges)
+            {
+                bool confirmed = EditorUtility.DisplayDialog(
+                    "Cancel RTMPE setup?",
+                    "You have unsaved changes. Closing the wizard now will " +
+                    "discard them and leave previously-saved settings " +
+                    "untouched.",
+                    "Discard changes",
+                    "Keep editing");
+                if (!confirmed) return false;
+            }
+            // Suppress the Unity "want to save?" path — Cancel always
+            // discards.  Mark dirty=false so OnDestroy / external Close
+            // cannot re-trigger the dialog.
+            _hasUnsavedChanges = false;
+            EditorApplication.delayCall += Close;
+            return true;
+        }
+
+        /// <summary>
+        /// Persist settings, surfacing any storage failure to the user
+        /// instead of silently advancing the wizard.  Returns <c>true</c>
+        /// only when persistence succeeded; the caller must not move past
+        /// the current step on <c>false</c>.
+        /// </summary>
+        private bool TrySaveSettings()
+        {
+            try
+            {
+                SaveSettings();
+                _lastSaveError = null;
+                return true;
+            }
+            catch (System.Exception ex)
+            {
+                _lastSaveError =
+                    $"Failed to save RTMPE settings: {ex.GetType().Name} — {ex.Message}";
+                EditorUtility.DisplayDialog(
+                    "RTMPE — settings not saved",
+                    _lastSaveError + "\n\nThe wizard will remain on this step " +
+                    "so you can correct the problem and retry.",
+                    "OK");
+                Repaint();
+                return false;
             }
         }
 
@@ -223,7 +339,11 @@ namespace RTMPE.Editor
 
         private void LoadSettings()
         {
-            _apiKey      = EditorPrefs.GetString("RTMPE_ApiKey",      "");
+            // API key is read from the OS credential vault (DPAPI / macOS
+            // Keychain / libsecret) via ApiKeyStore — never from plaintext
+            // EditorPrefs. ApiKeyStore.Load() also one-shot migrates any
+            // legacy plaintext entry written by older SDK versions.
+            _apiKey      = ApiKeyStore.Load();
             _gatewayHost = EditorPrefs.GetString("RTMPE_Host",        "127.0.0.1");
             _gatewayPort = EditorPrefs.GetInt   ("RTMPE_Port",        7777);
             _maxPlayers  = EditorPrefs.GetInt   ("RTMPE_MaxPlayers",  16);
@@ -232,7 +352,7 @@ namespace RTMPE.Editor
 
         private void SaveSettings()
         {
-            EditorPrefs.SetString("RTMPE_ApiKey",     _apiKey);
+            ApiKeyStore.Save(_apiKey);
             EditorPrefs.SetString("RTMPE_Host",       _gatewayHost);
             EditorPrefs.SetInt   ("RTMPE_Port",       _gatewayPort);
             EditorPrefs.SetInt   ("RTMPE_MaxPlayers", _maxPlayers);

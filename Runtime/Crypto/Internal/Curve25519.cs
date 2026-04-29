@@ -180,7 +180,19 @@ namespace RTMPE.Crypto.Internal
             x2 = finalX2;
             z2 = finalZ2;
 
-            return ToLE(FMul(x2, FInv(z2)));
+            var output = ToLE(FMul(x2, FInv(z2)));
+
+            // Wipe the clamped scalar bytes. `k` contains the X25519 private
+            // scalar (clamped per RFC 7748 §5); leaving it on the GC heap
+            // would extend the recovery window for a managed-heap dump
+            // adversary. The BigInteger field-element copies (x2/x3/z2/z3
+            // and intermediates) are immutable and cannot be wiped here —
+            // that residue is acknowledged in this file's threat-model
+            // header and bounded by the per-handshake-ephemeral lifetime
+            // of the scalar.
+            Array.Clear(k, 0, k.Length);
+
+            return output;
         }
 
         // ── Public API ───────────────────────────────────────────────────────
@@ -205,15 +217,35 @@ namespace RTMPE.Crypto.Internal
         /// <summary>
         /// Compute the X25519 shared secret from this side's private key and the peer's public key.
         /// Returns 32 bytes of shared secret material.
-        /// Returns null if the computed shared secret is the all-zero string (degenerate key).
+        /// Returns null if the computed shared secret is the all-zero string (low-order point detected).
         /// </summary>
+        /// <remarks>
+        /// All-zero rejection (RFC 7748 §6.1, last paragraph): a peer that
+        /// supplies any of the small-order u-coordinates listed in §7
+        /// causes the Montgomery ladder to output the all-zero string. An
+        /// attacker can use this to force a known shared secret and
+        /// fingerprint the session keys. The check is performed with a
+        /// constant-time accumulator so that the success/failure decision
+        /// does not branch on the secret bytes (although the secret is
+        /// already returned to the caller in the success path, so the
+        /// only secret-dependent branch eliminated here is the early-exit
+        /// in the previous implementation).
+        /// </remarks>
         internal static byte[] SharedSecret(byte[] myPrivateKey, byte[] peerPublicKey)
         {
             var result = ScalarMult(myPrivateKey, peerPublicKey);
-            // RFC 7748 requires implementations to reject the all-zero output.
-            bool allZero = true;
-            foreach (var b in result) if (b != 0) { allZero = false; break; }
-            return allZero ? null : result;
+
+            // Constant-time all-zero check.
+            int diff = 0;
+            for (int i = 0; i < result.Length; i++) diff |= result[i];
+            if (diff == 0)
+            {
+                // Wipe the (zero) buffer for hygiene and return null so the
+                // caller aborts the handshake. Cf. RFC 7748 §6.1.
+                Array.Clear(result, 0, result.Length);
+                return null;
+            }
+            return result;
         }
     }
 }

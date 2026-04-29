@@ -4,18 +4,18 @@
 // wire method IDs using FNV-1a 32-bit hashing of "TypeName.MethodName".
 //
 // Design decisions:
-//   • Lazy per-type discovery: a type's methods are scanned on first access,
-//     not at app startup.  This avoids Assembly.GetTypes() over all loaded
-//     assemblies (expensive on IL2CPP) and eliminates ordering dependencies.
-//   • Thread safety: the _cache dictionary is guarded by a lock.  Unity main-
-//     thread callers (which is the only supported call site) never contend.
-//   • Collision guard: Validate(type) checks that none of the FNV-1a hashes
-//     collide with each other or with the reserved manual RpcMethodId constants.
-//     Call Validate() from NetworkBehaviour.OnNetworkSpawn to catch problems
-//     at object spawn time rather than at first RPC invocation.
-//   • Method name uniqueness: two [RtmpeRpc] methods with the same name on the
-//     same type produce a hash collision — Validate() treats that as a fatal
-//     configuration error (not an overload system).
+//  • Lazy per-type discovery: a type's methods are scanned on first access,
+//    not at app startup.  This avoids Assembly.GetTypes() over all loaded
+//    assemblies (expensive on IL2CPP) and eliminates ordering dependencies.
+//  • Thread safety: the _cache dictionary is guarded by a lock.  Unity main-
+//    thread callers (which is the only supported call site) never contend.
+//  • Collision guard: Validate(type) checks that none of the FNV-1a hashes
+//    collide with each other or with the reserved manual RpcMethodId constants.
+//    Call Validate() from NetworkBehaviour.OnNetworkSpawn to catch problems
+//    at object spawn time rather than at first RPC invocation.
+//  • Method name uniqueness: two [RtmpeRpc] methods with the same name on the
+//    same type produce a hash collision — Validate() treats that as a fatal
+//    configuration error (not an overload system).
 
 using System;
 using System.Collections.Generic;

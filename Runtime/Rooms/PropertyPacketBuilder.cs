@@ -2,8 +2,8 @@
 //
 // Builds the payload bytes for custom property packets:
 //
-//   RoomPropertyUpdate   (0x24): client → server → all room clients
-//   PlayerPropertyUpdate (0x25): client → server → all room clients
+//  RoomPropertyUpdate   (0x24): client → server → all room clients
+//  PlayerPropertyUpdate (0x25): client → server → all room clients
 //
 // Payload encoding is UTF-8 JSON (not binary), matching the Room Service's
 // existing `json.Unmarshal(envelope.Payload, &payload)` handler contract.
@@ -105,60 +105,201 @@ namespace RTMPE.Rooms
             }
         }
 
-        // ─── Probe keys reserved for EnsureValueWithinLimit ──────────────
-        //
-        // Two single-key probe payloads measure (a) the "framing" byte count
-        // (version + properties + type wrapper) and (b) the same framing
-        // plus a specific value.  Their difference is the exact UTF-8
-        // byte count of the serialised value — independent of char vs.
-        // multi-byte concerns that plagued an earlier approach that used
-        // string.Length (UTF-16 code units) instead of Encoding.UTF8 byte
-        // count.  The probe key ("_P") is inert at MaxPropertyKeyBytes so
-        // it contributes a constant to both measurements.
-        private const string ProbeKey = "_P";
-
         /// <summary>
-        /// Enforces the 512-byte value cap by measuring the value's exact
-        /// UTF-8 byte count in the canonical JSON encoding — which is the
-        /// authoritative size observed on the wire.
-        ///
-        /// Implementation detail: we compute the byte size of the entire
-        /// canonical encoding twice — once with the probe value, once with
-        /// a tiny int sentinel — and subtract the framing overhead, leaving
-        /// the precise UTF-8 size of the value tuple.  This is O(1) in
-        /// allocations and avoids the earlier string.Length heuristic that
-        /// silently accepted multi-byte payloads over the limit.
+        /// Enforces the 512-byte value cap by ESTIMATING the value tuple's
+        /// UTF-8 byte count without re-serialising the whole payload.  The
+        /// previous implementation called <c>EncodeRoomPayload</c> twice per
+        /// property (baseline + probed) — quadratic in dictionary size when
+        /// validating a 50-key update (100 full encodings).  The estimator
+        /// here mirrors <c>PropertyJson</c>'s formatting so the result is
+        /// exact (not heuristic) and is computed in O(value_size) without
+        /// allocating a probe dictionary.
         /// </summary>
         private static void EnsureValueWithinLimit(string key, PropertyValue v)
         {
-            // Framing baseline: same key, trivial (1-byte) value.
-            var baseline = new Dictionary<string, PropertyValue>(1)
-            {
-                { ProbeKey, PropertyValue.OfInt(0) },
-            };
-            int baselineBytes = Encoding.UTF8.GetByteCount(
-                PropertyJson.EncodeRoomPayload(1, baseline));
-
-            // With the actual value substituted under the same key.
-            var probed = new Dictionary<string, PropertyValue>(1)
-            {
-                { ProbeKey, v },
-            };
-            int probedBytes = Encoding.UTF8.GetByteCount(
-                PropertyJson.EncodeRoomPayload(1, probed));
-
-            // The baseline encodes `{"type":"int","value":0}` for the inner
-            // `value` tuple (23 bytes).  Subtracting that constant yields
-            // the exact UTF-8 byte size of the value+type tuple we are
-            // limiting.  Using a constant avoids parsing the probe output.
-            const int baselineValueTupleBytes = 23; // strlen({"type":"int","value":0})
-            int valueTupleBytes = probedBytes - baselineBytes + baselineValueTupleBytes;
-
+            int valueTupleBytes = PropertyJsonSizing.EstimateValueTupleBytes(v);
             if (valueTupleBytes > PropertyLimits.MaxValueBytes)
                 throw new ArgumentException(
                     $"Property '{key}' value exceeds max {PropertyLimits.MaxValueBytes} UTF-8 bytes "
                     + $"(measured {valueTupleBytes}).",
                     nameof(v));
+        }
+    }
+
+    /// <summary>
+    /// Internal sizing helper.  Mirrors the formatting decisions made by
+    /// <see cref="PropertyJson"/> so the byte count returned here matches
+    /// the byte count of the actual encoded payload exactly (no slack
+    /// margin).  The encoder and the estimator MUST be updated together —
+    /// any divergence would let a too-large value slip past validation
+    /// or reject a legal value at the boundary.
+    /// </summary>
+    internal static class PropertyJsonSizing
+    {
+        /// <summary>
+        /// Returns the UTF-8 byte count of the canonical JSON encoding of
+        /// <c>{"type":"&lt;tag&gt;","value":&lt;value&gt;}</c> for the
+        /// supplied <paramref name="v"/> — i.e. the inner tuple wrapped
+        /// around each property's value in the wire payload.
+        /// </summary>
+        internal static int EstimateValueTupleBytes(PropertyValue v)
+        {
+            // Fixed framing of the {"type":"<T>","value":<V>} wrapper:
+            //     `{`        →  1
+            //     `"type":"` →  8
+            //     <T>        →  T
+            //     `","value":` → 10
+            //     <V>        →  V
+            //     `}`        →  1
+            //   Total = 20 + T + V.
+            int typeTagLen = TagFor(v.Type).Length;
+            int valueChars = ValueByteCount(v);
+            return 20 + typeTagLen + valueChars;
+        }
+
+        private static string TagFor(PropertyType t)
+        {
+            switch (t)
+            {
+                case PropertyType.Int:     return PropertyJson.TagInt;
+                case PropertyType.Float:   return PropertyJson.TagFloat;
+                case PropertyType.Bool:    return PropertyJson.TagBool;
+                case PropertyType.String:  return PropertyJson.TagString;
+                case PropertyType.Bytes:   return PropertyJson.TagBytes;
+                case PropertyType.Vector3: return PropertyJson.TagVector3;
+                case PropertyType.Color:   return PropertyJson.TagColor;
+                default: throw new InvalidOperationException($"Unknown PropertyType: {t}");
+            }
+        }
+
+        /// <summary>
+        /// UTF-8 byte count of the JSON encoding of the value alone (without
+        /// the `"value":` key prefix or surrounding tuple braces).  Mirrors
+        /// <see cref="PropertyJson.AppendValue"/> exactly.
+        /// </summary>
+        private static int ValueByteCount(PropertyValue v)
+        {
+            switch (v.Type)
+            {
+                case PropertyType.Int:
+                    return v.AsInt().ToString(System.Globalization.CultureInfo.InvariantCulture).Length;
+
+                case PropertyType.Float:
+                    // Round-trip "R" formatting matches PropertyJson exactly;
+                    // ASCII-only, so .Length == UTF-8 byte count.
+                    return v.AsFloat().ToString("R", System.Globalization.CultureInfo.InvariantCulture).Length;
+
+                case PropertyType.Bool:
+                    return v.AsBool() ? 4 /* true */ : 5 /* false */;
+
+                case PropertyType.String:
+                    {
+                        // Two surrounding quotes plus the JSON-escaped UTF-8
+                        // body — escape rules MUST match PropertyJson.AppendJsonString.
+                        var s = v.AsString();
+                        return 2 + EscapedJsonStringByteCount(s);
+                    }
+
+                case PropertyType.Bytes:
+                    {
+                        // Base64: 4 chars per 3 input bytes, padded.  Two
+                        // surrounding quotes added on top.  Base64 is ASCII so
+                        // char count == byte count.
+                        int n = v.AsBytesReadOnly().Length;
+                        return 2 + ((n + 2) / 3) * 4;
+                    }
+
+                case PropertyType.Vector3:
+                    {
+                        var vec = v.AsVector3();
+                        // [x,y,z]  — three R-formatted floats, two commas, two brackets.
+                        int len = 2 /* [] */ + 2 /* commas */;
+                        len += vec.x.ToString("R", System.Globalization.CultureInfo.InvariantCulture).Length;
+                        len += vec.y.ToString("R", System.Globalization.CultureInfo.InvariantCulture).Length;
+                        len += vec.z.ToString("R", System.Globalization.CultureInfo.InvariantCulture).Length;
+                        return len;
+                    }
+
+                case PropertyType.Color:
+                    {
+                        var c = v.AsColor();
+                        int len = 2 /* [] */ + 3 /* commas */;
+                        len += c.r.ToString("R", System.Globalization.CultureInfo.InvariantCulture).Length;
+                        len += c.g.ToString("R", System.Globalization.CultureInfo.InvariantCulture).Length;
+                        len += c.b.ToString("R", System.Globalization.CultureInfo.InvariantCulture).Length;
+                        len += c.a.ToString("R", System.Globalization.CultureInfo.InvariantCulture).Length;
+                        return len;
+                    }
+
+                default:
+                    throw new InvalidOperationException($"Unknown PropertyType: {v.Type}");
+            }
+        }
+
+        /// <summary>
+        /// UTF-8 byte count of the JSON-escaped string body (excluding the
+        /// surrounding quotes).  Replicates the escape decisions made by
+        /// <see cref="PropertyJson.AppendJsonString"/>.
+        /// </summary>
+        private static int EscapedJsonStringByteCount(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return 0;
+            int total = 0;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                switch (c)
+                {
+                    case '"':
+                    case '\\':
+                    case '\b':
+                    case '\f':
+                    case '\n':
+                    case '\r':
+                    case '\t':
+                        total += 2;  // backslash escape
+                        break;
+                    default:
+                        if (c < 0x20)
+                        {
+                            total += 6;  // \uXXXX
+                        }
+                        else
+                        {
+                            // Multi-byte UTF-8 widths.  Mirror System.Text.Encoding.UTF8
+                            // exactly:
+                            //   U+0000..U+007F    →  1 byte
+                            //   U+0080..U+07FF    →  2 bytes
+                            //   U+0800..U+FFFF    →  3 bytes
+                            //   U+10000..U+10FFFF →  4 bytes (surrogate pair)
+                            if (c < 0x80)
+                            {
+                                total += 1;
+                            }
+                            else if (c < 0x800)
+                            {
+                                total += 2;
+                            }
+                            else if (char.IsHighSurrogate(c)
+                                && i + 1 < s.Length
+                                && char.IsLowSurrogate(s[i + 1]))
+                            {
+                                // Surrogate pair = single Unicode scalar in
+                                // the supplementary plane → 4 UTF-8 bytes.
+                                total += 4;
+                                i++;
+                            }
+                            else
+                            {
+                                // BMP (or unpaired surrogate, which UTF-8
+                                // emitter encodes as 3-byte replacement).
+                                total += 3;
+                            }
+                        }
+                        break;
+                }
+            }
+            return total;
         }
     }
 }

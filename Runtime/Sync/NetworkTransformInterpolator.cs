@@ -3,31 +3,31 @@
 // Buffered interpolation for smooth movement of non-owner networked objects.
 //
 // Design decisions:
-//   • Extends MonoBehaviour so Update() fires automatically on the main thread.
-//   • Owner-only suppression: AddState() and Update() are both valid on any
-//     client, but by convention only non-owner clients call AddState().  The
-//     owning client uses NetworkTransform.Update() to SEND; the interpolator
-//     is wired to RECEIVE via NetworkManager.OnDataReceived.
-//   • Timestamping uses Time.timeAsDouble (local monotonic clock) at the moment
-//     of receipt — no network time-synchronisation required at this stage.
-//     The render cursor is Time.timeAsDouble - _interpolationDelay, giving a
-//     stable 100 ms window in which to always find a from/to state pair.
-//   • Timestamping uses Time.timeAsDouble (local monotonic clock) for
-//     high-resolution, non-rewinding time values suitable for sub-frame math.
-//   • AddState() accepts a typed TransformState snapshot so that position,
-//     rotation, and scale are always transported together without extra copies.
-//   • Division-by-zero is guarded when two states share the same timestamp
-//     (packets decoded in the same frame): the from-state is returned as-is.
-//   • Quaternion.Slerp is used directly for rotation; Unity already selects
-//     the shortest arc internally.
-//   • No per-frame heap allocations: internal storage is a pre-allocated List<T>
-//     used as a ring buffer; Update() accesses elements by index.
-//   • Settings are [SerializeField] fields on the component (Unity convention),
-//     keeping Inspector integration straightforward.
-//   • Default buffer size of 10 provides ~7 states of margin over the minimum
-//     2-state requirement at 30 Hz + 100 ms delay (~720 B total).
-//   • Scale interpolation is opt-in (_interpolateScale = false by default)
-//     matching the NetworkTransform default of not syncing scale.
+//  • Extends MonoBehaviour so Update() fires automatically on the main thread.
+//  • Owner-only suppression: AddState() and Update() are both valid on any
+//    client, but by convention only non-owner clients call AddState().  The
+//    owning client uses NetworkTransform.Update() to SEND; the interpolator
+//    is wired to RECEIVE via NetworkManager.OnDataReceived.
+//  • Timestamping uses Time.timeAsDouble (local monotonic clock) at the moment
+//    of receipt — no network time-synchronisation required at this stage.
+//    The render cursor is Time.timeAsDouble - _interpolationDelay, giving a
+//    stable 100 ms window in which to always find a from/to state pair.
+//  • Timestamping uses Time.timeAsDouble (local monotonic clock) for
+//    high-resolution, non-rewinding time values suitable for sub-frame math.
+//  • AddState() accepts a typed TransformState snapshot so that position,
+//    rotation, and scale are always transported together without extra copies.
+//  • Division-by-zero is guarded when two states share the same timestamp
+//    (packets decoded in the same frame): the from-state is returned as-is.
+//  • Quaternion.Slerp is used directly for rotation; Unity already selects
+//    the shortest arc internally.
+//  • No per-frame heap allocations: internal storage is a pre-allocated List<T>
+//    used as a ring buffer; Update() accesses elements by index.
+//  • Settings are [SerializeField] fields on the component (Unity convention),
+//    keeping Inspector integration straightforward.
+//  • Default buffer size of 10 provides ~7 states of margin over the minimum
+//    2-state requirement at 30 Hz + 100 ms delay (~720 B total).
+//  • Scale interpolation is opt-in (_interpolateScale = false by default)
+//    matching the NetworkTransform default of not syncing scale.
 //
 // Threading: all public methods and Update() run on the Unity main thread.
 // TryInterpolate(double) is pure logic and testable without a Unity scene.
@@ -41,7 +41,7 @@ namespace RTMPE.Sync
     /// Buffers server-received <see cref="TransformState"/> snapshots and applies
     /// smooth interpolated movement to this <see cref="GameObject"/> each frame.
     ///
-    /// Add to any networked prefab alongside <see cref="NetworkTransform"/>.
+   /// Add to any networked prefab alongside <see cref="NetworkTransform"/>.
     /// Call <see cref="AddState"/> whenever a <c>StateDelta</c> is decoded for
     /// this object (typically wired to <c>NetworkManager.OnDataReceived</c>).
     /// </summary>
@@ -63,6 +63,14 @@ namespace RTMPE.Sync
         [Tooltip("Also interpolate local-space scale.  Disabled by default to match " +
                  "NetworkTransform._syncScale = false.")]
         [SerializeField] private bool _interpolateScale = false;
+
+        [Tooltip("Hard upper bound on accepted timestamps (seconds).  Defends " +
+                 "the interpolator against a hostile or buggy sender that puts " +
+                 "double.MaxValue (or any far-future value) into the timestamp " +
+                 "field — which would otherwise permanently freeze the buffer " +
+                 "because no subsequent timestamp could ever be greater. " +
+                 "24 hours of session time covers any realistic playback.")]
+        [SerializeField] private double _maxAcceptableTimestamp = 24.0 * 60.0 * 60.0;
 
         // ── Buffer state ───────────────────────────────────────────────────────
 
@@ -86,6 +94,58 @@ namespace RTMPE.Sync
         // smaller timestamp are discarded to maintain chronological buffer order
         // despite out-of-order UDP delivery or duplicate packets.
         private double _latestTimestamp = double.MinValue;
+
+        // ── Sender-clock alignment ─────────────────────────────────────────────
+        //
+        // The receiver-clock AddState path (above) timestamps each snapshot at
+        // the moment the packet leaves the network thread.  Under jitter that
+        // collapses sender intervals: two snapshots produced 33 ms apart on
+        // the server can land 5 ms apart on the receiver, and the interpolation
+        // segment between them runs 6× faster than the underlying motion.
+        //
+        // The sender-tick AddState overload below converts the wire tick into
+        // a sender-domain timestamp, then offsets it into receiver wall-clock
+        // space using a low-pass filter on the (receiver_now - sender_time)
+        // delta.  States separated by N sender ticks remain N × tickInterval
+        // apart in the buffer regardless of network jitter.  This is the same
+        // pattern Quake3 / Source / Overwatch use for their snapshot streams.
+        //
+        // The offset is a single double accumulator updated as an exponential
+        // moving average: offset := offset + alpha * (sample - offset).  Alpha
+        // is chosen so the filter has a ~1 s time constant at 30 Hz (alpha ≈
+        // 0.033), which absorbs single-packet jitter without lagging through a
+        // genuine clock skew that develops over seconds.
+        private double _clockOffset;        // receiver_now - sender_time, EMA
+        private bool   _hasClockOffset;     // false until the first tick sample
+        private const double ClockOffsetAlpha = 1.0 / 30.0;
+
+        // Highest sender tick observed, for wrap-safe out-of-order rejection.
+        // Mirrors the modular arithmetic used by InputBuffer / NetworkVariable
+        // so the whole SDK observes one wrap discipline.
+        private uint _latestSenderTick;
+        private bool _hasSenderTick;
+
+        // Cursor hint for the bracketing-pair search in TryInterpolate.
+        // Remote timestamps are monotonic by construction (AddState rejects
+        // out-of-order writes; AddStateFromSenderTick filters via wrap-safe
+        // sender-tick gating) and the per-frame render time advances
+        // monotonically with Time.timeAsDouble — together this makes the
+        // search amortised O(1) via a logical-index cursor that only ever
+        // advances forward.  Without the cursor the inner loop walks every
+        // sample under the lock on every Update; at 5 000 networked objects
+        // and a 64-cap ring this is hundreds of thousands of lock-protected
+        // index reads per frame.
+        //
+        // _bracketCursor is a LOGICAL index relative to _head (i.e. 0 = oldest
+        // valid entry).  It is reset to 0 whenever the buffer is cleared, the
+        // ring head wraps past it (overwrite of the slot it points at), or an
+        // out-of-order sample lands at or below the cursor's left edge — any
+        // of which would otherwise let the search return a stale pair.
+        private int _bracketCursor;
+        // Tracks whether a Configure / Clear has invalidated the cursor since
+        // the last successful search; used to skip the optimistic "start from
+        // _bracketCursor" path until the buffer is repopulated.
+        private bool _bracketCursorValid;
 
         // Lock guarding all ring-buffer mutations and reads (_buffer, _head,
         // _latestTimestamp).  The SDK convention routes packet callbacks through
@@ -126,7 +186,7 @@ namespace RTMPE.Sync
         /// Call this on the main thread when a <c>StateDelta</c> is decoded for
         /// this object ID.
         ///
-        /// <paramref name="timestamp"/> should be <c>Time.timeAsDouble</c> at the
+       /// <paramref name="timestamp"/> should be <c>Time.timeAsDouble</c> at the
         /// moment the packet was received so that the interpolation cursor
         /// (<c>Time.timeAsDouble - _interpolationDelay</c>) can locate a
         /// surrounding pair.
@@ -137,6 +197,15 @@ namespace RTMPE.Sync
         /// </param>
         public void AddState(TransformState state, double timestamp)
         {
+            // Reject non-finite (NaN, +Inf, -Inf) and absurd far-future
+            // timestamps at the entry point.  A double.MaxValue payload would
+            // otherwise lock the buffer permanently — any subsequent legitimate
+            // timestamp would compare strictly less than _latestTimestamp and
+            // be silently dropped.  The interpolator has its own ingress
+            // independent of the InputPayload parser and needs the same gate.
+            if (!double.IsFinite(timestamp) || timestamp >= _maxAcceptableTimestamp)
+                return;
+
             lock (_syncRoot)
             {
                 // Discard out-of-order and duplicate states — only strictly newer
@@ -156,7 +225,142 @@ namespace RTMPE.Sync
                     // Overwrite the oldest slot and advance the ring head.
                     _buffer[_head] = new TimestampedState { Timestamp = timestamp, State = state };
                     _head = (_head + 1) % _bufferSize;
+                    // The slot the cursor points at may have just been
+                    // overwritten by the new write, and the entire logical
+                    // window shifted left by one.  Pull the cursor in by one
+                    // step (clamped at zero) so the next search resumes at a
+                    // still-valid position rather than walking off the new
+                    // oldest entry.
+                    if (_bracketCursorValid)
+                    {
+                        _bracketCursor = _bracketCursor > 0 ? _bracketCursor - 1 : 0;
+                    }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Enqueue a snapshot stamped by the sender's tick number.  The wire
+        /// tick is mapped into receiver wall-clock space via an exponentially-
+        /// smoothed clock-offset estimator so jitter on the receive path does
+        /// not collapse the inter-snapshot interval the interpolator sees.
+        ///
+        /// <para>Out-of-order rejection uses 32-bit modular sequence-number
+        /// arithmetic (RFC 1982 §3.2): a tick is accepted iff
+        /// <c>(int)(senderTick - latestSenderTick) &gt; 0</c> after the first
+        /// sample.  This is the same wrap discipline used by
+        /// <c>InputBuffer</c> and <c>NetworkVariable</c> so a uint32 wrap that
+        /// happens mid-session does not silently freeze the buffer.</para>
+        ///
+        /// <para><paramref name="receiverNow"/> should be
+        /// <c>Time.timeAsDouble</c> at receive time so the clock-offset
+        /// estimator stays anchored to the same render-cursor clock that
+        /// <see cref="Update"/> reads.</para>
+        ///
+        /// <para><paramref name="tickIntervalSeconds"/> is the sender's
+        /// tick period (<c>1 / tickRate</c>); reading
+        /// <c>NetworkSettings.TickInterval</c> on the call site keeps the SDK
+        /// to a single source of truth for the tick rate.</para>
+        /// </summary>
+        public void AddStateFromSenderTick(
+            TransformState state,
+            uint           senderTick,
+            double         receiverNow,
+            double         tickIntervalSeconds)
+        {
+            // Reject pathological tick interval values defensively — a zero
+            // or negative interval would map every tick to the same sender
+            // time, collapsing the buffer.  A non-finite value is also a
+            // protocol bug we do not propagate.
+            if (!double.IsFinite(receiverNow)
+                || !double.IsFinite(tickIntervalSeconds)
+                || tickIntervalSeconds <= 0.0)
+                return;
+
+            lock (_syncRoot)
+            {
+                // ── Wrap-safe out-of-order check ─────────────────────────────
+                // Signed-difference comparison treats two unsigned values as
+                // "near" on the 32-bit ring when the gap is < 2^31; any
+                // realistic gameplay backlog (a few hundred ticks at most) is
+                // orders of magnitude below that threshold.
+                if (_hasSenderTick && (int)(senderTick - _latestSenderTick) <= 0)
+                    return;
+
+                // ── Sender-domain timestamp ──────────────────────────────────
+                // Promote tick to double BEFORE multiplying so a tick close
+                // to uint.MaxValue does not overflow during the conversion.
+                double senderTime = (double)senderTick * tickIntervalSeconds;
+
+                // ── Clock-offset EMA ─────────────────────────────────────────
+                // Sample = receiver_now - sender_time.  Initial sample is
+                // adopted directly (no warm-up bias); subsequent samples are
+                // low-pass filtered with ClockOffsetAlpha so a single jittery
+                // packet does not yank the render cursor.
+                double sample = receiverNow - senderTime;
+                if (!_hasClockOffset)
+                {
+                    _clockOffset    = sample;
+                    _hasClockOffset = true;
+                }
+                else
+                {
+                    _clockOffset += ClockOffsetAlpha * (sample - _clockOffset);
+                }
+
+                // Stored timestamp lives in the receiver wall-clock domain so
+                // the existing TryInterpolate(renderTime) path — which reads
+                // Time.timeAsDouble - delay — needs no changes.
+                double timestamp = senderTime + _clockOffset;
+
+                // The interpolator's AddState(state, timestamp) path enforces
+                // strict monotonic timestamps; the sender-tick path enforces
+                // strict monotonic ticks instead.  Persist the high-water
+                // tick FIRST so a duplicate timestamp (rare under EMA) does
+                // not block subsequent tick-strict-greater states.
+                _latestSenderTick = senderTick;
+                _hasSenderTick    = true;
+
+                // Bypass the per-timestamp monotonicity guard inside
+                // AddState — the sender-tick guard above is the authoritative
+                // ordering signal here.  Inline the buffer push so two
+                // adjacent ticks whose receiver-domain timestamps round to
+                // the same EMA value do not silently drop the second.
+                if (!double.IsFinite(timestamp) || timestamp >= _maxAcceptableTimestamp)
+                    return;
+
+                // Track the highest stored timestamp so a later receiver-clock
+                // AddState() call (mixed-mode integration) cannot insert an
+                // older state in front of the sender-tick ordering.
+                if (timestamp > _latestTimestamp) _latestTimestamp = timestamp;
+
+                if (_buffer.Count < _bufferSize)
+                {
+                    _buffer.Add(new TimestampedState { Timestamp = timestamp, State = state });
+                }
+                else
+                {
+                    _buffer[_head] = new TimestampedState { Timestamp = timestamp, State = state };
+                    _head = (_head + 1) % _bufferSize;
+                    if (_bracketCursorValid)
+                    {
+                        _bracketCursor = _bracketCursor > 0 ? _bracketCursor - 1 : 0;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Current sender-clock offset estimate (receiver_now - sender_time).
+        /// Exposed for diagnostics and unit tests; converges to a stable value
+        /// after a few seconds of streaming snapshots.
+        /// </summary>
+        internal double ClockOffsetEstimate
+        {
+            get
+            {
+                lock (_syncRoot)
+                    return _hasClockOffset ? _clockOffset : 0.0;
             }
         }
 
@@ -164,7 +368,7 @@ namespace RTMPE.Sync
         /// Core interpolation logic — pure function, separated from the Unity
         /// frame callback for deterministic unit testing.
         ///
-        /// Searches the delay buffer for the pair of states that bracket
+       /// Searches the delay buffer for the pair of states that bracket
         /// <paramref name="renderTime"/> and returns the linearly/spherically
         /// interpolated result.
         /// </summary>
@@ -179,9 +383,9 @@ namespace RTMPE.Sync
         /// <see langword="true"/> when a valid interpolated state was produced.
         /// <see langword="false"/> when:
         /// <list type="bullet">
-        ///   <item>The buffer has fewer than 2 states.</item>
-        ///   <item><paramref name="renderTime"/> is before the oldest buffered state.</item>
-        ///   <item><paramref name="renderTime"/> is after the newest buffered state.</item>
+        ///  <item>The buffer has fewer than 2 states.</item>
+        ///  <item><paramref name="renderTime"/> is before the oldest buffered state.</item>
+        ///  <item><paramref name="renderTime"/> is after the newest buffered state.</item>
         /// </list>
         /// The caller (e.g. <see cref="Update"/>) should be a no-op on false.
         /// </returns>
@@ -201,12 +405,33 @@ namespace RTMPE.Sync
                 if (_buffer.Count < 2) return false;
 
                 // With the ring buffer, states are stored in logical order starting at
-                // _head.  A helper that reads logical index i maps to physical:
-                //   physical = (_head + i) % _buffer.Count.
-                // Walk forward (oldest → newest) to find the bracketing pair.
+                // _head.  Logical index i maps to physical (_head + i) % count.
+                //
+                // Monotonic remote timestamps make the bracketing-pair search
+                // amortised O(1) via a cursor that advances with render time;
+                // resetting on reset / older-than-cursor samples preserves
+                // correctness when streams restart.  Without this hint the
+                // inner loop is O(N) under the lock per frame per object,
+                // which under interest-managed broadcast scales to hundreds
+                // of thousands of lock-protected reads at fleet scale.
                 int count = _buffer.Count;
+
+                // If the cursor is stale (Clear / ConfigureForTest / first
+                // call after spawn) start from logical index 0 and rebuild.
+                int start = _bracketCursorValid ? _bracketCursor : 0;
+                if (start > count - 2) start = 0; // ring shrank under us
                 int fromIndex = -1;
-                for (int i = 0; i < count - 1; i++)
+
+                // Adversarial guard: if renderTime is older than the cursor's
+                // left edge (a legitimate clock rewind, or a fresh stream
+                // arriving with smaller sender-tick timestamps that the EMA
+                // mapped behind the cursor), restart at logical 0 so the
+                // search can still locate a valid pair.  Without this the
+                // forward walk would never revisit the older window.
+                int startPhys = (_head + start) % count;
+                if (_buffer[startPhys].Timestamp > renderTime) start = 0;
+
+                for (int i = start; i < count - 1; i++)
                 {
                     int iA = (_head + i)     % count;
                     int iB = (_head + i + 1) % count;
@@ -219,6 +444,9 @@ namespace RTMPE.Sync
 
                 // renderTime is outside the buffered range — no interpolation possible.
                 if (fromIndex < 0) return false;
+
+                _bracketCursor      = fromIndex;
+                _bracketCursorValid = true;
 
                 int physFrom = (_head + fromIndex)     % count;
                 int physTo   = (_head + fromIndex + 1) % count;
@@ -282,7 +510,7 @@ namespace RTMPE.Sync
 
         // ── Test seam ─────────────────────────────────────────────────────────
         //
-        // ConfigureForTest allows unit tests to set the buffer parameters without
+       // ConfigureForTest allows unit tests to set the buffer parameters without
         // going through Unity serialisation.  Accessible via InternalsVisibleTo.
 
         /// <summary>
@@ -293,21 +521,33 @@ namespace RTMPE.Sync
         /// <param name="interpolationDelay">Seconds behind real-time to render.</param>
         /// <param name="interpolateScale">Whether scale is interpolated.</param>
         internal void ConfigureForTest(
-            int   bufferSize         = 10,
-            float interpolationDelay = 0.1f,
-            bool  interpolateScale   = false)
+            int    bufferSize             = 10,
+            float  interpolationDelay     = 0.1f,
+            bool   interpolateScale       = false,
+            double maxAcceptableTimestamp = 24.0 * 60.0 * 60.0)
         {
             lock (_syncRoot)
             {
-                _bufferSize          = bufferSize;
-                _interpolationDelay  = interpolationDelay;
-                _interpolateScale    = interpolateScale;
+                _bufferSize             = bufferSize;
+                _interpolationDelay     = interpolationDelay;
+                _interpolateScale       = interpolateScale;
+                _maxAcceptableTimestamp = maxAcceptableTimestamp;
                 // Reset ring-buffer state for a consistent starting condition.
                 _buffer.Clear();
                 _head = 0;
                 // Reset the high-water timestamp so subsequent AddState calls
                 // with small timestamps (test vectors) are not silently dropped.
                 _latestTimestamp = double.MinValue;
+                // Bracketing-pair cursor is paired to the live buffer; a fresh
+                // fixture must restart the search at logical index 0.
+                _bracketCursor      = 0;
+                _bracketCursorValid = false;
+                // Sender-clock estimator state: a fresh fixture must start
+                // without any inherited tick / offset bias.
+                _hasSenderTick   = false;
+                _latestSenderTick = 0u;
+                _hasClockOffset  = false;
+                _clockOffset     = 0.0;
             }
         }
     }

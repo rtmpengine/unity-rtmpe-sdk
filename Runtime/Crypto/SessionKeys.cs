@@ -22,12 +22,12 @@ namespace RTMPE.Crypto
     /// A pair of 32-byte ChaCha20-Poly1305 session keys derived from a single
     /// ECDH shared secret via HKDF-SHA256.
     ///
-    /// <list type="bullet">
-    ///   <item><term><see cref="EncryptKey"/></term><description>Key used to seal outbound packets.</description></item>
-    ///   <item><term><see cref="DecryptKey"/></term><description>Key used to open inbound packets.</description></item>
+   /// <list type="bullet">
+    ///  <item><term><see cref="EncryptKey"/></term><description>Key used to seal outbound packets.</description></item>
+    ///  <item><term><see cref="DecryptKey"/></term><description>Key used to open inbound packets.</description></item>
     /// </list>
     ///
-    /// Dispose this object when the session ends to zero key material.
+   /// Dispose this object when the session ends to zero key material.
     /// </summary>
     public sealed class SessionKeys : IDisposable
     {

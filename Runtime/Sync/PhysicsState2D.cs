@@ -4,13 +4,13 @@
 // network by NetworkRigidbody2D.
 //
 // Design decisions:
-//   • Uses Vector2 for position/velocity (XY plane only).
-//   • Rotation is a single float (Z-axis angle in degrees).
-//     Matches Rigidbody2D.rotation which Unity exposes in degrees.
-//   • AngularVelocity is a single float (degrees/second).
-//     Matches Rigidbody2D.angularVelocity which Unity also exposes in deg/s.
-//   • IsSleeping mirrors the 3-D convention; Rigidbody2D.IsSleeping() is the
-//     corresponding Unity API call.
+//  • Uses Vector2 for position/velocity (XY plane only).
+//  • Rotation is a single float (Z-axis angle in degrees).
+//    Matches Rigidbody2D.rotation which Unity exposes in degrees.
+//  • AngularVelocity is a single float (degrees/second).
+//    Matches Rigidbody2D.angularVelocity which Unity also exposes in deg/s.
+//  • IsSleeping mirrors the 3-D convention; Rigidbody2D.IsSleeping() is the
+//    corresponding Unity API call.
 
 using UnityEngine;
 

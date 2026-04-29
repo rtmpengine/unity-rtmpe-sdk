@@ -7,20 +7,20 @@
 // Wire formats (all little-endian):
 //
 // ── RoomCreate (0x20) Client → Server ──────────────────────────────────────
-//   [name_len:2 LE][name:N UTF-8]
-//   [max_players:1]
-//   [is_public:1]
+//  [name_len:2 LE][name:N UTF-8]
+//  [max_players:1]
+//  [is_public:1]
 //
 // ── RoomJoin (0x21) Client → Server ────────────────────────────────────────
-//   [room_id_len:2 LE][room_id:N UTF-8]           (empty if joining by code)
-//   [room_code_len:2 LE][room_code:N UTF-8]       (empty if joining by ID)
-//   [display_name_len:2 LE][display_name:N UTF-8]
+//  [room_id_len:2 LE][room_id:N UTF-8]           (empty if joining by code)
+//  [room_code_len:2 LE][room_code:N UTF-8]       (empty if joining by ID)
+//  [display_name_len:2 LE][display_name:N UTF-8]
 //
 // ── RoomLeave (0x22) Client → Server ───────────────────────────────────────
-//   (empty payload — server identifies player by session)
+//  (empty payload — server identifies player by session)
 //
 // ── RoomList (0x23) Client → Server ────────────────────────────────────────
-//   [public_only:1]
+//  [public_only:1]
 
 using System;
 using System.Text;
@@ -82,7 +82,7 @@ namespace RTMPE.Rooms
             byte[] displayNameBytes = SafeEncodeUtf8(options.DisplayName, MaxDisplayNameBytes);
 
             // Layout: [room_id_len:2][room_id:N][room_code_len:2][room_code:N]
-            //         [display_name_len:2][display_name:N]
+            //        [display_name_len:2][display_name:N]
             int size = 2 + roomIdBytes.Length
                      + 2 + roomCodeBytes.Length
                      + 2 + displayNameBytes.Length;

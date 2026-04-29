@@ -2,6 +2,8 @@
 //
 // Carries the server reply from a MatchmakingResponse (0x2B) packet.
 
+using RTMPE.Core;
+
 namespace RTMPE.Rooms
 {
     /// <summary>
@@ -29,5 +31,13 @@ namespace RTMPE.Rooms
             RoomCode = roomCode ?? string.Empty;
             Created  = created;
         }
+
+        /// <summary>
+        /// Diagnostic <see cref="ToString"/> override that redacts the invite
+        /// <see cref="RoomCode"/>.  RoomId is retained because it is opaque
+        /// (server-generated UUID, useless for unauthorised joins).
+        /// </summary>
+        public override string ToString()
+            => $"MatchmakingResult(roomId={RoomId}, roomCode={LogRedaction.RoomCode(RoomCode)}, created={Created})";
     }
 }

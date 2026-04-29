@@ -85,12 +85,25 @@ namespace RTMPE.Crypto.Internal
                 data[data.Length - 1] = counter++;
 
                 using var hmac = new HMACSHA256(prk);
+                // Wipe previous T(i-1) — its bytes are now part of OKM
+                // (which the caller controls the lifetime of) and the HMAC
+                // input we just consumed. Holding extra copies serves no
+                // purpose and prolongs key-derived material on the heap.
+                if (t_prev.Length != 0) Array.Clear(t_prev, 0, t_prev.Length);
                 t_prev = hmac.ComputeHash(data);
 
                 int copyLen = Math.Min(HashLen, outputLength - offset);
                 Buffer.BlockCopy(t_prev, 0, okm, offset, copyLen);
                 offset += copyLen;
+
+                // The HMAC input contains the previous T (key-derived);
+                // wipe it now that the HMAC has consumed it.
+                Array.Clear(data, 0, data.Length);
             }
+
+            // Wipe the final T(i) — its bytes have already been copied into
+            // the caller's `okm` and the buffer is no longer needed.
+            if (t_prev.Length != 0) Array.Clear(t_prev, 0, t_prev.Length);
 
             return okm;
         }

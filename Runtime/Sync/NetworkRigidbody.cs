@@ -6,64 +6,65 @@
 //
 // ── Architecture ──────────────────────────────────────────────────────────────
 //
-//   Owner (authoritative physics):
-//     FixedUpdate() captures the Rigidbody state each physics step.
-//     When any enabled field exceeds its send threshold AND the configured
-//     send-rate interval has elapsed, a PhysicsSync payload is built and
-//     transmitted as PacketType.StateSync (0x40) via the Sync Engine, which
-//     broadcasts it to all room members at 30 Hz.
+//  Owner (authoritative physics):
+//    FixedUpdate() captures the Rigidbody state each physics step.
+//    When any enabled field exceeds its send threshold AND the configured
+//    send-rate interval has elapsed, a PhysicsSync payload is built and
+//    transmitted as PacketType.StateSync (0x40) via the Sync Engine, which
+//    broadcasts it to all room members at 30 Hz.
 //
-//   Non-owner (remote simulation):
-//     ApplyRemoteState() is called by NetworkManager when a physics-sync packet
-//     arrives for this object.  The received state is stored and applied each
-//     FixedUpdate():
-//       • MovePosition / MoveRotation smooth the body toward the authoritative
-//         position, respecting physics constraints (no teleport through colliders).
-//       • The received linear velocity is blended onto the Rigidbody so the
-//         physics engine continues simulating between packets (no rubber-banding).
-//       • Dead reckoning extrapolates the expected position using the last known
-//         velocity for up to _deadReckoningTimeout seconds while no new packet
-//         arrives, preventing objects from stopping mid-air between ticks.
-//       • If the position error exceeds _snapThreshold, MovePosition snaps
-//         immediately instead of lerping, correcting large desync without
-//         prolonged visual drift.
-//       • When IsSleeping is received, the remote body is put to sleep to stop
-//         physics noise on stationary objects.
+//  Non-owner (remote simulation):
+//    ApplyRemoteState() is called by NetworkManager when a physics-sync packet
+//    arrives for this object.  The received state is stored and applied each
+//    FixedUpdate():
+//      • MovePosition / MoveRotation smooth the body toward the authoritative
+//        position, respecting physics constraints (no teleport through colliders).
+//      • The received linear velocity is blended onto the Rigidbody so the
+//        physics engine continues simulating between packets (no rubber-banding).
+//      • Dead reckoning extrapolates the expected position using the last known
+//        velocity for up to _deadReckoningTimeout seconds while no new packet
+//        arrives, preventing objects from stopping mid-air between ticks.
+//      • If the position error exceeds _snapThreshold, MovePosition snaps
+//        immediately instead of lerping, correcting large desync without
+//        prolonged visual drift.
+//      • When IsSleeping is received, the remote body is put to sleep to stop
+//        physics noise on stationary objects.
 //
-//   Owner reconciliation:
-//     When the Sync Engine broadcasts the owner's own state back (because all
-//     room members receive each tick), ApplyReconciliation() can optionally
-//     apply a server-corrected position.  Currently a no-op placeholder — the
-//     owner's local physics simulation is authoritative.
+//  Owner reconciliation:
+//    When the Sync Engine broadcasts the owner's own state back (because all
+//    room members receive each tick), ApplyReconciliation() can optionally
+//    apply a server-corrected position.  Currently a no-op placeholder — the
+//    owner's local physics simulation is authoritative.
 //
 // ── Threading ─────────────────────────────────────────────────────────────────
 //
-//   All methods run on the Unity main thread.  ApplyRemoteState() is called from
-//   NetworkManager (main thread) and stores state into _receivedState, which
-//   FixedUpdate() reads on the next physics step (also main thread).  No lock is
-//   required because both sites execute on the same thread.
+//  All methods run on the Unity main thread.  ApplyRemoteState() is called from
+//  NetworkManager (main thread) and stores state into _receivedState, which
+//  FixedUpdate() reads on the next physics step (also main thread).  No lock is
+//  required because both sites execute on the same thread.
 //
 // ── Design decisions ──────────────────────────────────────────────────────────
 //
-//   • Uses FixedUpdate (physics timestep) for both capture and application so
-//     that Rigidbody.velocity and .angularVelocity reflect the physics engine's
-//     actual state, not a mid-frame snapshot.
-//   • MovePosition / MoveRotation are preferred over direct position / rotation
-//     assignment on non-kinematic bodies: they participate in collision detection
-//     within the physics step, preventing tunnelling.
-//   • _makeRemoteKinematic: when true, the Rigidbody on non-owner clients is set
-//     to kinematic on spawn, and position/rotation are applied directly.  This is
-//     appropriate when the owner fully controls the body (e.g. a player character)
-//     and remote clients should never simulate physics for it.
-//   • Send rate defaults to 20 Hz (below the 30 Hz Sync Engine tick) to reduce
-//     bandwidth while still producing smooth results with dead reckoning.
-//   • Change detection uses per-field thresholds to suppress sends for micro-
-//     movements (floating-point noise, sleep vibrations) that would waste bandwidth.
-//   • Sleep state is only included in the payload when it changes, reducing the
-//     common-case payload size for active objects.
+//  • Uses FixedUpdate (physics timestep) for both capture and application so
+//    that Rigidbody.velocity and .angularVelocity reflect the physics engine's
+//    actual state, not a mid-frame snapshot.
+//  • MovePosition / MoveRotation are preferred over direct position / rotation
+//    assignment on non-kinematic bodies: they participate in collision detection
+//    within the physics step, preventing tunnelling.
+//  • _makeRemoteKinematic: when true, the Rigidbody on non-owner clients is set
+//    to kinematic on spawn, and position/rotation are applied directly.  This is
+//    appropriate when the owner fully controls the body (e.g. a player character)
+//    and remote clients should never simulate physics for it.
+//  • Send rate defaults to 20 Hz (below the 30 Hz Sync Engine tick) to reduce
+//    bandwidth while still producing smooth results with dead reckoning.
+//  • Change detection uses per-field thresholds to suppress sends for micro-
+//    movements (floating-point noise, sleep vibrations) that would waste bandwidth.
+//  • Sleep state is only included in the payload when it changes, reducing the
+//    common-case payload size for active objects.
 
 using UnityEngine;
 using RTMPE.Core;
+using RTMPE.Sync.Internal;
 
 namespace RTMPE.Sync
 {
@@ -139,6 +140,24 @@ namespace RTMPE.Sync
         [Tooltip("Speed at which the remote body slerps toward the authoritative rotation.")]
         [SerializeField] [Range(1f, 50f)] private float _rotationCorrectionSpeed = 10f;
 
+        [Tooltip("Convergence rate (per second) for the linear-velocity blend on remote " +
+                 "non-kinematic bodies.  Used as the rate constant inside an exponential " +
+                 "smoothing filter so the time-to-converge is identical at any physics step.")]
+        [SerializeField] [Range(0.1f, 60f)] private float _velocityBlendRate = 10f;
+
+        [Tooltip("Convergence rate (per second) for the angular-velocity blend on remote " +
+                 "non-kinematic bodies.  Same exponential-smoothing semantics as " +
+                 "_velocityBlendRate.")]
+        [SerializeField] [Range(0.1f, 60f)] private float _angularVelocityBlendRate = 10f;
+
+        [Tooltip("Position-error magnitude (world units) above which a non-kinematic " +
+                 "remote body is teleported by direct .position assignment instead of " +
+                 "being driven through MovePosition.  MovePosition sweeps the body " +
+                 "through colliders for the upcoming physics step; on a large server " +
+                 "correction the sweep can clamp short against geometry and leave the " +
+                 "body desynced.")]
+        [SerializeField] [Range(0.1f, 50f)] private float _snapDistanceThreshold = 1.5f;
+
         // ── Inspector — Owner reconciliation ───────────────────────────────────
 
         [Header("Owner Reconciliation")]
@@ -207,6 +226,47 @@ namespace RTMPE.Sync
         // RigidbodyConstraints.None over an inspector-configured default).
         private bool _hasReceivedConstraints;
 
+        // ── Receive-side hardening ─────────────────────────────────────────────
+        //
+       // Token-bucket rate limit for inbound physics packets, per object.  A
+        // hostile peer or compromised server cannot drive PhysX state changes
+        // faster than NetworkSettings.maxPhysicsPacketsPerSecond / second.
+        private float _rateBucketTokens;
+        private float _rateBucketLastTime;
+
+        // Monotonic local sequence number incremented every time a packet is
+        // accepted.  Used for receive-order enforcement: an out-of-order
+        // dispatch (re-ordered between threads, replayed by an attacker) can
+        // be detected when the inbound packet would carry a stale view.
+        // Without a wire-format sequence we fall back to local arrival order.
+        private uint _appliedSequence;
+        // True once a position has been accepted, so the per-tick delta cap
+        // has a reference to compare against.
+        private bool _hasAppliedPosition;
+
+        // Stable position anchor refreshed every PositionAnchorInterval accepted
+        // packets.  Provides a secondary absolute-distance check that is immune
+        // to manipulation of _receivedState.Position via out-of-order or crafted
+        // packet sequences.
+        private const uint PositionAnchorInterval = 32;
+        private UnityEngine.Vector3 _positionAnchor;
+        private bool _hasPositionAnchor;
+
+        // ── Owner-reconciliation deferral ──────────────────────────────────────
+        //
+        // Physics body state must be written aligned with the FixedUpdate
+        // cadence; writing in the Update path (HandlePhysicsSyncPacket → this
+        // component) with two FixedUpdates per Update at 60 fps physics + 30 fps
+        // rendering produces a visible lurch every other physics step as the
+        // body teleports mid-Update and then runs one extra integration step
+        // before the next render.  Capture the desired correction here and
+        // apply it from FixedUpdate so the write lands exactly once per
+        // physics tick — the LCM beat goes away.
+        private Vector3    _pendingOwnerSnapPosition;
+        private bool       _hasPendingOwnerSnapPosition;
+        private Quaternion _pendingOwnerSnapRotation;
+        private bool       _hasPendingOwnerSnapRotation;
+
         // ── Unity lifecycle ────────────────────────────────────────────────────
 
         /// <summary>
@@ -242,7 +302,25 @@ namespace RTMPE.Sync
             _appliedConstraints     = (byte)(int)_rb.constraints;
             _hasReceivedConstraints = false;
 
+            // Pre-fill the rate-limit bucket so the first inbound packet
+            // immediately after spawn is admitted; the bucket then refills at
+            // maxPhysicsPacketsPerSecond / second.  Capacity is bounded by the
+            // configured rate so a sleeping object cannot accumulate burst
+            // tokens beyond a single second's worth.
+            var settings0 = NetworkManager.Instance?.Settings;
+            float capacity0 = settings0 != null ? Mathf.Max(0f, settings0.maxPhysicsPacketsPerSecond) : 0f;
+            _rateBucketTokens   = capacity0;
+            _rateBucketLastTime = Time.fixedTime;
+            _hasAppliedPosition = false;
+            _appliedSequence    = 0;
+            _hasPositionAnchor  = false;
+
             _sendAccum = 0f;
+
+            // Pending owner-reconciliation buffer is per-spawn lifecycle: a
+            // re-spawn must not carry an unconsumed snap from a previous run.
+            _hasPendingOwnerSnapPosition = false;
+            _hasPendingOwnerSnapRotation = false;
         }
 
         /// <summary>
@@ -252,6 +330,8 @@ namespace RTMPE.Sync
         {
             _hasReceivedState = false;
             _hasSentOnce = false;
+            _hasPendingOwnerSnapPosition = false;
+            _hasPendingOwnerSnapRotation = false;
         }
 
         private void FixedUpdate()
@@ -268,6 +348,25 @@ namespace RTMPE.Sync
 
         private void OwnerFixedUpdate()
         {
+            // ── Drain queued reconciliation writes ────────────────────────────
+            // ApplyReconciliation runs on the main thread / Update path when a
+            // server-broadcast state arrives; mutating _rb.position directly
+            // there causes lurches at the LCM of the Update / FixedUpdate
+            // clocks (one teleport plus an extra integration step every Update
+            // beat).  Queueing the target and applying it here aligns every
+            // owner-side write with PhysX exactly once per physics step.
+            if (_hasPendingOwnerSnapPosition)
+            {
+                _rb.position                 = _pendingOwnerSnapPosition;
+                _hasPendingOwnerSnapPosition = false;
+            }
+            if (_hasPendingOwnerSnapRotation)
+            {
+                if (_makeRemoteKinematic) _rb.rotation = _pendingOwnerSnapRotation;
+                else                      _rb.MoveRotation(_pendingOwnerSnapRotation);
+                _hasPendingOwnerSnapRotation = false;
+            }
+
             _sendAccum += Time.fixedDeltaTime;
             float sendInterval = 1f / _sendRateHz;
             if (_sendAccum < sendInterval) return;
@@ -372,25 +471,42 @@ namespace RTMPE.Sync
             if (_enableDeadReckoning && timeSincePacket < _deadReckoningTimeout && _syncVelocity)
                 targetPos = _receivedState.Position + _receivedState.Velocity * timeSincePacket;
 
+            // Frame-rate-independent blend factor.  1 - exp(-rate·dt) yields the
+            // same time-to-converge at any physics step (50 / 60 / 120 Hz) where
+            // the naive `dt * coefficient` Lerp would silently accelerate as the
+            // step shrinks.
+            float dt        = Time.fixedDeltaTime;
+            float posBlend  = 1f - Mathf.Exp(-_positionCorrectionSpeed * dt);
+            float rotBlend  = 1f - Mathf.Exp(-_rotationCorrectionSpeed * dt);
+            float velBlend  = 1f - Mathf.Exp(-_velocityBlendRate         * dt);
+            float angBlend  = 1f - Mathf.Exp(-_angularVelocityBlendRate  * dt);
+
             // ── Position correction ───────────────────────────────────────────
             if (_syncPosition)
             {
                 float posError = Vector3.Distance(_rb.position, targetPos);
                 if (posError > _snapThreshold)
                 {
-                    // Large error: snap to authoritative position.
-                    if (_makeRemoteKinematic)
-                        _rb.position = targetPos;
-                    else
-                        _rb.MovePosition(targetPos);
+                    // Large error: teleport to the authoritative position.  On a
+                    // dynamic body, MovePosition runs a sweep test for the next
+                    // physics step and will clamp short against any collider in
+                    // the path of a multi-metre correction, leaving the remote
+                    // visibly desynced.  Direct .position assignment skips the
+                    // sweep so the snap actually lands.
+                    ApplySnapPosition(targetPos);
                 }
                 else
                 {
-                    // Small error: lerp smoothly toward the projected position.
-                    Vector3 corrected = Vector3.Lerp(
-                        _rb.position, targetPos,
-                        Time.fixedDeltaTime * _positionCorrectionSpeed);
+                    // Small error: blend smoothly toward the projected position
+                    // using exponential smoothing so the convergence rate is
+                    // identical at any physics step.
+                    Vector3 corrected = Vector3.Lerp(_rb.position, targetPos, posBlend);
                     if (_makeRemoteKinematic)
+                        _rb.position = corrected;
+                    else if (Vector3.Distance(_rb.position, corrected) > _snapDistanceThreshold)
+                        // Even a "small-error" branch can produce a per-step
+                        // motion larger than the sweep budget after a long
+                        // hitch; route those through the bypass too.
                         _rb.position = corrected;
                     else
                         _rb.MovePosition(corrected);
@@ -401,8 +517,7 @@ namespace RTMPE.Sync
             if (_syncRotation)
             {
                 Quaternion corrected = Quaternion.Slerp(
-                    _rb.rotation, _receivedState.Rotation,
-                    Time.fixedDeltaTime * _rotationCorrectionSpeed);
+                    _rb.rotation, _receivedState.Rotation, rotBlend);
                 if (_makeRemoteKinematic)
                     _rb.rotation = corrected;
                 else
@@ -416,15 +531,37 @@ namespace RTMPE.Sync
             if (!_makeRemoteKinematic)
             {
                 if (_syncVelocity)
-                    _rb.linearVelocity = Vector3.Lerp(
-                        _rb.linearVelocity, _receivedState.Velocity,
-                        Time.fixedDeltaTime * _positionCorrectionSpeed);
+                    _rb.SetLinearVelocity(Vector3.Lerp(
+                        _rb.GetLinearVelocity(), _receivedState.Velocity, velBlend));
 
                 if (_syncAngularVelocity)
                     _rb.angularVelocity = Vector3.Lerp(
-                        _rb.angularVelocity, _receivedState.AngularVelocity,
-                        Time.fixedDeltaTime * _rotationCorrectionSpeed);
+                        _rb.angularVelocity, _receivedState.AngularVelocity, angBlend);
             }
+        }
+
+        // Teleport the remote body to <paramref name="targetPos"/>, preserving
+        // the most recent linear velocity on a non-kinematic body so the
+        // physics simulation continues smoothly from the new origin instead of
+        // dropping to zero motion the instant the snap lands.  Direct
+        // .position assignment bypasses the upcoming-step sweep that
+        // MovePosition performs on dynamic bodies; required when the
+        // correction distance exceeds the normal interpolation budget.
+        private void ApplySnapPosition(Vector3 targetPos)
+        {
+            if (_makeRemoteKinematic)
+            {
+                _rb.position = targetPos;
+                return;
+            }
+
+            // Non-kinematic: assign position directly so PhysX moves the body
+            // without a discrete-step sweep.  Linear velocity is preserved
+            // from the latest accepted packet so simulation continues
+            // naturally; the velocity blend below smooths any divergence.
+            _rb.position = targetPos;
+            if (_syncVelocity)
+                _rb.SetLinearVelocity(_receivedState.Velocity);
         }
 
         // ── Internal API (called by NetworkManager) ────────────────────────────
@@ -437,10 +574,69 @@ namespace RTMPE.Sync
         /// <param name="changedMask">Bit-mask indicating which fields are valid.</param>
         internal void ApplyRemoteState(PhysicsState incoming, byte changedMask)
         {
+            var settings = NetworkManager.Instance?.Settings;
+
+            // ── Per-object inbound rate limit ─────────────────────────────────
+            // Token-bucket: refill at maxPhysicsPacketsPerSecond per second,
+            // capped at one second's worth.  Each accepted packet costs one
+            // token.  When the bucket is empty the packet is silently dropped
+            // — never resets the bucket via attacker-controlled input, so a
+            // flood cannot reset the counter to its own benefit.
+            if (settings != null && settings.maxPhysicsPacketsPerSecond > 0f)
+            {
+                float now = Time.fixedTime;
+                float dt  = Mathf.Max(0f, now - _rateBucketLastTime);
+                _rateBucketLastTime = now;
+                float capacity = settings.maxPhysicsPacketsPerSecond;
+                _rateBucketTokens = Mathf.Min(capacity,
+                    _rateBucketTokens + dt * settings.maxPhysicsPacketsPerSecond);
+                if (_rateBucketTokens < 1f) return;
+                _rateBucketTokens -= 1f;
+            }
+
+            // ── Plausibility caps on velocity / angular velocity ──────────────
+            if (settings != null)
+            {
+                if (settings.maxLinearVelocity > 0f
+                    && (changedMask & PhysicsPacketBuilder.ChangedVelocity) != 0
+                    && incoming.Velocity.sqrMagnitude
+                       > settings.maxLinearVelocity * settings.maxLinearVelocity)
+                    return;
+
+                if (settings.maxAngularVelocity > 0f
+                    && (changedMask & PhysicsPacketBuilder.ChangedAngularVelocity) != 0
+                    && incoming.AngularVelocity.sqrMagnitude
+                       > settings.maxAngularVelocity * settings.maxAngularVelocity)
+                    return;
+
+                if (settings.maxPositionDeltaPerTick > 0f
+                    && (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
+                    && _hasAppliedPosition)
+                {
+                    float capSq = settings.maxPositionDeltaPerTick * settings.maxPositionDeltaPerTick;
+                    if ((incoming.Position - _receivedState.Position).sqrMagnitude > capSq)
+                        return;
+
+                    // Secondary check against a stable anchor refreshed every
+                    // PositionAnchorInterval accepted packets.  Limits the total
+                    // distance travellable via a sequence of individually-valid
+                    // small steps crafted from out-of-order or replayed packets.
+                    if (_hasPositionAnchor)
+                    {
+                        float anchorCapSq = capSq * PositionAnchorInterval * PositionAnchorInterval;
+                        if ((incoming.Position - _positionAnchor).sqrMagnitude > anchorCapSq)
+                            return;
+                    }
+                }
+            }
+
             // Merge the received fields with the current known state so that fields
             // absent from this packet retain their last known values.
             if ((changedMask & PhysicsPacketBuilder.ChangedPosition) != 0)
+            {
                 _receivedState.Position = incoming.Position;
+                _hasAppliedPosition     = true;
+            }
 
             if ((changedMask & PhysicsPacketBuilder.ChangedRotation) != 0)
                 _receivedState.Rotation = incoming.Rotation;
@@ -454,40 +650,61 @@ namespace RTMPE.Sync
             if ((changedMask & PhysicsPacketBuilder.ChangedSleep) != 0)
                 _receivedState.IsSleeping = incoming.IsSleeping;
 
-            if ((changedMask & PhysicsPacketBuilder.ChangedConstraints) != 0)
+            // ConstraintMask: only honoured when AllowDynamicConstraints is true.
+            // Bits outside DynamicConstraintsAllowMask are stripped before assignment
+            // so a hostile sender cannot toggle constraint bits the host policy
+            // disallows (e.g. unfreezing an axis the local design has locked).
+            if ((changedMask & PhysicsPacketBuilder.ChangedConstraints) != 0
+                && settings != null && settings.allowDynamicConstraints)
             {
-                _receivedState.ConstraintMask = incoming.ConstraintMask;
+                byte allow = (byte)(settings.dynamicConstraintsAllowMask & 0xFF);
+                _receivedState.ConstraintMask = (byte)(incoming.ConstraintMask & allow);
                 _hasReceivedConstraints       = true;
             }
 
             _lastReceiveTime  = Time.fixedTime;
             _hasReceivedState = true;
+            unchecked { _appliedSequence++; }
+
+            // Refresh the position anchor on the first accepted packet and then
+            // every PositionAnchorInterval packets so the secondary delta cap
+            // always has a recent, attacker-resistant reference point.
+            if ((changedMask & PhysicsPacketBuilder.ChangedPosition) != 0)
+            {
+                if (!_hasPositionAnchor || (_appliedSequence % PositionAnchorInterval) == 0)
+                {
+                    _positionAnchor    = _receivedState.Position;
+                    _hasPositionAnchor = true;
+                }
+            }
         }
 
         /// <summary>
         /// Called by <c>NetworkManager</c> when the Sync Engine broadcasts the
         /// owner's own physics state back to all room members.
         ///
-        /// <para>When <see cref="_enableOwnerReconciliation"/> is <c>true</c>,
+       /// <para>When <see cref="_enableOwnerReconciliation"/> is <c>true</c>,
         /// applies a defensive snap if the local body has diverged from the
         /// server-confirmed position by more than
         /// <see cref="_ownerReconcileSnapThreshold"/> world units.  Below the
         /// threshold the local prediction is kept intact, avoiding visual pops
         /// from normal physics noise.</para>
         ///
-        /// <para>When <see cref="_enableOwnerReconciliation"/> is <c>false</c>
+       /// <para>When <see cref="_enableOwnerReconciliation"/> is <c>false</c>
         /// (the default), this is a no-op — the owner's local physics
         /// simulation is treated as authoritative.  Set to true when an
         /// authoritative server simulates physics (anti-cheat / competitive
         /// modes) and broadcasts corrections back.</para>
         ///
-        /// <para>Defensively rejects NaN/Inf positions and non-unit quaternions
+       /// <para>Defensively rejects NaN/Inf positions and non-unit quaternions
         /// from the server payload — a bug or hostile signal will not be
         /// allowed to corrupt local <c>Rigidbody</c> state.</para>
         /// </summary>
         internal void ApplyReconciliation(PhysicsState serverState, byte changedMask)
         {
             if (!_enableOwnerReconciliation || _rb == null || !IsOwner) return;
+
+            var settings = NetworkManager.Instance?.Settings;
 
             // Position snap on large divergence.
             if (_syncPosition && (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0)
@@ -502,10 +719,55 @@ namespace RTMPE.Sync
                 }
 
                 float err = Vector3.Distance(_rb.position, sp);
+
+                // ── Server-correction cap & world bounds ─────────────────────
+                // Defends against a hostile / compromised server that would
+                // otherwise teleport the local Rigidbody to an arbitrary
+                // location.  Mirrors NetworkTransform.ApplyReconciliation so
+                // the same project-wide tuning governs both transforms and
+                // rigidbodies.  Each guard is bypassed when its setting is
+                // disabled (0 / false) for back-compat with existing scenes.
+                if (settings != null)
+                {
+                    if (settings.maxServerCorrectionDistance > 0f
+                        && err > settings.maxServerCorrectionDistance)
+                    {
+                        Debug.LogWarning(
+                            "[RTMPE] NetworkRigidbody.ApplyReconciliation: rejected " +
+                            $"server correction of {err:F2}m (cap " +
+                            $"{settings.maxServerCorrectionDistance:F2}m) — keeping " +
+                            "local state.", this);
+                        return;
+                    }
+
+                    if (settings.worldBoundsEnabled)
+                    {
+                        Vector3 d = sp - settings.worldBoundsCenter;
+                        Vector3 e = settings.worldBoundsExtents;
+                        if (Mathf.Abs(d.x) > e.x
+                            || Mathf.Abs(d.y) > e.y
+                            || Mathf.Abs(d.z) > e.z)
+                        {
+                            Debug.LogWarning(
+                                "[RTMPE] NetworkRigidbody.ApplyReconciliation: rejected " +
+                                $"server position {sp} outside world bounds — keeping " +
+                                "local state.", this);
+                            return;
+                        }
+                    }
+                }
+
                 if (err > _ownerReconcileSnapThreshold)
                 {
-                    if (_makeRemoteKinematic) _rb.position = sp;
-                    else                      _rb.MovePosition(sp);
+                    // Queue the snap for the next FixedUpdate so the actual
+                    // _rb.position write lands on the physics cadence.  A
+                    // direct write here would teleport the body mid-Update,
+                    // and PhysX's next integration step (≤16 ms later at
+                    // 60 fps physics) would then run on top of the snapped
+                    // pose, producing a visible velocity-preserving lurch on
+                    // every owner correction beat.
+                    _pendingOwnerSnapPosition    = sp;
+                    _hasPendingOwnerSnapPosition = true;
                 }
             }
 
@@ -520,8 +782,11 @@ namespace RTMPE.Sync
                 float angleErr = Quaternion.Angle(_rb.rotation, sr);
                 if (angleErr > 30f) // 30° divergence → snap
                 {
-                    if (_makeRemoteKinematic) _rb.rotation = sr;
-                    else                      _rb.MoveRotation(sr);
+                    // Same FixedUpdate-aligned deferral as the position branch
+                    // above: a direct write here would land between physics
+                    // steps and add a non-deterministic rotational nudge.
+                    _pendingOwnerSnapRotation    = sr;
+                    _hasPendingOwnerSnapRotation = true;
                 }
             }
         }
@@ -546,7 +811,7 @@ namespace RTMPE.Sync
             {
                 Position        = _rb.position,
                 Rotation        = _rb.rotation,
-                Velocity        = _rb.linearVelocity,
+                Velocity        = _rb.GetLinearVelocity(),
                 AngularVelocity = _rb.angularVelocity,
                 IsSleeping      = _rb.IsSleeping(),
                 ConstraintMask  = (byte)(int)_rb.constraints,

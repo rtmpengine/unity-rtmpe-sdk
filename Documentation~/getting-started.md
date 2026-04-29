@@ -1,7 +1,7 @@
 # RTMPE SDK — Getting Started
 
 > **SDK Version:** `com.rtmpe.sdk 1.1.0`
-> **Unity Version Required:** Unity 6000.0 LTS or later
+> **Unity Version Required:** Unity 2022.3 LTS, 2023 LTS, or 6000.0 LTS or later
 > **Target Platform:** PC, Mac, Linux, Android, iOS (WebGL via a user-provided WebSocket transport — see [Architecture §3](architecture.md#3-transport-layer))
 
 ---
@@ -80,7 +80,7 @@
 
 | Requirement     | Detail                                    |
 | --------------- | ----------------------------------------- |
-| Unity           | 6000.0 LTS (Unity 6) or later             |
+| Unity           | 2022.3 LTS, 2023 LTS, or 6000.0 LTS+      |
 | .NET Standard   | 2.1                                       |
 | Build targets   | PC, Mac, Linux, Android, iOS — all supported |
 | RTMPE Gateway   | ≥ 3.0.0 — obtain from the RTMPE dashboard |
@@ -134,6 +134,22 @@ RTMPE SDK   1.1.0   ✓
 ```
 
 The `RTMPE` namespace is now available in all scripts.
+
+### About the mirror repository
+
+The Git URL above points to `Faisalzz1/unity-rtmpe-sdk` — a flat,
+UPM-installable mirror of the package directory inside the RTMPE
+monorepo. The mirror is published automatically by the
+`publish-unity-sdk-mirror` GitHub Actions workflow on every commit to
+`main` that touches the package; you do not need to clone the monorepo
+to install the SDK.
+
+If the mirror appears to lag behind the monorepo (a release note
+references behaviour you cannot reproduce), the most recent workflow run
+on the monorepo's **Actions → Publish Unity SDK Mirror** tab will show
+why. Re-running it republishes the mirror; until then, install Option B
+(local copy) directly from the monorepo at
+`clients/unity-sdk/Packages/com.rtmpe.sdk` as a stop-gap.
 
 ---
 

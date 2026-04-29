@@ -5,13 +5,13 @@
 //
 // What is verified:
 //
-//   1. Empty batch produces a 2-byte payload with count=0.
-//   2. Single-entry batch round-trips bytewise via InputPayload.ReadFrom.
-//   3. Multi-entry batch preserves ordering (oldest-first).
-//   4. Wire size is exactly 2 + 13 * count bytes.
-//   5. count > MaxBatchSize throws ArgumentOutOfRangeException.
-//   6. count > payloads.Length throws ArgumentOutOfRangeException.
-//   7. null payloads throws ArgumentNullException.
+//  1. Empty batch produces a 2-byte payload with count=0.
+//  2. Single-entry batch round-trips bytewise via InputPayload.ReadFrom.
+//  3. Multi-entry batch preserves ordering (oldest-first).
+//  4. Wire size is exactly 2 + 13 * count bytes.
+//  5. count > MaxBatchSize throws ArgumentOutOfRangeException.
+//  6. count > payloads.Length throws ArgumentOutOfRangeException.
+//  7. null payloads throws ArgumentNullException.
 //
 // These tests are the SDK's parity check against the Go side
 // (modules/synchronization/.../input_payload.go ParseInputBatch).  If the

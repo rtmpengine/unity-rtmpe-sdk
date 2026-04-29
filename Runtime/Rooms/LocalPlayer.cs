@@ -23,14 +23,44 @@ namespace RTMPE.Rooms
     /// </summary>
     public sealed class LocalPlayerContext
     {
-        private readonly RoomManager     _rooms;
-        private readonly Func<string>    _getLocalPlayerId;
+        // Resolved on every call so a Reconnect-driven
+        // RecreateRoomAndSpawnManagers swap is observed without re-allocating
+        // the public-facing context object — the application caches the
+        // result of NetworkManager.LocalPlayer indefinitely (Photon-compatible
+        // long-lived reference) so a stale captured RoomManager would route
+        // every property write to a defunct PacketBuilder + dead lambdas.
+        private readonly Func<RoomManager> _roomsProvider;
+        private readonly Func<string>      _getLocalPlayerId;
 
-        internal LocalPlayerContext(RoomManager rooms, Func<string> getLocalPlayerId)
+        // Snapshot of the RoomManager passed at construction time.  Retained
+        // ONLY for back-compat with the prior fixed-reference constructor —
+        // when callers use the new provider constructor this field is null
+        // and every method routes through _roomsProvider().
+        private readonly RoomManager _roomsFixed;
+
+        internal LocalPlayerContext(Func<RoomManager> roomsProvider, Func<string> getLocalPlayerId)
         {
-            _rooms            = rooms ?? throw new ArgumentNullException(nameof(rooms));
+            _roomsProvider    = roomsProvider    ?? throw new ArgumentNullException(nameof(roomsProvider));
             _getLocalPlayerId = getLocalPlayerId ?? throw new ArgumentNullException(nameof(getLocalPlayerId));
         }
+
+        // Legacy constructor preserved so existing test fixtures and any
+        // out-of-tree callers that constructed with a fixed RoomManager
+        // continue to compile.  New code MUST use the Func<RoomManager>
+        // overload — capturing a single RoomManager instance breaks across
+        // reconnects, where the manager is recreated and a stale capture
+        // would silently route every call to the dead instance.
+        internal LocalPlayerContext(RoomManager rooms, Func<string> getLocalPlayerId)
+        {
+            _roomsFixed       = rooms ?? throw new ArgumentNullException(nameof(rooms));
+            _getLocalPlayerId = getLocalPlayerId ?? throw new ArgumentNullException(nameof(getLocalPlayerId));
+        }
+
+        // Resolve the live RoomManager.  When the provider returns null
+        // (transport not yet up) callers fall through to the no-session-yet
+        // log so the application sees an actionable warning rather than a
+        // NullReferenceException.
+        private RoomManager Rooms => _roomsProvider != null ? _roomsProvider() : _roomsFixed;
 
         /// <summary>
         /// The authenticated local player's UUID, or an empty string when
@@ -59,7 +89,14 @@ namespace RTMPE.Rooms
                 return;
             }
 
-            _rooms.SetPlayerProperties(
+            var rooms = Rooms;
+            if (rooms == null)
+            {
+                Debug.LogError(
+                    "[RTMPE] LocalPlayer.SetProperty: no RoomManager available — connection state is invalid.");
+                return;
+            }
+            rooms.SetPlayerProperties(
                 playerId,
                 new Dictionary<string, PropertyValue> { { key, value } });
         }
@@ -81,7 +118,14 @@ namespace RTMPE.Rooms
                     "[RTMPE] LocalPlayer.SetProperties: no authenticated session yet — call after handshake completes.");
                 return;
             }
-            _rooms.SetPlayerProperties(playerId, properties);
+            var rooms = Rooms;
+            if (rooms == null)
+            {
+                Debug.LogError(
+                    "[RTMPE] LocalPlayer.SetProperties: no RoomManager available — connection state is invalid.");
+                return;
+            }
+            rooms.SetPlayerProperties(playerId, properties);
         }
     }
 }

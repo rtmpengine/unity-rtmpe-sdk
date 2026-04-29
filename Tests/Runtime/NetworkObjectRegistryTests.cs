@@ -290,6 +290,67 @@ namespace RTMPE.Tests
             Assert.AreSame(nb2, all[0]);
         }
 
+        // ── Re-entrancy / snapshot overload ────────────────────────────────────
+
+        [Test]
+        [Description("GetAllSnapshot fills a caller-owned list independent of the shared buffer.")]
+        public void GetAllSnapshot_FillsDestination_AndIsIndependentOfSharedBuffer()
+        {
+            var a = MakeObject(101UL);
+            var b = MakeObject(102UL);
+            _registry.Register(a);
+            _registry.Register(b);
+
+            var dst = new List<NetworkBehaviour>();
+            _registry.GetAllSnapshot(dst);
+            Assert.AreEqual(2, dst.Count);
+            CollectionAssert.Contains(dst, a);
+            CollectionAssert.Contains(dst, b);
+
+            // The destination is completely independent of the registry's
+            // internal storage: a subsequent GetAll cannot affect dst.
+            var shared = _registry.GetAll();
+            Assert.AreEqual(2, shared.Count);
+            Assert.AreNotSame(shared, dst,
+                "Snapshot must allocate or use the caller-owned list, never the shared buffer");
+        }
+
+        [Test]
+        [Description("GetAllSnapshot clears the destination list before refilling.")]
+        public void GetAllSnapshot_ClearsDestinationBeforePopulating()
+        {
+            var a = MakeObject(301UL);
+            _registry.Register(a);
+
+            var dst = new List<NetworkBehaviour> { null, null, null };
+            _registry.GetAllSnapshot(dst);
+            Assert.AreEqual(1, dst.Count, "Stale entries must be cleared before fill");
+            Assert.AreSame(a, dst[0]);
+        }
+
+        [Test]
+        [Description("GetAllSnapshot rejects a null destination with ArgumentNullException.")]
+        public void GetAllSnapshot_NullDestination_Throws()
+        {
+            Assert.Throws<System.ArgumentNullException>(() => _registry.GetAllSnapshot(null));
+        }
+
+        [Test]
+        [Description("Two top-level GetAll calls reuse the shared buffer (zero-allocation contract).")]
+        public void GetAll_TopLevelCalls_ShareTheSameBufferReference()
+        {
+            var a = MakeObject(401UL);
+            _registry.Register(a);
+
+            var first  = _registry.GetAll();
+            var second = _registry.GetAll();
+
+            // The hot path must keep returning the same shared list reference
+            // so callers do not pay an allocation per frame.
+            Assert.AreSame(first, second,
+                "GetAll's zero-allocation contract returns the shared buffer for both top-level calls");
+        }
+
         // ── Test doubles ───────────────────────────────────────────────────────
 
         private sealed class ThrowingNB : NetworkBehaviour

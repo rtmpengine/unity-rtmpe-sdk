@@ -4,26 +4,31 @@
 // All multi-byte values are little-endian.
 //
 // Wire format per parameter:
-//   [type_id : 1 u8]
-//   [value   : N bytes]  — size and layout depend on type_id (see table below)
+//  [type_id : 1 u8]
+//  [value   : N bytes]  — size and layout depend on type_id (see table below)
 //
 // Type registry:
-//   0x01  int32      4 bytes  signed LE
-//   0x02  float32    4 bytes  IEEE-754 LE
-//   0x03  bool       1 byte   1=true, 0=false
-//   0x04  string     2-byte LE len + N UTF-8 bytes (max 65535 bytes encoded)
-//   0x05  byte[]     2-byte LE len + N bytes       (max 65535 bytes)
-//   0x06  Vector3   12 bytes  x:f32 y:f32 z:f32 LE
-//   0x07  Color     16 bytes  r:f32 g:f32 b:f32 a:f32 LE
-//   0x08  ulong      8 bytes  unsigned LE
-//   0x09  Quaternion 16 bytes  x:f32 y:f32 z:f32 w:f32 LE
-//   0x0A  INetworkSerializable
-//                    [type_name_len:2 LE][type_name UTF-8][payload_len:2 LE][payload bytes]
-//                    The receiver looks up the concrete Type via
-//                    RpcTypeRegistry, instantiates it, and calls
-//                    NetworkDeserialize against an IRtmpeReader scoped to the
-//                    payload bytes — unknown type names skip cleanly using
-//                    payload_len so subsequent parameters parse correctly.
+//  0x01  int32      4 bytes  signed LE
+//  0x02  float32    4 bytes  IEEE-754 LE
+//  0x03  bool       1 byte   1=true, 0=false
+//  0x04  string     2-byte LE len + N UTF-8 bytes (max 65535 bytes encoded)
+//  0x05  byte[]     2-byte LE len + N bytes       (max 65535 bytes)
+//  0x06  Vector3   12 bytes  x:f32 y:f32 z:f32 LE
+//  0x07  Color     16 bytes  r:f32 g:f32 b:f32 a:f32 LE
+//  0x08  ulong      8 bytes  unsigned LE
+//  0x09  Quaternion 16 bytes  x:f32 y:f32 z:f32 w:f32 LE
+//  0x0A  INetworkSerializable
+//                   [type_name_len:2 LE][type_name UTF-8][payload_len:2 LE][payload bytes]
+//                   type_name is wire-supplied (hostile) and is resolved
+//                   ONLY against the explicit RpcTypeRegistry — types
+//                   without [RtmpeRpcSerializable] or an explicit
+//                   Register<T>() are NOT instantiable, even if they
+//                   implement INetworkSerializable elsewhere in the
+//                   AppDomain.  Unresolved type names cause the
+//                   parameter to be surfaced as null with a warning and
+//                   the parser advances past payload_len so subsequent
+//                   parameters still align.  See RpcTypeRegistry.cs
+//                   for the trust model.
 
 using System;
 using System.Runtime.InteropServices;
@@ -251,7 +256,7 @@ namespace RTMPE.Rpc
         /// <paramref name="offset"/>.  Advances <paramref name="offset"/> by
         /// the number of bytes consumed.
         ///
-        /// Returns <see langword="null"/> and sets <paramref name="offset"/> to -1
+       /// Returns <see langword="null"/> and sets <paramref name="offset"/> to -1
         /// on truncated or unrecognised input — the caller must check for -1
         /// before further reads.
         /// </summary>
@@ -360,13 +365,24 @@ namespace RTMPE.Rpc
                     int payloadStart = offset;
                     offset += payloadLen; // ALWAYS advance past payload, even on failure
 
+                    // SECURITY: typeName is wire-supplied and must NEVER be
+                    // resolved via Type.GetType / AppDomain probing.  The
+                    // registry is a closed, author-attested allow-list:
+                    // names not in the registry are dropped with a warning
+                    // so an attacker cannot reach arbitrary parameterless-
+                    // ctor INetworkSerializable types loaded in the
+                    // AppDomain.
                     Type concrete = RpcTypeRegistry.Resolve(typeName);
                     if (concrete == null)
                     {
                         Debug.LogWarning(
-                            $"[RTMPE] RpcSerializer: unknown INetworkSerializable type " +
-                            $"'{typeName}'.  Returning null parameter.  Register the type " +
-                            "via RpcTypeRegistry.Register<T>() or ensure its assembly is loaded.");
+                            $"[RTMPE] RpcSerializer: rejected unregistered " +
+                            $"INetworkSerializable type '{typeName}' on inbound RPC. " +
+                            "Register it explicitly via RpcTypeRegistry.Register<T>() " +
+                            "or annotate the type with [RtmpeRpcSerializable] and " +
+                            "enable RpcTypeRegistry.AllowAppDomainScan.  Parameter " +
+                            "surfaced as null; downstream dispatch will reject " +
+                            "non-nullable bindings.");
                         return null;
                     }
 
@@ -404,19 +420,32 @@ namespace RTMPE.Rpc
                     {
                         ns.NetworkDeserialize(reader);
                     }
+                    catch (RpcDeserializationException)
+                    {
+                        // Re-throw without wrapping so the dispatcher sees the
+                        // original type-name context.
+                        throw;
+                    }
                     catch (Exception ex)
                     {
-                        Debug.LogWarning(
-                            $"[RTMPE] RpcSerializer: NetworkDeserialize for '{typeName}' threw " +
-                            $"{ex.GetType().Name}: {ex.Message}.  Returning default-valued instance.");
-                        return concrete.IsValueType ? Activator.CreateInstance(concrete) : null;
+                        // A throwing NetworkDeserialize cannot leave a coherent
+                        // instance behind — escalate so the dispatcher drops
+                        // the entire RPC rather than invoking the receiver
+                        // with a partial-state argument.
+                        throw new RpcDeserializationException(
+                            typeName,
+                            $"NetworkDeserialize for '{typeName}' threw " +
+                            $"{ex.GetType().Name}: {ex.Message}.",
+                            ex);
                     }
 
                     if (reader.HasFailed)
                     {
-                        Debug.LogWarning(
-                            $"[RTMPE] RpcSerializer: payload for '{typeName}' was truncated " +
-                            "during NetworkDeserialize.  Returning partially-populated instance.");
+                        // Truncated payload — same policy: refuse to surface a
+                        // partially-populated instance to user code.
+                        throw new RpcDeserializationException(
+                            typeName,
+                            $"Payload for '{typeName}' was truncated during NetworkDeserialize.");
                     }
 
                     return ns;

@@ -1,11 +1,11 @@
 // RTMPE SDK — Tests/Runtime/HandshakeHandlerTests.cs
 //
 // NUnit tests for the ECDH handshake crypto layer:
-//   - Curve25519 (X25519) key generation and Diffie-Hellman
-//   - HkdfSha256 key derivation
-//   - ChaCha20Poly1305Impl AEAD seal / open
-//   - Ed25519Verify RFC 8032 vectors
-//   - HandshakeHandler end-to-end session key derivation symmetry
+//  - Curve25519 (X25519) key generation and Diffie-Hellman
+//  - HkdfSha256 key derivation
+//  - ChaCha20Poly1305Impl AEAD seal / open
+//  - Ed25519Verify RFC 8032 vectors
+//  - HandshakeHandler end-to-end session key derivation symmetry
 //
 // Test vectors are taken from published RFCs — noted per test.
 //
@@ -404,7 +404,7 @@ namespace RTMPE.Tests
         public void HandshakeHandler_ValidateChallenge_ReturnsFalseForNullPayload()
         {
             var h = new HandshakeHandler();
-            Assert.IsFalse(h.ValidateChallenge(null, out _, out _));
+            Assert.IsFalse(h.ValidateChallenge(null, handshakeInitCiphertext: null, out _, out _));
         }
 
         [Test]
@@ -412,9 +412,9 @@ namespace RTMPE.Tests
         public void HandshakeHandler_ValidateChallenge_ReturnsFalseForWrongLength()
         {
             var h = new HandshakeHandler();
-            Assert.IsFalse(h.ValidateChallenge(new byte[127], out _, out _), "127 bytes");
-            Assert.IsFalse(h.ValidateChallenge(new byte[129], out _, out _), "129 bytes");
-            Assert.IsFalse(h.ValidateChallenge(Array.Empty<byte>(), out _, out _), "empty");
+            Assert.IsFalse(h.ValidateChallenge(new byte[127], null, out _, out _), "127 bytes");
+            Assert.IsFalse(h.ValidateChallenge(new byte[129], null, out _, out _), "129 bytes");
+            Assert.IsFalse(h.ValidateChallenge(Array.Empty<byte>(), null, out _, out _), "empty");
         }
 
         [Test]
@@ -423,8 +423,100 @@ namespace RTMPE.Tests
         {
             // All-zero challenge has an invalid Ed25519 signature → must be rejected.
             var h = new HandshakeHandler();
-            Assert.IsFalse(h.ValidateChallenge(new byte[128], out _, out _),
+            Assert.IsFalse(h.ValidateChallenge(new byte[128], null, out _, out _),
                 "An all-zero Challenge payload must fail Ed25519 verification.");
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // Transcript-binding tests
+        //
+       // These tests use ComputeTranscript directly (no signing) to verify the
+        // byte-stable transcript layout that both sides must agree on.  End-to-
+        // end Ed25519 sign+verify against the gateway lives in the Rust unit
+        // tests (cargo test -p rtmpe-gateway) since the Unity SDK ships only
+        // the verifier — there is no managed Ed25519 signer available here.
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Category("HandshakeHandler")]
+        public void Transcript_IsDeterministic_AndDistinguishesEveryField()
+        {
+            var staticPub = new byte[32]; for (int i = 0; i < 32; i++) staticPub[i] = (byte)i;
+            var ephemeral = new byte[32]; for (int i = 0; i < 32; i++) ephemeral[i] = (byte)(i + 0x40);
+            var cih = new byte[32];       for (int i = 0; i < 32; i++) cih[i]       = (byte)(i + 0x80);
+
+            byte[] baseHash = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                HandshakeHandler.HandshakeProtocolVersion, HandshakeHandler.CipherSuiteId);
+            byte[] sameHash = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                HandshakeHandler.HandshakeProtocolVersion, HandshakeHandler.CipherSuiteId);
+            Assert.IsTrue(BytesEqual(baseHash, sameHash), "transcript must be deterministic");
+
+            // A 1-byte change in any bound field must produce a different hash
+            // (avalanche under SHA-256 — these are sanity checks on *which*
+            // fields are bound, not on SHA-256 itself).
+            staticPub[0] ^= 0xFF;
+            byte[] diffStatic = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                HandshakeHandler.HandshakeProtocolVersion, HandshakeHandler.CipherSuiteId);
+            Assert.IsFalse(BytesEqual(baseHash, diffStatic), "static_pub must be bound");
+            staticPub[0] ^= 0xFF;
+
+            ephemeral[0] ^= 0xFF;
+            byte[] diffEph = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                HandshakeHandler.HandshakeProtocolVersion, HandshakeHandler.CipherSuiteId);
+            Assert.IsFalse(BytesEqual(baseHash, diffEph), "ephemeral_pub must be bound");
+            ephemeral[0] ^= 0xFF;
+
+            cih[0] ^= 0xFF;
+            byte[] diffCih = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                HandshakeHandler.HandshakeProtocolVersion, HandshakeHandler.CipherSuiteId);
+            Assert.IsFalse(BytesEqual(baseHash, diffCih), "client_init_hash must be bound");
+            cih[0] ^= 0xFF;
+
+            byte[] diffVer = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                0x01, HandshakeHandler.CipherSuiteId);
+            Assert.IsFalse(BytesEqual(baseHash, diffVer), "protocol_version must be bound");
+
+            byte[] diffSuite = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                HandshakeHandler.HandshakeProtocolVersion, (byte)0xFF);
+            Assert.IsFalse(BytesEqual(baseHash, diffSuite), "cipher_suite_id must be bound");
+        }
+
+        [Test]
+        [Category("HandshakeHandler")]
+        public void ValidateChallenge_RejectsV1StyleSignature()
+        {
+            // v1 signed bare ephemeral||static_pub (no transcript hash).  Even
+            // if an attacker forges a syntactically valid 128-byte Challenge
+            // whose signature is over the v1 message, our v2 verifier rebuilds
+            // the canonical transcript and the signature must fail.  We can't
+            // produce a real v1 signature here (no Ed25519 signer), but we can
+            // assert that with arbitrary 64 random bytes the verifier still
+            // refuses every payload — guarding against a regression that
+            // accepted v1-only verification.
+            var h = new HandshakeHandler();
+            var rng = new System.Random(0xC0DE);
+            for (int t = 0; t < 32; t++)
+            {
+                var bogus = new byte[128];
+                rng.NextBytes(bogus);
+                Assert.IsFalse(
+                    h.ValidateChallenge(bogus, new byte[] { 1, 2, 3 }, out _, out _),
+                    $"random Challenge #{t} must not verify");
+            }
+        }
+
+        // Reflection helper — ComputeTranscript is internal to keep the public
+        // API surface small.  Tests inside the SDK assembly normally see
+        // internals via [InternalsVisibleTo], but to avoid touching the
+        // assembly-level attribute list we reach in via reflection.
+        private static byte[] InvokeComputeTranscript(
+            byte[] staticPub, byte[] ephemeral, byte[] cih, byte ver, byte suite)
+        {
+            var mi = typeof(HandshakeHandler).GetMethod(
+                "ComputeTranscript",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            Assert.IsNotNull(mi, "ComputeTranscript not found via reflection");
+            return (byte[])mi.Invoke(null, new object[] { staticPub, ephemeral, cih, ver, suite });
         }
 
         [Test]
@@ -443,7 +535,7 @@ namespace RTMPE.Tests
         /// Verify that if client and server perform X25519 + HKDF-SHA256 using the same
         /// key-ordering logic, client.Encrypt == server.Decrypt and vice versa.
         ///
-        /// Uses Curve25519 and HkdfSha256 directly (InternalsVisibleTo is required).
+       /// Uses Curve25519 and HkdfSha256 directly (InternalsVisibleTo is required).
         /// </summary>
         [Test]
         [Category("SessionKeys")]

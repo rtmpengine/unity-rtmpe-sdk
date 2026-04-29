@@ -5,18 +5,30 @@
 // before this parser is called.
 //
 // Enhanced RPC payload layout (all little-endian):
-//   [method_id   :  4 LE u32]  FNV-1a("TypeName.MethodName")
-//   [sender_id   :  8 LE u64]  gateway-verified session ID
-//   [request_id  :  4 LE u32]  client correlation ID
-//   [object_id   :  8 LE u64]  NetworkBehaviour.NetworkObjectId
-//   [target      :  1 u8]      RpcTarget (All=0x00, Others=0x01, Server=0x02)
-//   [rpc_flags   :  1 u8]      reserved
-//   [param_count :  1 u8]      number of typed parameters
-//   [params…]                  typed param stream (RpcSerializer format)
+//  [method_id   :  4 LE u32]  FNV-1a("TypeName.MethodName")
+//  [sender_id   :  8 LE u64]  wire-supplied; AEAD authenticates the relay,
+//                             NOT the originating peer.  Treated as hostile
+//                             input and validated via EnhancedRpcVerifier.
+//  [request_id  :  4 LE u32]  client correlation ID (opaque)
+//  [object_id   :  8 LE u64]  wire-supplied; cross-checked against the
+//                             spawn registry by NetworkManager and via the
+//                             optional EnhancedRpcVerifier.ObjectExistsVerifier.
+//  [target      :  1 u8]      wire-supplied RpcTarget; undefined enum
+//                             values are rejected before construction so
+//                             downstream code never sees an out-of-range
+//                             cast.
+//  [rpc_flags   :  1 u8]      reserved
+//  [param_count :  1 u8]      number of typed parameters
+//  [params…]                  typed param stream (RpcSerializer format)
 //
 // Total fixed header: 27 bytes.
+//
+// Trust model — see EnhancedRpcVerifier.cs for the full policy table.
+// Every field above except request_id is treated as attacker-controlled
+// and gated through TryParse before an EnhancedRpcRequest is constructed.
 
 using System;
+using UnityEngine;
 
 namespace RTMPE.Rpc
 {
@@ -94,13 +106,85 @@ namespace RTMPE.Rpc
 
             // offset is now 27 (= EnhancedRequestHeaderSize)
 
+            // ── Verification gate ────────────────────────────────────────────
+            //
+           // Every field below is wire-supplied and must be validated BEFORE
+            // we allocate the args array or run user-supplied
+            // NetworkDeserialize for INetworkSerializable params.  Failing
+            // checks here drops the packet at the cheapest possible point
+            // and prevents a crafted payload from reaching downstream code
+            // that branches on these fields.
+
+            // Reject undefined target enum values.  An unchecked
+            // (RpcTarget)targetByte cast would silently propagate an
+            // attacker-chosen byte (0x00–0xFF) into game code that switches
+            // on Target — observed in the wild as a confused-deputy
+            // primitive.  Enum.IsDefined here is acceptable for hot-path
+            // use because RpcTarget is a small, sealed enum (≤ 4 entries).
+            if (!EnhancedRpcVerifier.IsTargetDefined(targetByte))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] EnhancedRpcPacketParser: dropped RPC with undefined " +
+                    $"target byte 0x{targetByte:X2} from sender {senderId} " +
+                    $"(method 0x{methodId:X8}).");
+                return false;
+            }
             RpcTarget target = (RpcTarget)targetByte;
 
-            // Decode typed parameters.
+            // Reject senderIds that fail the configured policy.  Default
+            // policy: senderId==0 (the SDK's "uninitialised session"
+            // sentinel) is always rejected; non-zero values are accepted
+            // until an integrator installs EnhancedRpcVerifier.SenderVerifier
+            // to enforce a roster check.  Strict roster enforcement is the
+            // recommended deployment configuration in untrusted-peer
+            // environments.
+            if (!EnhancedRpcVerifier.IsSenderAcceptable(senderId))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] EnhancedRpcPacketParser: dropped RPC with " +
+                    $"unacceptable senderId {senderId} (method 0x{methodId:X8}, " +
+                    $"object {objectId}).");
+                return false;
+            }
+
+            // Optional object-id sanity hook.  NetworkManager will perform
+            // the authoritative spawn-registry lookup at dispatch time —
+            // this hook lets integrators layer game-specific invariants
+            // (ownership, interest sets) without modifying SDK code.
+            if (!EnhancedRpcVerifier.IsObjectAcceptable(objectId))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] EnhancedRpcPacketParser: dropped RPC with " +
+                    $"unacceptable objectId {objectId} (sender {senderId}, " +
+                    $"method 0x{methodId:X8}).");
+                return false;
+            }
+
+            // Decode typed parameters.  Each ReadParam either returns the
+            // decoded value or sets offset to -1 on truncation / unknown
+            // type.  Unknown INetworkSerializable type names resolve to
+            // null via the explicit RpcTypeRegistry — they do NOT trip
+            // the offset==-1 path; downstream argument-type validation in
+            // NetworkBehaviour.DispatchEnhancedRpc rejects nulls bound to
+            // non-nullable parameters.
             var args = new object[paramCount];
             for (int i = 0; i < paramCount; i++)
             {
-                object val = RpcSerializer.ReadParam(payload, ref offset);
+                object val;
+                try
+                {
+                    val = RpcSerializer.ReadParam(payload, ref offset);
+                }
+                catch (RpcDeserializationException ex)
+                {
+                    // INetworkSerializable parameter rejected — drop the
+                    // entire RPC rather than dispatch a partial argument list.
+                    Debug.LogWarning(
+                        $"[RTMPE] EnhancedRpcPacketParser: rejected RPC due to " +
+                        $"deserialise failure on parameter {i} ('{ex.TypeName}'): " +
+                        $"{ex.Message}");
+                    return false;
+                }
                 if (offset == -1)
                     return false;   // truncated or unknown type
                 args[i] = val;

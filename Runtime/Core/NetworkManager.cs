@@ -301,6 +301,23 @@ namespace RTMPE.Core
         private string _reconnectToken;
         /// <summary>N-8: 32-byte HMAC key for IP-migration proofs, derived alongside session keys.</summary>
         private byte[] _ipMigrationKey;
+        /// <summary>
+        /// 32-byte AEAD key (HKDF info suffix <c>\x03</c>) used to decrypt the
+        /// SessionAck payload when the gateway is configured with
+        /// <c>RTMPE_ENCRYPT_SESSION_ACK=true</c> and
+        /// <see cref="NetworkSettings.ExpectEncryptedSessionAck"/> is enabled.
+        /// </summary>
+        private byte[] _sessionAckKey;
+
+        /// <summary>
+        /// Owns the per-session ARQ sequence space.  Allocates the 4-byte
+        /// sub-header value emitted on the wire when
+        /// <see cref="NetworkSettings.EmitArqSequence"/> is enabled and the
+        /// outbound packet carries <see cref="PacketFlags.Reliable"/>.  The
+        /// retransmit table will be wired in once gateway-side ACK plumbing
+        /// lands; until then this instance only services sequence allocation.
+        /// </summary>
+        private readonly ReliableChannel _outboundReliableChannel = new ReliableChannel();
         private ulong  _localPlayerId;
         private ulong  _currentRoomId;
 
@@ -2107,6 +2124,35 @@ namespace RTMPE.Core
             bool wasEncrypted = (data[PacketProtocol.OFFSET_FLAGS]
                                  & (byte)PacketFlags.Encrypted) != 0;
             int packetLength = length;
+
+            // SessionAck bootstrap-encryption path.  When the gateway is run
+            // with RTMPE_ENCRYPT_SESSION_ACK=true and the SDK has opted in via
+            // NetworkSettings.ExpectEncryptedSessionAck, the SessionAck
+            // payload is sealed under a one-time AEAD key derived from the
+            // ECDH shared secret (HKDF info suffix \x03), with a fixed
+            // all-zero 12-byte nonce and AAD = [0x08, FLAG_ENCRYPTED].  The
+            // regular session-key decrypt path cannot open this packet —
+            // SessionAck is the bootstrap that delivers crypto_id, which the
+            // session-AEAD nonce depends on.  Route SessionAck through a
+            // dedicated decrypt before the generic AEAD branch runs.
+            if (wasEncrypted
+                && (PacketType)data[PacketProtocol.OFFSET_TYPE] == PacketType.SessionAck
+                && _settings != null
+                && _settings.ExpectEncryptedSessionAck)
+            {
+                data = DecryptSessionAckPacket(data, length);
+                if (data == null)
+                {
+                    if (ShouldWarn(ref _lastAeadFailWarnTicks))
+                        Debug.LogWarning(
+                            "[RTMPE] Dropped SessionAck: bootstrap AEAD authentication " +
+                            "failed.  Verify the gateway's RTMPE_ENCRYPT_SESSION_ACK " +
+                            "matches NetworkSettings.ExpectEncryptedSessionAck.");
+                    return;
+                }
+                packetLength = data.Length;
+                wasEncrypted = false; // already decrypted; skip generic branch
+            }
             if (wasEncrypted)
             {
                 // DecryptInboundPacket returns an exact-sized plaintext byte[]
@@ -2353,7 +2399,7 @@ namespace RTMPE.Core
 
             // Derive directional session keys (AEAD) + N-8 IP migration key via HKDF-SHA256.
             // Three independent expansions from a single PRK — info suffixes \x00, \x01, \x02.
-            _sessionKeys = _handshakeHandler.DeriveSessionKeys(out _ipMigrationKey);
+            _sessionKeys = _handshakeHandler.DeriveSessionKeys(out _ipMigrationKey, out _sessionAckKey);
             if (_sessionKeys == null)
             {
                 Debug.LogError("[RTMPE] ECDH key derivation failed (degenerate shared secret). Disconnecting.");
@@ -3697,6 +3743,11 @@ namespace RTMPE.Core
                     Array.Clear(_ipMigrationKey, 0, _ipMigrationKey.Length);
                     _ipMigrationKey = null;
                 }
+                if (_sessionAckKey != null)
+                {
+                    Array.Clear(_sessionAckKey, 0, _sessionAckKey.Length);
+                    _sessionAckKey = null;
+                }
                 // Last-room snapshot is a companion to the reconnect token —
                 // both lose meaning once the token is cleared.  An explicit
                 // Disconnect() therefore also wipes the snapshot so a later
@@ -3935,14 +3986,53 @@ namespace RTMPE.Core
             // ciphertext.Length == ptLen + 16  (Poly1305 tag appended)
 
             // ── 8. Assemble the encrypted packet ────────────────────────────────
-            // Wire layout when FLAG_APP_SEQUENCE is set:
-            //   [header(13)][app_seq(4 LE)][ciphertext]
+            // Wire layout (sub-headers appear in this fixed order before the
+            // ciphertext, each gated by its corresponding flag bit):
+            //   [header(13)]
+            //   [arq_seq(4 LE)        if FLAG_RELIABLE        and EmitArqSequence]
+            //   [app_seq(4 LE)        if FLAG_APP_SEQUENCE]
+            //   [gameplay_seq(4 LE)   if FLAG_GAMEPLAY_ORDERED and EmitGameplaySequencePrefix]
+            //   [ciphertext]
+            //
             // The 4-byte app sequence is on the wire so the receiver can read
-            // it without first decrypting; the AAD binds the same bytes so any
-            // tampering causes Poly1305 verification to fail and the packet
-            // is silently dropped.
-            int appSeqWireBytes = stampAppSeq ? 4 : 0;
-            var result = new byte[PacketProtocol.HEADER_SIZE + appSeqWireBytes + ciphertext.Length];
+            // it without first decrypting; the AAD binds those same bytes so
+            // any tampering causes Poly1305 verification to fail and the
+            // packet is silently dropped.
+            //
+            // arq_seq and gameplay_seq are NOT bound into the AAD on the
+            // gateway side (see `build_aad` in modules/gateway/src/crypto/pipeline.rs),
+            // so they pass through as plaintext sub-headers; the AEAD key still
+            // protects every byte of the ciphertext that follows.
+            bool emitArq =
+                _settings != null
+                && _settings.EmitArqSequence
+                && (flags & (byte)PacketFlags.Reliable) != 0;
+            bool emitGameplay =
+                _settings != null
+                && _settings.EmitGameplaySequencePrefix
+                && (flags & (byte)PacketFlags.GameplayOrdered) != 0;
+            int arqWireBytes      = emitArq      ? 4 : 0;
+            int appSeqWireBytes   = stampAppSeq  ? 4 : 0;
+            int gameplayWireBytes = emitGameplay ? 4 : 0;
+            int subHeaderBytes    = arqWireBytes + appSeqWireBytes + gameplayWireBytes;
+
+            uint arqSeqForWire = 0u;
+            if (emitArq)
+            {
+                // Allocate from the channel's outbound counter without
+                // registering a retransmit entry — the on-the-wire emission
+                // is intentionally decoupled from the retransmit table until
+                // gateway-side ACK plumbing lands.  When the full ARQ loop is
+                // wired, the registration will move to the caller of
+                // EncryptAndSend.
+                arqSeqForWire = _outboundReliableChannel.AllocateOutboundSequence();
+            }
+            uint gameplaySeqForWire = 0u;
+            if (emitGameplay)
+            {
+                gameplaySeqForWire = GameplaySequencePrefix.NextSequence();
+            }
+            var result = new byte[PacketProtocol.HEADER_SIZE + subHeaderBytes + ciphertext.Length];
             // Copy header as-is first, then patch the three affected fields.
             Buffer.BlockCopy(packet, 0, result, 0, PacketProtocol.HEADER_SIZE);
 
@@ -3957,24 +4047,39 @@ namespace RTMPE.Core
             result[PacketProtocol.OFFSET_FLAGS] = (byte)(flags | (byte)PacketFlags.Encrypted);
 
             // header.payload_len counts every byte after the 13-byte header,
-            // i.e. the optional 4-byte app-seq prefix plus the ciphertext.
-            uint ctLen = (uint)(appSeqWireBytes + ciphertext.Length);
+            // i.e. every present sub-header prefix plus the ciphertext.
+            uint ctLen = (uint)(subHeaderBytes + ciphertext.Length);
             result[PacketProtocol.OFFSET_PAYLOAD_LEN]     = (byte) ctLen;
             result[PacketProtocol.OFFSET_PAYLOAD_LEN + 1] = (byte)(ctLen >>  8);
             result[PacketProtocol.OFFSET_PAYLOAD_LEN + 2] = (byte)(ctLen >> 16);
             result[PacketProtocol.OFFSET_PAYLOAD_LEN + 3] = (byte)(ctLen >> 24);
 
+            int subOffset = PacketProtocol.HEADER_SIZE;
+            if (emitArq)
+            {
+                result[subOffset    ] = (byte) arqSeqForWire;
+                result[subOffset + 1] = (byte)(arqSeqForWire >>  8);
+                result[subOffset + 2] = (byte)(arqSeqForWire >> 16);
+                result[subOffset + 3] = (byte)(arqSeqForWire >> 24);
+                subOffset += 4;
+            }
             if (stampAppSeq)
             {
-                int o = PacketProtocol.HEADER_SIZE;
-                result[o    ] = (byte) appSeqForWire;
-                result[o + 1] = (byte)(appSeqForWire >>  8);
-                result[o + 2] = (byte)(appSeqForWire >> 16);
-                result[o + 3] = (byte)(appSeqForWire >> 24);
+                result[subOffset    ] = (byte) appSeqForWire;
+                result[subOffset + 1] = (byte)(appSeqForWire >>  8);
+                result[subOffset + 2] = (byte)(appSeqForWire >> 16);
+                result[subOffset + 3] = (byte)(appSeqForWire >> 24);
+                subOffset += 4;
             }
-            Buffer.BlockCopy(ciphertext, 0, result,
-                             PacketProtocol.HEADER_SIZE + appSeqWireBytes,
-                             ciphertext.Length);
+            if (emitGameplay)
+            {
+                result[subOffset    ] = (byte) gameplaySeqForWire;
+                result[subOffset + 1] = (byte)(gameplaySeqForWire >>  8);
+                result[subOffset + 2] = (byte)(gameplaySeqForWire >> 16);
+                result[subOffset + 3] = (byte)(gameplaySeqForWire >> 24);
+                subOffset += 4;
+            }
+            Buffer.BlockCopy(ciphertext, 0, result, subOffset, ciphertext.Length);
 
             SendToWire(result);
         }
@@ -4008,6 +4113,79 @@ namespace RTMPE.Core
         // <c>.Length</c> may exceed the packet length and MUST NOT be used to
         // size ciphertext extraction — that would feed garbage tail bytes
         // into Poly1305 and guarantee a tag-mismatch on every packet.
+        /// <summary>
+        /// Decrypt the bootstrap-encrypted SessionAck payload.
+        ///
+        /// <para>The gateway's <c>encrypt_session_ack()</c> seals the payload
+        /// (the bytes after the 13-byte fixed header) with:</para>
+        /// <list type="bullet">
+        ///  <item>Key: HKDF-SHA256 expansion of the ECDH PRK with info suffix <c>\x03</c>
+        ///        (<see cref="_sessionAckKey"/>).</item>
+        ///  <item>Nonce: twelve zero bytes — safe because the key is single-use per session.</item>
+        ///  <item>AAD: two bytes — <c>[0x08, 0x02]</c>
+        ///        (<see cref="PacketType.SessionAck"/>, <see cref="PacketFlags.Encrypted"/>).</item>
+        /// </list>
+        /// <para>The returned byte[] mirrors <see cref="DecryptInboundPacket"/>:
+        /// a freshly-allocated header + plaintext-payload buffer with
+        /// <see cref="PacketFlags.Encrypted"/> stripped from the flags byte and
+        /// <c>payload_len</c> updated to match.</para>
+        /// </summary>
+        private byte[] DecryptSessionAckPacket(byte[] data, int length)
+        {
+            if (_sessionAckKey == null) return null;
+
+            // Header(13) + Poly1305 tag(16) is the minimum valid frame size.
+            const int TagLen = 16;
+            if (data == null || length < PacketProtocol.HEADER_SIZE + TagLen)
+                return null;
+
+            int ciphertextLen = length - PacketProtocol.HEADER_SIZE;
+            var ciphertext = new byte[ciphertextLen];
+            Buffer.BlockCopy(data, PacketProtocol.HEADER_SIZE, ciphertext, 0, ciphertextLen);
+
+            // Match the gateway's SESSION_ACK_AAD constant byte-for-byte.
+            byte[] aad = new byte[]
+            {
+                (byte)PacketType.SessionAck,
+                (byte)PacketFlags.Encrypted,
+            };
+            byte[] nonce = new byte[12]; // all zeros — fixed bootstrap nonce
+
+            byte[] plaintext;
+            try
+            {
+                plaintext = ChaCha20Poly1305Impl.Open(_sessionAckKey, nonce, ciphertext, aad);
+            }
+            catch
+            {
+                return null;
+            }
+            if (plaintext == null) return null;
+
+            // Single-use bootstrap key: scrub immediately after a successful open
+            // so the secret does not linger in memory for the rest of the session.
+            // A memory-dump attacker mid-game must find nothing here to recover.
+            Array.Clear(_sessionAckKey, 0, _sessionAckKey.Length);
+            _sessionAckKey = null;
+
+            // Reassemble: header (with FLAG_ENCRYPTED stripped, payload_len
+            // adjusted) followed by the decrypted plaintext.  Downstream
+            // dispatch then runs as if the packet had arrived in plaintext —
+            // identical to the path taken when ExpectEncryptedSessionAck=false.
+            var result = new byte[PacketProtocol.HEADER_SIZE + plaintext.Length];
+            Buffer.BlockCopy(data, 0, result, 0, PacketProtocol.HEADER_SIZE);
+            result[PacketProtocol.OFFSET_FLAGS] =
+                (byte)(result[PacketProtocol.OFFSET_FLAGS] & ~(byte)PacketFlags.Encrypted);
+            uint plLen = (uint)plaintext.Length;
+            result[PacketProtocol.OFFSET_PAYLOAD_LEN]     = (byte) plLen;
+            result[PacketProtocol.OFFSET_PAYLOAD_LEN + 1] = (byte)(plLen >>  8);
+            result[PacketProtocol.OFFSET_PAYLOAD_LEN + 2] = (byte)(plLen >> 16);
+            result[PacketProtocol.OFFSET_PAYLOAD_LEN + 3] = (byte)(plLen >> 24);
+            if (plaintext.Length > 0)
+                Buffer.BlockCopy(plaintext, 0, result, PacketProtocol.HEADER_SIZE, plaintext.Length);
+            return result;
+        }
+
         private byte[] DecryptInboundPacket(byte[] data, int length)
         {
             if (_sessionKeys == null) return null;

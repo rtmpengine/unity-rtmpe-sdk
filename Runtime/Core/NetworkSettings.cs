@@ -96,6 +96,28 @@ namespace RTMPE.Core
         [Range(1_024, 65_536)]
         public int networkThreadBufferBytes = 8_192;
 
+        /// <summary>
+        /// Hard cap on the depth of <c>NetworkThread</c>'s outbound send queue.
+        /// When the queue is at this depth, additional <c>Send</c> /
+        /// <c>SendOwned</c> calls drop the newest packet and increment
+        /// <c>NetworkThread.SendQueueDroppedCount</c> instead of enqueueing
+        /// (drop-newest preserves arrival ordering of already-queued traffic).
+        /// Bounds heap usage when producers outpace the drain — primarily
+        /// under sustained ENOBUFS, where drain throughput falls below the
+        /// 30 Hz × 16-player producer rate.  Default 4096 ≈ 4 MB at 1200 B
+        /// per item, sized for mobile.  Integrators MUST monitor
+        /// <c>SendQueueDroppedCount</c> to detect saturation.
+        /// </summary>
+        [Tooltip("Hard cap on the NetworkThread outbound send-queue depth. " +
+                 "When at the cap, additional packets are dropped (newest) " +
+                 "and SendQueueDroppedCount is incremented; OnError is NOT " +
+                 "raised. Bounds heap usage when the producer outpaces the " +
+                 "drain (sustained ENOBUFS). Default 4096 ≈ 4 MB at 1200 B " +
+                 "per item — sized for mobile. Monitor " +
+                 "NetworkThread.SendQueueDroppedCount for saturation.")]
+        [Range(64, 65_536)]
+        public int sendQueueMaxItems = 4_096;
+
         // ── Interest management ─────────────────────────────────────────────────
 
         [Header("Interest Management")]

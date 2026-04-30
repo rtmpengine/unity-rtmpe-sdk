@@ -1243,7 +1243,10 @@ namespace RTMPE.Core
                     _settings.receiveBufferBytes);
             }
 
-            _networkThread = new NetworkThread(_transport, _settings.networkThreadBufferBytes);
+            _networkThread = new NetworkThread(
+                _transport,
+                _settings.networkThreadBufferBytes,
+                _settings.sendQueueMaxItems);
             _networkThread.OnPacketReceivedRented += HandlePacketReceivedRented;
             _networkThread.OnError                += HandleTransportError;
 
@@ -1430,14 +1433,36 @@ namespace RTMPE.Core
                 _spawnManager = new SpawnManager(registry, ownership, this);
 
                 // Wire the static EnhancedRpcVerifier hooks to the live
-                // session state.  The default sender verifier accepts only
-                // the local session id (peer impersonation guard); the
-                // default object verifier requires the inbound objectId to
-                // resolve in the spawn registry.  Both hooks are torn down
-                // on Cleanup / ClearSessionData so a stale closure cannot
-                // outlive the manager that captured it.
+                // session state.
+                //
+                // The roster-anchored sender verifier admits the local session
+                // id and (when in a room) defers to IsRosterMemberSession for
+                // peer admission.  The current room wire format (see
+                // RoomPacketParser — RoomJoin response and PlayerJoined
+                // notification) does NOT carry the gateway session id per
+                // roster member; only player UUIDs are exposed.  Without a
+                // session-id keyed roster the SDK cannot distinguish a
+                // legitimate peer from an arbitrary in-room sender, so the
+                // membership predicate accepts any non-zero session id and a
+                // one-time advisory is emitted on first peer admission.  This
+                // preserves cross-player RPC delivery while keeping the zero
+                // sentinel guard (impersonation of the pre-authenticated
+                // session) and the self-only path active outside any room.
+                //
+                // The object verifier requires the inbound objectId to resolve
+                // in the spawn registry.  Both hooks are torn down on Cleanup /
+                // ClearSessionData so a stale closure cannot outlive the
+                // manager that captured it.
                 RTMPE.Rpc.EnhancedRpcVerifier.SelfSessionIdProvider =
                     () => _localPlayerId;
+                RTMPE.Rpc.EnhancedRpcVerifier.IsRoomJoined =
+                    () => _roomManager?.CurrentRoom != null;
+                RTMPE.Rpc.EnhancedRpcVerifier.LocalSessionIdProvider =
+                    () => _localPlayerId;
+                RTMPE.Rpc.EnhancedRpcVerifier.IsRosterMemberSession =
+                    AdmitNonZeroPeerWithOneTimeAdvisory;
+                RTMPE.Rpc.EnhancedRpcVerifier.SenderVerifier =
+                    RTMPE.Rpc.EnhancedRpcVerifier.RoomAnchoredSenderVerifier;
                 RTMPE.Rpc.EnhancedRpcVerifier.ObjectExistsVerifier =
                     objectId => objectId != 0UL && registry.Get(objectId) != null;
 
@@ -1460,6 +1485,33 @@ namespace RTMPE.Core
 
         private void OnRoomManagerPlayerJoined(PlayerInfo _)
             => _spawnManager?.MarkAllVariablesDirtyForResync();
+
+        // One-time advisory state for the in-room peer-admission fallback.
+        // The roster-anchored sender verifier consults this predicate when a
+        // non-self senderId arrives while the local SDK is in a room.  The
+        // current open-source room wire format does not expose gateway session
+        // ids per roster member, so client-side roster anchoring is not yet
+        // possible; non-zero peers are admitted with a one-time advisory so
+        // legitimate cross-player RPC traffic flows while the architectural
+        // limitation remains visible to integrators auditing logs.
+        private static int _peerAdmissionAdvisoryEmitted;
+
+        private static bool AdmitNonZeroPeerWithOneTimeAdvisory(ulong senderId)
+        {
+            if (senderId == 0UL) return false;
+            if (System.Threading.Interlocked.CompareExchange(
+                    ref _peerAdmissionAdvisoryEmitted, 1, 0) == 0)
+            {
+                UnityEngine.Debug.LogWarning(
+                    "[RTMPE] EnhancedRpcVerifier admitting peer RPCs without a " +
+                    "session-id-keyed roster anchor.  The room wire format does " +
+                    "not expose per-member gateway session ids, so peer senderIds " +
+                    "cannot be cross-checked against the roster on the client.  " +
+                    "Wire EnhancedRpcVerifier.IsRosterMemberSession or call " +
+                    "SetServerAttestedSenderVerifier for stricter admission.");
+            }
+            return true;
+        }
 
         /// <summary>
         /// **N-1** — shortcut reconnect using a previously-issued reconnect
@@ -1680,7 +1732,10 @@ namespace RTMPE.Core
                     _settings.sendBufferBytes,
                     _settings.receiveBufferBytes);
             }
-            _networkThread = new NetworkThread(_transport, _settings.networkThreadBufferBytes);
+            _networkThread = new NetworkThread(
+                _transport,
+                _settings.networkThreadBufferBytes,
+                _settings.sendQueueMaxItems);
             _networkThread.OnPacketReceivedRented += HandlePacketReceivedRented;
             _networkThread.OnError                += HandleTransportError;
         }
@@ -3855,8 +3910,17 @@ namespace RTMPE.Core
             // RecreateRoomAndSpawnManagers so they cannot fire against the
             // torn-down session (and so the captured registry / session-id
             // closure is eligible for GC).
-            RTMPE.Rpc.EnhancedRpcVerifier.SelfSessionIdProvider = null;
-            RTMPE.Rpc.EnhancedRpcVerifier.ObjectExistsVerifier  = null;
+            RTMPE.Rpc.EnhancedRpcVerifier.SelfSessionIdProvider  = null;
+            RTMPE.Rpc.EnhancedRpcVerifier.ObjectExistsVerifier   = null;
+            RTMPE.Rpc.EnhancedRpcVerifier.IsRoomJoined           = null;
+            RTMPE.Rpc.EnhancedRpcVerifier.LocalSessionIdProvider = null;
+            RTMPE.Rpc.EnhancedRpcVerifier.IsRosterMemberSession  = null;
+            // Revert to the static default so a subsequent session that boots
+            // without RecreateRoomAndSpawnManagers (e.g. a unit-test fixture
+            // poking ClearSessionData) inherits the conservative self-only
+            // policy rather than a stale roster-anchored closure.
+            RTMPE.Rpc.EnhancedRpcVerifier.SenderVerifier =
+                RTMPE.Rpc.EnhancedRpcVerifier.DefaultSenderVerifier;
             _handshakeHandler?.Dispose();  // Zero key material before GC can observe it
             _handshakeHandler = null;
             _sessionKeys?.Dispose();       // Zero session keys before GC can observe it

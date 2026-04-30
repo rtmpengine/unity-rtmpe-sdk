@@ -72,6 +72,17 @@ namespace RTMPE.Threading
         // ConcurrentQueue<T>'s internal slots without boxing.
         private readonly ThreadSafeQueue<SendItem> _sendQueue = new ThreadSafeQueue<SendItem>();
 
+        // Hard cap on the outbound queue depth.  Prevents an unbounded heap
+        // leak when producers (Send / SendOwned) outpace the drain — the
+        // primary risk window is sustained ENOBUFS, where the drain backs off
+        // to ~250 datagrams/second while a 30 Hz × 16-player session
+        // continues to enqueue at ~480 datagrams/second.  Net growth ≈
+        // 230 items/second, each holding up to ~1200 bytes of pool-rented
+        // payload — without a cap the heap leaks ≈ 280 KiB/second until OOM.
+        // See sendQueueMaxItems on NetworkSettings for the configurable bound.
+        private readonly int _maxQueuedItems;
+        private long _sendQueueDroppedCount;
+
         private readonly struct SendItem
         {
             public readonly byte[] Buffer;
@@ -144,13 +155,27 @@ namespace RTMPE.Threading
 
         /// <param name="transport">Transport to own and operate. Disposed on <see cref="Dispose"/>.</param>
         /// <param name="receiveBufferSize">Per-packet receive buffer size in bytes (default 8 KiB).</param>
-        public NetworkThread(NetworkTransport transport, int receiveBufferSize = 8_192)
+        /// <param name="sendQueueMaxItems">
+        /// Hard cap on the number of outbound <see cref="SendItem"/> entries the
+        /// thread will hold at any one time.  When the queue is at the cap,
+        /// <see cref="Send"/> and <see cref="SendOwned"/> drop the newest packet
+        /// and increment <see cref="SendQueueDroppedCount"/> instead of
+        /// enqueueing.  Default 4096 ≈ 4 MB at 1200 B/item — bounded for
+        /// mobile while large enough to absorb routine bursts.
+        /// </param>
+        public NetworkThread(
+            NetworkTransport transport,
+            int receiveBufferSize = 8_192,
+            int sendQueueMaxItems = 4_096)
         {
             if (receiveBufferSize <= 0)
                 throw new ArgumentOutOfRangeException(nameof(receiveBufferSize));
+            if (sendQueueMaxItems <= 0)
+                throw new ArgumentOutOfRangeException(nameof(sendQueueMaxItems));
 
             _transport         = transport ?? throw new ArgumentNullException(nameof(transport));
             _receiveBufferSize = receiveBufferSize;
+            _maxQueuedItems    = sendQueueMaxItems;
         }
 
         // ── Lifecycle ──────────────────────────────────────────────────────────
@@ -251,6 +276,20 @@ namespace RTMPE.Threading
         /// Enqueue <paramref name="data"/> for transmission on the next loop iteration.
         /// Thread-safe; returns immediately. The incoming array is copied internally
         /// so the caller can safely reuse or discard its buffer.
+        ///
+        /// Bounded contract — the outbound queue is capped at the
+        /// <c>sendQueueMaxItems</c> value passed to the constructor (default
+        /// 4096).  When the queue is at capacity (typically under sustained
+        /// ENOBUFS, where the drain rate falls below the producer rate) the
+        /// newest packet is dropped on the floor and
+        /// <see cref="SendQueueDroppedCount"/> is incremented.  Drop-newest is
+        /// chosen over drop-oldest because (a) it preserves arrival order of
+        /// already-queued traffic — drop-oldest would invert sequence at the
+        /// receiver and break per-packet ordering guarantees built on top of
+        /// this layer; and (b) it requires no head-removal primitive on
+        /// <see cref="ThreadSafeQueue{T}"/>.  No <see cref="OnError"/> is raised
+        /// (matches the ENOBUFS ethos — telemetry only); integrators MUST
+        /// monitor <see cref="SendQueueDroppedCount"/> to detect saturation.
         /// </summary>
         public void Send(byte[] data, bool reliable = false)
         {
@@ -260,6 +299,18 @@ namespace RTMPE.Threading
             // larger than data.Length; we record the exact byte count alongside
             // the buffer so the transport sends only the meaningful prefix.
             var rented = ArrayPool<byte>.Shared.Rent(data.Length);
+
+            // Cap check is intentionally a non-atomic Count read followed by
+            // Enqueue.  A small overshoot bounded by the number of concurrent
+            // producers is acceptable; the alternative — a lock around every
+            // enqueue — would add cross-core contention on the hot send path.
+            if (_sendQueue.Count >= _maxQueuedItems)
+            {
+                Interlocked.Increment(ref _sendQueueDroppedCount);
+                ArrayPool<byte>.Shared.Return(rented, clearArray: true);
+                return;
+            }
+
             try
             {
                 Buffer.BlockCopy(data, 0, rented, 0, data.Length);
@@ -297,6 +348,17 @@ namespace RTMPE.Threading
         public void SendOwned(byte[] ownedData)
         {
             if (!_running || ownedData == null || ownedData.Length == 0) return;
+
+            // Drop-newest under saturation.  See Send() for the rationale on
+            // ordering and policy choice.  The owned array is not pool-rented,
+            // so no return-to-pool step is needed — letting the reference
+            // fall out of scope is sufficient.
+            if (_sendQueue.Count >= _maxQueuedItems)
+            {
+                Interlocked.Increment(ref _sendQueueDroppedCount);
+                return;
+            }
+
             // Caller-owned arrays are sent in full; they must not be returned to
             // the pool because they were never rented from it.  Send's
             // try/catch wraps the rented-buffer return contract on
@@ -382,6 +444,22 @@ namespace RTMPE.Threading
         /// Exposed for telemetry; never resets across the thread's lifetime.
         /// </summary>
         public long EnobufsCount => Interlocked.Read(ref _enobufsCount);
+
+        /// <summary>
+        /// Total number of outbound packets dropped because the send queue
+        /// was at its configured cap (drop-newest policy).  Sustained growth
+        /// indicates the producer rate exceeds the drain rate — typically a
+        /// symptom of an ENOBUFS-bounded uplink.  Exposed for telemetry;
+        /// never resets across the thread's lifetime.
+        /// </summary>
+        public long SendQueueDroppedCount => Interlocked.Read(ref _sendQueueDroppedCount);
+
+        /// <summary>
+        /// Current depth of the outbound send queue.  Approximate — may be
+        /// observed mid-mutation by a concurrent producer or by the drain
+        /// loop.  Useful for telemetry dashboards and saturation tests.
+        /// </summary>
+        public int SendQueueCount => _sendQueue.Count;
 
         private void DrainSendQueue()
         {

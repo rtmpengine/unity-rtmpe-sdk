@@ -120,9 +120,7 @@ namespace RTMPE.Rpc
         /// </summary>
         public static void Register<T>() where T : INetworkSerializable, new()
         {
-            var type = typeof(T);
-            if (type.FullName != null)
-                _byName[type.FullName] = type;
+            Register(typeof(T));
         }
 
         /// <summary>
@@ -147,8 +145,32 @@ namespace RTMPE.Rpc
                     "and either a value type or a class with a public parameterless ctor).",
                     nameof(type));
 
-            if (type.FullName != null)
-                _byName[type.FullName] = type;
+            if (type.FullName == null) return;
+
+            // Guard the dictionary write with a same-name / different-Type
+            // detection.  Idempotent re-registration of the exact same Type
+            // (the documented behaviour) stays silent; a second registration
+            // under the same FullName but a DIFFERENT runtime Type instance
+            // surfaces a diagnostic.  The mismatch is only ever observed
+            // after IL2CPP / domain-reload boundaries (assembly version
+            // skew, hot-reload of a recompiled type) and silently letting
+            // the new entry win means in-flight RPC handlers continue to
+            // dispatch through the old NetworkDeserialize while every new
+            // entry uses the new one — divergent behaviour for the same
+            // wire shape.  Logging at the moment of swap makes the source
+            // observable in player.log; the assignment still proceeds so
+            // tests and authoring code that intentionally rotate types
+            // continue to work.
+            if (_byName.TryGetValue(type.FullName, out var existing) && existing != type)
+            {
+                UnityEngine.Debug.LogWarning(
+                    $"[RTMPE] RpcTypeRegistry.Register: '{type.FullName}' already maps to a " +
+                    $"different Type instance ({existing.AssemblyQualifiedName}) — overwriting " +
+                    $"with {type.AssemblyQualifiedName}.  This usually indicates an assembly " +
+                    "version skew or a hot-reloaded type; in-flight RPC handlers may dispatch " +
+                    "through stale NetworkDeserialize bindings until they next re-resolve.");
+            }
+            _byName[type.FullName] = type;
         }
 
         /// <summary>

@@ -33,6 +33,40 @@ namespace RTMPE.Protocol
         // gateway's expectation that the first packet carries sequence 0.
         private int _sequenceCounter = -1;
 
+        // Midpoint observability: increments by 1 every time the int
+        // counter crosses from int.MaxValue → int.MinValue, which
+        // corresponds to the wire-domain u32 sequence transitioning from
+        // 0x7FFF_FFFF → 0x8000_0000 — the MIDPOINT of u32 space, not the
+        // full wrap.  This is the operationally-useful early signal: at
+        // the midpoint there are still ~2 billion sends of headroom
+        // before the gateway's replay-window logic begins observing
+        // duplicate sequences after the actual u32 wrap, giving operators
+        // a generous window to plan a re-handshake.  The TRUE u32 wrap
+        // (0xFFFF_FFFF → 0x0000_0000) corresponds to the int counter
+        // going from -1 to 0 — but at that point the warning is already
+        // too late, so we deliberately fire the alert at the midpoint
+        // crossing.
+        private long _sequenceMidpointCrossingCount;
+
+        /// <summary>
+        /// Total number of times the wire sequence counter has crossed
+        /// the u32 midpoint (0x7FFF_FFFF → 0x8000_0000) since this builder
+        /// was constructed.  This is the operational early-warning signal
+        /// for sequence wrap: at midpoint there are still ~2 billion
+        /// sends of headroom before the actual u32 wrap, giving
+        /// dashboards time to plan a re-handshake.  Operators that
+        /// observe a non-zero count should age the connection.
+        /// </summary>
+        public long SequenceMidpointCrossingCount =>
+            System.Threading.Interlocked.Read(ref _sequenceMidpointCrossingCount);
+
+        /// <summary>
+        /// Last assigned wire sequence (uint) — useful for dashboards that
+        /// want to estimate time-to-wrap.  Reads the int counter and casts
+        /// to uint via the same convention as the wire encoding.
+        /// </summary>
+        public uint CurrentSequence => (uint)Volatile.Read(ref _sequenceCounter);
+
         // ── Public factory methods ────────────────────────────────────────────
 
         /// <summary>
@@ -236,7 +270,29 @@ namespace RTMPE.Protocol
 
             // Atomic increment — no Unsafe.As required; cast uint at write time.
             // Interlocked.Increment returns int; casting to uint handles wrap-around correctly.
-            uint seq = (uint)Interlocked.Increment(ref _sequenceCounter);
+            int rawSeq = Interlocked.Increment(ref _sequenceCounter);
+            uint seq   = (uint)rawSeq;
+            // Midpoint detection: when the int counter increments from
+            // int.MaxValue (= u32 0x7FFFFFFF) to int.MinValue (= u32
+            // 0x80000000), the wire-domain u32 has crossed the midpoint
+            // of its space.  At this point ~2 billion further sends remain
+            // before the actual wrap (u32 0xFFFFFFFF → 0x00000000); the
+            // alert fires here precisely so operators have time to plan a
+            // re-handshake well before the gateway's replay-window dedup
+            // begins observing duplicate sequences.  Log exactly once
+            // per builder lifetime.
+            if (rawSeq == int.MinValue)
+            {
+                long count = Interlocked.Increment(ref _sequenceMidpointCrossingCount);
+                if (count == 1)
+                {
+                    UnityEngine.Debug.LogWarning(
+                        "[RTMPE] PacketBuilder: wire sequence counter just crossed " +
+                        "the u32 midpoint.  A full u32 wrap will occur after another " +
+                        "~2 billion sends; plan a re-handshake before the gateway's " +
+                        "replay-window dedup begins observing duplicate sequences.");
+                }
+            }
 
             var packet = new byte[PacketProtocol.HEADER_SIZE + payload.Length];
 

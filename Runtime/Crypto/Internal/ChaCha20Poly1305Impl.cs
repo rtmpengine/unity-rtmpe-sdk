@@ -45,6 +45,7 @@
 // ============================================================================
 
 using System;
+using System.Buffers;
 using System.Numerics;
 
 namespace RTMPE.Crypto.Internal
@@ -81,55 +82,62 @@ namespace RTMPE.Crypto.Internal
         private static void ChaCha20Block(
             byte[] key, uint counter, byte[] nonce, byte[] output)
         {
-            // Build initial state (16 × uint32).
-            var s = new uint[16];
-            s[0]  = C0; s[1]  = C1; s[2]  = C2; s[3]  = C3;
-            s[4]  = ReadLE32(key,    0); s[5]  = ReadLE32(key,    4);
-            s[6]  = ReadLE32(key,    8); s[7]  = ReadLE32(key,   12);
-            s[8]  = ReadLE32(key,   16); s[9]  = ReadLE32(key,   20);
-            s[10] = ReadLE32(key,   24); s[11] = ReadLE32(key,   28);
-            s[12] = counter;
-            s[13] = ReadLE32(nonce,  0);
-            s[14] = ReadLE32(nonce,  4);
-            s[15] = ReadLE32(nonce,  8);
-
-            // Working copy.
-            var w = (uint[])s.Clone();
-
-            // 10 double rounds = 20 rounds total.
-            for (int i = 0; i < 10; i++)
+            uint[] s = null;
+            uint[] w = null;
+            try
             {
-                // Column rounds
-                QuarterRound(ref w[0], ref w[4], ref w[8],  ref w[12]);
-                QuarterRound(ref w[1], ref w[5], ref w[9],  ref w[13]);
-                QuarterRound(ref w[2], ref w[6], ref w[10], ref w[14]);
-                QuarterRound(ref w[3], ref w[7], ref w[11], ref w[15]);
-                // Diagonal rounds
-                QuarterRound(ref w[0], ref w[5], ref w[10], ref w[15]);
-                QuarterRound(ref w[1], ref w[6], ref w[11], ref w[12]);
-                QuarterRound(ref w[2], ref w[7], ref w[8],  ref w[13]);
-                QuarterRound(ref w[3], ref w[4], ref w[9],  ref w[14]);
-            }
+                // Build initial state (16 × uint32).
+                s = new uint[16];
+                s[0]  = C0; s[1]  = C1; s[2]  = C2; s[3]  = C3;
+                s[4]  = ReadLE32(key,    0); s[5]  = ReadLE32(key,    4);
+                s[6]  = ReadLE32(key,    8); s[7]  = ReadLE32(key,   12);
+                s[8]  = ReadLE32(key,   16); s[9]  = ReadLE32(key,   20);
+                s[10] = ReadLE32(key,   24); s[11] = ReadLE32(key,   28);
+                s[12] = counter;
+                s[13] = ReadLE32(nonce,  0);
+                s[14] = ReadLE32(nonce,  4);
+                s[15] = ReadLE32(nonce,  8);
 
-            // Add original state and write to output (64 bytes, LE).
-            for (int i = 0; i < 16; i++)
+                // Working copy.
+                w = (uint[])s.Clone();
+
+                // 10 double rounds = 20 rounds total.
+                for (int i = 0; i < 10; i++)
+                {
+                    // Column rounds
+                    QuarterRound(ref w[0], ref w[4], ref w[8],  ref w[12]);
+                    QuarterRound(ref w[1], ref w[5], ref w[9],  ref w[13]);
+                    QuarterRound(ref w[2], ref w[6], ref w[10], ref w[14]);
+                    QuarterRound(ref w[3], ref w[7], ref w[11], ref w[15]);
+                    // Diagonal rounds
+                    QuarterRound(ref w[0], ref w[5], ref w[10], ref w[15]);
+                    QuarterRound(ref w[1], ref w[6], ref w[11], ref w[12]);
+                    QuarterRound(ref w[2], ref w[7], ref w[8],  ref w[13]);
+                    QuarterRound(ref w[3], ref w[4], ref w[9],  ref w[14]);
+                }
+
+                // Add original state and write to output (64 bytes, LE).
+                for (int i = 0; i < 16; i++)
+                {
+                    uint v = w[i] + s[i];
+                    output[i * 4 + 0] = (byte)(v);
+                    output[i * 4 + 1] = (byte)(v >> 8);
+                    output[i * 4 + 2] = (byte)(v >> 16);
+                    output[i * 4 + 3] = (byte)(v >> 24);
+                }
+            }
+            finally
             {
-                uint v = w[i] + s[i];
-                output[i * 4 + 0] = (byte)(v);
-                output[i * 4 + 1] = (byte)(v >> 8);
-                output[i * 4 + 2] = (byte)(v >> 16);
-                output[i * 4 + 3] = (byte)(v >> 24);
+                // Wipe the working state. Both `s` and `w` contain the 32-byte
+                // AEAD key in words [4..12]; if these arrays are promoted to
+                // gen-1/2 by the GC under heavy load, key bytes can linger in
+                // long-lived heap regions. Zeroing in the finally block
+                // closes the window even if `output` write or any earlier
+                // step throws (e.g. IndexOutOfRange on a malformed caller).
+                // Cf. RFC 9106 §5.4 and OpenSSL's OPENSSL_cleanse pattern.
+                if (w != null) Array.Clear(w, 0, 16);
+                if (s != null) Array.Clear(s, 0, 16);
             }
-
-            // Wipe the working state. Both `s` and `w` contain the 32-byte
-            // AEAD key in words [4..12]; if these arrays are promoted to
-            // gen-1/2 by the GC under heavy load, key bytes can linger in
-            // long-lived heap regions. Zeroing immediately after the block
-            // closes the only window in which a heap-dump adversary could
-            // recover the key from this transient state. Cf. RFC 9106 §5.4
-            // and OpenSSL's OPENSSL_cleanse pattern.
-            Array.Clear(w, 0, 16);
-            Array.Clear(s, 0, 16);
         }
 
         /// <summary>XOR input with the ChaCha20 keystream starting at <paramref name="initialCounter"/>.</summary>
@@ -139,26 +147,33 @@ namespace RTMPE.Crypto.Internal
             byte[] output, int outputOffset,
             int length)
         {
-            var block = new byte[64];
-            uint blockCounter = initialCounter;
-            int processed = 0;
-
-            while (processed < length)
+            byte[] block = null;
+            try
             {
-                ChaCha20Block(key, blockCounter++, nonce, block);
-                int take = Math.Min(64, length - processed);
-                for (int i = 0; i < take; i++)
-                    output[outputOffset + processed + i]
-                        = (byte)(input[inputOffset + processed + i] ^ block[i]);
-                processed += take;
-            }
+                block = new byte[64];
+                uint blockCounter = initialCounter;
+                int processed = 0;
 
-            // Wipe the keystream block. While ChaCha20 keystream bytes are
-            // not directly key-recoverable, retaining 64 bytes of contiguous
-            // keystream from a known-plaintext packet would let a heap-dump
-            // adversary forge / decrypt that specific packet, so we zero on
-            // exit as defense-in-depth.
-            Array.Clear(block, 0, block.Length);
+                while (processed < length)
+                {
+                    ChaCha20Block(key, blockCounter++, nonce, block);
+                    int take = Math.Min(64, length - processed);
+                    for (int i = 0; i < take; i++)
+                        output[outputOffset + processed + i]
+                            = (byte)(input[inputOffset + processed + i] ^ block[i]);
+                    processed += take;
+                }
+            }
+            finally
+            {
+                // Wipe the keystream block on every exit path (success, OOB
+                // throw, anything).  While ChaCha20 keystream bytes are not
+                // directly key-recoverable, retaining 64 bytes of contiguous
+                // keystream from a known-plaintext packet would let a heap-
+                // dump adversary forge / decrypt that specific packet, so
+                // zero on exit as defense-in-depth.
+                if (block != null) Array.Clear(block, 0, block.Length);
+            }
         }
 
         // ── Poly1305 MAC ─────────────────────────────────────────────────────
@@ -235,34 +250,60 @@ namespace RTMPE.Crypto.Internal
         // ── AEAD Construction ────────────────────────────────────────────────
 
         /// <summary>
-        /// Build the Poly1305 input buffer per RFC 8439 §2.8:
-        ///   AAD || pad16(AAD) || Ciphertext || pad16(Ciphertext)
-        ///   || len(AAD):8LE || len(Ciphertext):8LE
+        /// Compute the canonical RFC 8439 §2.8 Poly1305 input length for the
+        /// given AAD and ciphertext sizes:
+        ///   pad16(AAD) + pad16(Ciphertext) + 16 bytes of trailers.
         /// </summary>
-        private static byte[] BuildPolyInput(
-            byte[] aad,        int aadLen,
-            byte[] ciphertext, int ctLen)
+        private static int PolyInputLength(int aadLen, int ctLen)
         {
             int aadPad = ((aadLen + 15) / 16) * 16;
             int ctPad  = ((ctLen  + 15) / 16) * 16;
-            var buf    = new byte[aadPad + ctPad + 16];
+            return aadPad + ctPad + 16;
+        }
+
+        /// <summary>
+        /// Fill <paramref name="dest"/> with the Poly1305 input buffer per
+        /// RFC 8439 §2.8:
+        ///   AAD || pad16(AAD) || Ciphertext || pad16(Ciphertext)
+        ///   || len(AAD):8LE || len(Ciphertext):8LE
+        /// </summary>
+        /// <remarks>
+        /// The destination buffer MUST be sized at least
+        /// <see cref="PolyInputLength"/> bytes; the prefix slice it covers is
+        /// fully written by this routine — the bytes between
+        /// <c>aadLen</c>..<c>aadPad</c> and <c>aadPad+ctLen</c>..<c>aadPad+ctPad</c>
+        /// are explicitly zeroed so a pool-rented buffer with arbitrary prior
+        /// contents does not leak past payload bytes into the MAC computation.
+        /// Returns the actual prefix length written.
+        /// </remarks>
+        private static int BuildPolyInputInto(
+            byte[] aad,        int aadLen,
+            byte[] ciphertext, int ctLen,
+            byte[] dest)
+        {
+            int aadPad = ((aadLen + 15) / 16) * 16;
+            int ctPad  = ((ctLen  + 15) / 16) * 16;
+            int total  = aadPad + ctPad + 16;
 
             if (aadLen > 0)
-                Buffer.BlockCopy(aad, 0, buf, 0, aadLen);
-            if (ctLen > 0)
-                Buffer.BlockCopy(ciphertext, 0, buf, aadPad, ctLen);
+                Buffer.BlockCopy(aad, 0, dest, 0, aadLen);
+            if (aadPad > aadLen)
+                Array.Clear(dest, aadLen, aadPad - aadLen);
 
-            // len(aad) as 8-byte LE uint64
+            if (ctLen > 0)
+                Buffer.BlockCopy(ciphertext, 0, dest, aadPad, ctLen);
+            if (ctPad > ctLen)
+                Array.Clear(dest, aadPad + ctLen, ctPad - ctLen);
+
             ulong aadLenU = (ulong)aadLen;
             for (int i = 0; i < 8; i++)
-                buf[aadPad + ctPad + i] = (byte)(aadLenU >> (i * 8));
+                dest[aadPad + ctPad + i] = (byte)(aadLenU >> (i * 8));
 
-            // len(ciphertext) as 8-byte LE uint64
             ulong ctLenU = (ulong)ctLen;
             for (int i = 0; i < 8; i++)
-                buf[aadPad + ctPad + 8 + i] = (byte)(ctLenU >> (i * 8));
+                dest[aadPad + ctPad + 8 + i] = (byte)(ctLenU >> (i * 8));
 
-            return buf;
+            return total;
         }
 
         // ── Public API ────────────────────────────────────────────────────────
@@ -290,6 +331,7 @@ namespace RTMPE.Crypto.Internal
             byte[] block0      = null;
             byte[] poly1305Key = null;
             byte[] polyInput   = null;
+            int    polyLen     = 0;
             try
             {
                 // 1. Derive one-time Poly1305 key from block counter 0 (first 32 bytes).
@@ -303,8 +345,15 @@ namespace RTMPE.Crypto.Internal
                 ChaCha20XorKeyStream(key, 1, nonce, plaintext, 0, ciphertext, 0, plaintext.Length);
 
                 // 3. Compute Poly1305 MAC over: AAD || pad16 || ciphertext || pad16 || lengths.
-                polyInput = BuildPolyInput(aad, aad.Length, ciphertext, ciphertext.Length);
-                var tag = Poly1305Mac(polyInput, 0, polyInput.Length, poly1305Key);
+                //    The Poly input is rented from the shared array pool so the
+                //    256–512 B per-packet buffer does not churn the GC at game
+                //    tick rate.  Rent may return a longer array; only the
+                //    `polyLen` prefix is meaningful and only that prefix is
+                //    cleared in the finally block before return.
+                polyLen   = PolyInputLength(aad.Length, ciphertext.Length);
+                polyInput = ArrayPool<byte>.Shared.Rent(polyLen);
+                BuildPolyInputInto(aad, aad.Length, ciphertext, ciphertext.Length, polyInput);
+                var tag = Poly1305Mac(polyInput, 0, polyLen, poly1305Key);
 
                 // 4. Return ciphertext || tag.
                 var result = new byte[ciphertext.Length + 16];
@@ -317,9 +366,15 @@ namespace RTMPE.Crypto.Internal
                 if (block0      != null) Array.Clear(block0,      0, block0.Length);
                 if (poly1305Key != null) Array.Clear(poly1305Key, 0, poly1305Key.Length);
                 // polyInput contains AAD + ciphertext (already-on-the-wire
-                // data — not secret) but keeping the buffer alive serves no
-                // purpose; clear it for symmetry with the secret material.
-                if (polyInput   != null) Array.Clear(polyInput,   0, polyInput.Length);
+                // data — not secret) but the buffer is returned to the pool
+                // and will be re-rented for an unrelated packet.  Clear the
+                // prefix we wrote so an unrelated future caller does not see
+                // residual bytes from this packet.
+                if (polyInput != null)
+                {
+                    if (polyLen > 0) Array.Clear(polyInput, 0, polyLen);
+                    ArrayPool<byte>.Shared.Return(polyInput);
+                }
             }
         }
 
@@ -343,6 +398,7 @@ namespace RTMPE.Crypto.Internal
             byte[] block0      = null;
             byte[] poly1305Key = null;
             byte[] polyInput   = null;
+            int    polyLen     = 0;
             byte[] expectedTag = null;
             try
             {
@@ -353,8 +409,11 @@ namespace RTMPE.Crypto.Internal
                 Buffer.BlockCopy(block0, 0, poly1305Key, 0, 32);
 
                 // Verify tag before decrypting (authenticate-then-decrypt).
-                polyInput = BuildPolyInput(aad, aad.Length, ciphertextWithTag, ctLen);
-                expectedTag = Poly1305Mac(polyInput, 0, polyInput.Length, poly1305Key);
+                // Pool-rent the Poly input buffer (see Seal for rationale).
+                polyLen     = PolyInputLength(aad.Length, ctLen);
+                polyInput   = ArrayPool<byte>.Shared.Rent(polyLen);
+                BuildPolyInputInto(aad, aad.Length, ciphertextWithTag, ctLen, polyInput);
+                expectedTag = Poly1305Mac(polyInput, 0, polyLen, poly1305Key);
 
                 if (!ConstantTimeEquals(expectedTag, 0, ciphertextWithTag, ctLen, 16))
                     return null; // MAC verification failed — reject
@@ -369,7 +428,11 @@ namespace RTMPE.Crypto.Internal
                 if (block0      != null) Array.Clear(block0,      0, block0.Length);
                 if (poly1305Key != null) Array.Clear(poly1305Key, 0, poly1305Key.Length);
                 if (expectedTag != null) Array.Clear(expectedTag, 0, expectedTag.Length);
-                if (polyInput   != null) Array.Clear(polyInput,   0, polyInput.Length);
+                if (polyInput   != null)
+                {
+                    if (polyLen > 0) Array.Clear(polyInput, 0, polyLen);
+                    ArrayPool<byte>.Shared.Return(polyInput);
+                }
             }
         }
 

@@ -53,6 +53,24 @@ namespace RTMPE.Core
         private uint _lastDelivered;
         private bool _hasDelivered;
 
+        // Number of times a sequence already pending in the buffer was
+        // re-Enqueued with a different (or same) payload.  In a well-behaved
+        // session this counter remains zero — a legitimate duplicate
+        // sequence cannot survive the AEAD replay window upstream.  A
+        // non-zero count surfaces either (a) a sender bug producing
+        // duplicate gameplay sequences across distinct AEAD packets or
+        // (b) a downstream reordering pathology.  Surfaced for tests and
+        // future telemetry.
+        private long _duplicatePendingCount;
+
+        /// <summary>
+        /// Number of <see cref="Enqueue"/> calls that arrived for a
+        /// sequence already buffered.  The first-writer-wins policy keeps
+        /// the original payload; this counter records that the
+        /// later-arriving duplicate was rejected.
+        /// </summary>
+        public long DuplicatePendingCount => _duplicatePendingCount;
+
         /// <summary>
         /// Construct a reorder buffer with the given capacity.  The capacity
         /// is clamped to [2, 64] — values below 2 cannot resolve any
@@ -115,6 +133,18 @@ namespace RTMPE.Core
             }
 
             // Out-of-order arrival: park it pending the missing predecessor.
+            // First-writer-wins on collision: a sequence already buffered is
+            // not overwritten — the original payload is the AEAD-validated
+            // arrival that earned the slot, and silently replacing it would
+            // let a sender re-issue the same gameplay sequence with a fresh
+            // payload (data-integrity hazard) without any visible signal.
+            // The duplicate counter surfaces the event for diagnostics and
+            // for assertions in adversarial tests.
+            if (_pending.ContainsKey(sequence))
+            {
+                _duplicatePendingCount = unchecked(_duplicatePendingCount + 1);
+                return;
+            }
             _pending[sequence] = payload;
 
             // Memory-amplification guard.  Once the buffer reaches its cap we
@@ -146,8 +176,9 @@ namespace RTMPE.Core
         public void Reset()
         {
             _pending.Clear();
-            _lastDelivered = 0u;
-            _hasDelivered  = false;
+            _lastDelivered         = 0u;
+            _hasDelivered          = false;
+            _duplicatePendingCount = 0;
         }
 
         // ── Internals ────────────────────────────────────────────────────

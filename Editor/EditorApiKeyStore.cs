@@ -122,16 +122,58 @@ namespace RTMPE.Editor
         public static string Load()
         {
             // Legacy migration first — if a plaintext key exists, promote it.
+            //
+            // CRITICAL ORDERING: encrypt + persist the new ciphertext BEFORE
+            // deleting the legacy slot.  Save() swallows every exception and
+            // logs to the editor console; an unreported failure (locked
+            // EditorPrefs, disk full, OS keychain mid-update) used to delete
+            // the plaintext with no replacement, irreversibly losing the
+            // developer's saved API key on first migration reload.  Now the
+            // legacy slot is only cleared after the new ciphertext is
+            // confirmed present in EditorPrefs, so a failed migration leaves
+            // the legacy plaintext available for retry.
             if (EditorPrefs.HasKey(LegacyPrefKey))
             {
                 var legacy = EditorPrefs.GetString(LegacyPrefKey, "");
-                EditorPrefs.DeleteKey(LegacyPrefKey);
                 if (!string.IsNullOrEmpty(legacy))
                 {
-                    Debug.Log("[RTMPE] Migrated legacy plaintext API key from EditorPrefs to obfuscated store.");
-                    Save(legacy);
+                    try
+                    {
+                        var encoded = Encrypt(legacy);
+                        EditorPrefs.SetString(PrefKey, encoded);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Migration failed — leave the legacy plaintext in place
+                        // so the next editor session can retry rather than
+                        // silently losing the credential.
+                        Debug.LogError(
+                            "[RTMPE] EditorApiKeyStore: legacy migration failed " +
+                            $"({ex.GetType().Name}: {ex.Message}).  Legacy plaintext " +
+                            "preserved; will retry on next Editor load.");
+                        return legacy;
+                    }
+
+                    if (!EditorPrefs.HasKey(PrefKey))
+                    {
+                        // EditorPrefs.SetString returned without throwing but
+                        // the post-write read does not see the entry — extremely
+                        // rare but possible under platform-specific storage
+                        // saturation.  Preserve legacy and signal the failure.
+                        Debug.LogError(
+                            "[RTMPE] EditorApiKeyStore: post-write verification of " +
+                            "obfuscated API key failed; legacy plaintext preserved.");
+                        return legacy;
+                    }
+
+                    EditorPrefs.DeleteKey(LegacyPrefKey);
+                    Debug.Log(
+                        "[RTMPE] Migrated legacy plaintext API key from EditorPrefs " +
+                        "to obfuscated store.");
                     return legacy;
                 }
+                // Empty legacy — no key to migrate, just remove the empty slot.
+                EditorPrefs.DeleteKey(LegacyPrefKey);
             }
 
             var encoded = EditorPrefs.GetString(PrefKey, "");
@@ -249,7 +291,19 @@ namespace RTMPE.Editor
         /// </summary>
         private static byte[] DeriveKey()
         {
-            var deviceId = SystemInfo.deviceUniqueIdentifier ?? "rtmpe-unknown-device";
+            // SystemInfo.deviceUniqueIdentifier is null on a handful of
+            // platforms (and "" or "n/a" on others — the WebGL stub returns
+            // an empty string, some Android distributions and headless test
+            // hosts return the literal "n/a").  Treat any of these
+            // pathological values as "unknown" so the KEK is not silently
+            // derived from a per-platform constant — which would let every
+            // editor on that platform unwrap every other editor's stored
+            // ciphertext.  IsNullOrEmpty + the explicit "n/a" check covers
+            // every documented case observed in Unity-Editor support
+            // bundles.
+            var deviceId = SystemInfo.deviceUniqueIdentifier;
+            if (string.IsNullOrEmpty(deviceId) || deviceId == "n/a")
+                deviceId = "rtmpe-unknown-device";
             var ikm      = Encoding.UTF8.GetBytes(deviceId);
 
             // RFC 5869 HKDF-SHA256, single-block (L = 32 ≤ HashLen).

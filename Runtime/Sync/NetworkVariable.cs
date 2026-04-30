@@ -418,7 +418,23 @@ namespace RTMPE.Sync
                 IsDirty    = true;
 
                 // Fire AFTER _value is updated so callbacks can safely read Value.
-                OnValueChanged?.Invoke(oldValue, value);
+                // A user-supplied OnValueChanged subscriber that throws must
+                // not abort the calling code path — for the owning side this
+                // is the variable-flush hot loop, where one bad subscriber
+                // would otherwise stop every sibling NetworkVariable on the
+                // same object from publishing this tick.  Catch and surface;
+                // the dirty flag was already set, so the next flush retries.
+                try
+                {
+                    OnValueChanged?.Invoke(oldValue, value);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError(
+                        $"[RTMPE] NetworkVariable<{typeof(T).Name}>.OnValueChanged threw " +
+                        $"{ex.GetType().Name}: {ex.Message}.  Subscriber exception isolated; " +
+                        "the new value is already stored locally.");
+                }
             }
         }
 
@@ -478,6 +494,15 @@ namespace RTMPE.Sync
     /// </summary>
     public sealed class NetworkVariableString : NetworkVariableBase
     {
+        // Strict UTF-8 codec — the lax decoder silently substitutes U+FFFD
+        // for malformed byte sequences, letting a hostile peer smuggle bytes
+        // that survive the decode but mutate downstream string-equality
+        // invariants (display names, scene keys, room tags, reserved-key
+        // checks).  Symmetric with the RPC stack (M19-RPC-04/05) and the
+        // RoomPacketParser (M18-UTF8-01).
+        private static readonly Encoding StrictUtf8 =
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
         // ── Stored value ───────────────────────────────────────────────────────
 
         private string _value;
@@ -511,7 +536,20 @@ namespace RTMPE.Sync
                 _value          = normalized;
                 IsDirty         = true;
 
-                OnValueChanged?.Invoke(oldValue, normalized);
+                // Subscriber-isolation: see the symmetric guard on
+                // NetworkVariable<T>.Value.  The new value is already in
+                // _value; a throwing subscriber must not stop the flush.
+                try
+                {
+                    OnValueChanged?.Invoke(oldValue, normalized);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError(
+                        $"[RTMPE] NetworkVariableString.OnValueChanged threw " +
+                        $"{ex.GetType().Name}: {ex.Message}.  Subscriber exception isolated; " +
+                        "the new value is already stored locally.");
+                }
             }
         }
 
@@ -558,7 +596,7 @@ namespace RTMPE.Sync
             // bytes.  Wire-compatible with the Go server (binary.LittleEndian.Uint16).
             // `BinaryWriter.Write(string)` would emit a .NET 7-bit variable-length
             // integer prefix which is NOT compatible with the Go wire format.
-            byte[] bytes = Encoding.UTF8.GetBytes(_value ?? string.Empty);
+            byte[] bytes = StrictUtf8.GetBytes(_value ?? string.Empty);
             if (bytes.Length > ushort.MaxValue)
             {
                 throw new ArgumentException(
@@ -581,7 +619,31 @@ namespace RTMPE.Sync
             // UTF-8 bytes — matches the Serialize path above and the Go server format.
             ushort len   = reader.ReadUInt16();
             byte[] bytes = reader.ReadBytes(len);
-            SetValueWithoutNotify(Encoding.UTF8.GetString(bytes));
+            // BinaryReader.ReadBytes returns FEWER than the requested count
+            // when the underlying stream ends before the prefix's worth of
+            // bytes is available — no exception is raised.  Without this
+            // guard a truncated inbound packet would be silently decoded as
+            // a short string, leaving the receiver with a value that does
+            // not round-trip its peer's serialise output.  Surface a clean
+            // EndOfStreamException so the variable-update dispatcher logs
+            // and skips the entry.
+            if (bytes.Length != len)
+                throw new EndOfStreamException(
+                    $"NetworkVariableString.Deserialize: declared {len} UTF-8 bytes, " +
+                    $"only {bytes.Length} available — packet truncated.");
+            try
+            {
+                SetValueWithoutNotify(StrictUtf8.GetString(bytes));
+            }
+            catch (DecoderFallbackException ex)
+            {
+                // Surface malformed UTF-8 as the same truncation contract the
+                // dispatcher already handles — the packet is dropped and the
+                // prior value is preserved.
+                throw new EndOfStreamException(
+                    "NetworkVariableString.Deserialize: malformed UTF-8 in payload.",
+                    ex);
+            }
         }
     }
 }

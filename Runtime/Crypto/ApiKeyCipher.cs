@@ -39,6 +39,16 @@ namespace RTMPE.Crypto
         /// <summary>AEAD authentication tag length (16 bytes).</summary>
         public const int TagLen = 16;
 
+        // Hard ceiling on the UTF-8-encoded length of the API key.  The wire
+        // format prefixes the key with a 16-bit little-endian length so any
+        // value above ushort.MaxValue would silently truncate the prefix while
+        // emitting the full plaintext — leaving a length/payload mismatch the
+        // gateway parses past the next field.  The 1 KiB working ceiling sits
+        // an order of magnitude above any realistic operator-issued key while
+        // bounding the pre-encryption allocation to a constant size regardless
+        // of how the apiKey arrived at this method.
+        private const int MaxApiKeyBytes = 1024;
+
         // ── Encrypt ──────────────────────────────────────────────────────────
 
         /// <summary>
@@ -90,6 +100,17 @@ namespace RTMPE.Crypto
                 throw new ArgumentException("PSK must be exactly 32 bytes.", nameof(psk));
             if (string.IsNullOrEmpty(apiKey))
                 throw new ArgumentException("apiKey must not be null or empty.", nameof(apiKey));
+
+            // Range-check the encoded length BEFORE allocating the UTF-8
+            // buffer.  GetByteCount walks the string but does not allocate
+            // (per .NET BCL contract); rejecting an oversize key here keeps
+            // the failure local to the caller and avoids the multi-MB
+            // intermediate alloc + zeroise on the rejection path.
+            int encodedLen = Encoding.UTF8.GetByteCount(apiKey);
+            if (encodedLen > MaxApiKeyBytes)
+                throw new ArgumentException(
+                    $"apiKey is {encodedLen} UTF-8 bytes; maximum is {MaxApiKeyBytes}.",
+                    nameof(apiKey));
 
             byte[] keyBytes  = null;
             byte[] plaintext = null;

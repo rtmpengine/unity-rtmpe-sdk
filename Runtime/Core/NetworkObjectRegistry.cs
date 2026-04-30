@@ -40,6 +40,18 @@ namespace RTMPE.Core
         /// <see cref="NetworkBehaviour.NetworkObjectId"/>, that object is despawned
         /// before being evicted so <see cref="NetworkBehaviour.OnNetworkDespawn"/> fires
         /// and <see cref="NetworkBehaviour.IsSpawned"/> is reset to <see langword="false"/>.
+        /// <para>
+        /// A same-id collision is logged at error severity even though the
+        /// previous instance is correctly despawned: the collision indicates
+        /// upstream bookkeeping divergence (SpawnManager has lost track of an
+        /// id and re-issued it) and the operator must see it.  The previous
+        /// instance's <c>GameObject</c> remains live; the caller (typically
+        /// SpawnManager) is responsible for routing it through the
+        /// despawn/destroy pipeline so counters and prefab-map entries are
+        /// reconciled.  This method does NOT reach back into SpawnManager
+        /// to avoid a layering inversion — registry sits below SpawnManager
+        /// in the dependency stack.
+        /// </para>
         /// </summary>
         public void Register(NetworkBehaviour obj)
         {
@@ -56,7 +68,18 @@ namespace RTMPE.Core
             // if OnNetworkDespawn calls registry methods.
             // ReferenceEquals guard skips the no-op case of re-registering the same instance.
             if (previous != null && !ReferenceEquals(previous, obj))
+            {
+                // Surface the collision so operators see SpawnManager
+                // bookkeeping divergence rather than discovering it later
+                // as a "ghost object" in the scene.
+                UnityEngine.Debug.LogError(
+                    "[RTMPE] NetworkObjectRegistry.Register: same-id collision " +
+                    $"on objectId {obj.NetworkObjectId}.  Previous instance has " +
+                    "been despawned but its GameObject remains live; SpawnManager " +
+                    "counters / prefab map may be out of sync.  This indicates an " +
+                    "upstream id-allocation bug.");
                 previous.SetSpawned(false);
+            }
         }
 
         /// <summary>Remove the entry for the given object ID (if present).</summary>

@@ -62,14 +62,84 @@ namespace RTMPE.Core
         /// </summary>
         public const int DedupWindowSize = 1024;
 
+        // Lower bound on the per-frame RTO.  Anything smaller would let a
+        // pathological 0 / negative / NaN setter assignment collapse the
+        // retransmit timer into a tight resend loop, exhausting the
+        // outbound socket buffer before any ACK can arrive.
+        private const float MinRtoSeconds = 0.01f;
+
+        // Upper bound on the per-frame RTO.  Above the test ceiling the
+        // retransmit cadence becomes indistinguishable from "no retransmit"
+        // for the realtime gameplay window the SDK targets.
+        private const float MaxRtoCeilingSeconds = 60f;
+
+        // Lower / upper bounds on the retransmit attempt cap.  A negative
+        // value would silently disable retransmission; values above the
+        // ceiling exceed any plausible RTT × MaxRto budget.
+        private const int MinMaxAttempts = 1;
+        private const int MaxAttemptsCeiling = 64;
+
+        private float _initialRtoSeconds = 0.2f;
+        private float _maxRtoSeconds     = 2.0f;
+        private int   _maxAttempts       = 8;
+
         /// <summary>Initial retransmit timeout (seconds).</summary>
-        public float InitialRtoSeconds { get; set; } = 0.2f;
+        public float InitialRtoSeconds
+        {
+            get => _initialRtoSeconds;
+            // Reject NaN / Infinity outright; clamp positive finite values
+            // into the documented working range.  An out-of-range value
+            // never silently wins — it is always observable as a clamped
+            // read on the next get.  The exponential-backoff schedule
+            // depends on Initial <= Max so a setter that pushes the floor
+            // above the current ceiling lifts the ceiling along with it,
+            // mirroring the symmetric guard on MaxRtoSeconds.
+            set
+            {
+                float clamped = ClampRto(value, MinRtoSeconds, MaxRtoCeilingSeconds);
+                _initialRtoSeconds = clamped;
+                if (_maxRtoSeconds < clamped) _maxRtoSeconds = clamped;
+            }
+        }
 
         /// <summary>Upper cap on retransmit timeout (seconds).</summary>
-        public float MaxRtoSeconds { get; set; } = 2.0f;
+        public float MaxRtoSeconds
+        {
+            get => _maxRtoSeconds;
+            // The RTO ceiling must remain >= the RTO floor so the
+            // exponential-backoff schedule never inverts; clamp up to the
+            // initial RTO when an out-of-order setter assignment would
+            // otherwise leave MaxRto < InitialRto.
+            set
+            {
+                float clamped = ClampRto(value, MinRtoSeconds, MaxRtoCeilingSeconds);
+                if (clamped < _initialRtoSeconds) clamped = _initialRtoSeconds;
+                _maxRtoSeconds = clamped;
+            }
+        }
 
         /// <summary>Hard cap on retransmit attempts before the entry is dropped.</summary>
-        public int MaxAttempts { get; set; } = 8;
+        public int MaxAttempts
+        {
+            get => _maxAttempts;
+            set
+            {
+                if (value < MinMaxAttempts) value = MinMaxAttempts;
+                else if (value > MaxAttemptsCeiling) value = MaxAttemptsCeiling;
+                _maxAttempts = value;
+            }
+        }
+
+        // Shared finite-and-clamped helper for the two RTO setters.  Keeping
+        // the rule in one place ensures the InitialRto / MaxRto setters
+        // always make the same finiteness decision.
+        private static float ClampRto(float value, float lo, float hi)
+        {
+            if (float.IsNaN(value) || float.IsInfinity(value)) return lo;
+            if (value < lo) return lo;
+            if (value > hi) return hi;
+            return value;
+        }
 
         // ── Outbound state ─────────────────────────────────────────────────────
 
@@ -172,6 +242,12 @@ namespace RTMPE.Core
         {
             if (resend == null) throw new ArgumentNullException(nameof(resend));
 
+            // Clamp pathological clock readings so a NaN / negative input
+            // cannot stall the retransmit ladder for the rest of the
+            // session.  A single bad sample is tolerated (skip this tick);
+            // a steady stream of bad samples is the caller's bug to address.
+            if (float.IsNaN(nowSeconds) || float.IsInfinity(nowSeconds)) return;
+
             for (int i = 0; i < _outbound.Length; i++)
             {
                 ref OutboundEntry e = ref _outbound[i];
@@ -183,11 +259,32 @@ namespace RTMPE.Core
                     uint dropped = e.Sequence;
                     e = default;
                     _outboundCount--;
-                    onDropped?.Invoke(dropped);
+                    // Subscriber-isolation: a buggy onDropped handler must
+                    // not abort the per-tick sweep.  The entry has already
+                    // been cleared, so a thrown exception leaves no
+                    // book-keeping gap.
+                    try { onDropped?.Invoke(dropped); }
+                    catch (Exception ex)
+                    {
+                        UnityEngine.Debug.LogError(
+                            $"[RTMPE] ReliableChannel.Tick: onDropped threw " +
+                            $"{ex.GetType().Name}: {ex.Message}.  Subscriber exception isolated.");
+                    }
                     continue;
                 }
 
-                resend(e.Sequence, e.Payload);
+                // Subscriber-isolation: a thrown resend (transport
+                // disposed, send buffer full, etc.) must not abort the
+                // sweep across siblings.  Increment attempts and reschedule
+                // even on failure so the dropped-after-MaxAttempts ladder
+                // still fires for an entry whose resend chronically fails.
+                try { resend(e.Sequence, e.Payload); }
+                catch (Exception ex)
+                {
+                    UnityEngine.Debug.LogError(
+                        $"[RTMPE] ReliableChannel.Tick: resend threw " +
+                        $"{ex.GetType().Name}: {ex.Message}.  Continuing with backoff.");
+                }
                 e.Attempts++;
 
                 // Exponential backoff: 1× RTO, 2× RTO, 4× RTO ... up to the cap.

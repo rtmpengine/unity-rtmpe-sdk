@@ -1589,11 +1589,32 @@ namespace RTMPE.Tests
             public override void Dispose()    { }
         }
 
+        [SetUp]
+        public void SetUpClearStaticState()
+        {
+            // Defence-in-depth: a previous fixture that crashed BEFORE its
+            // [TearDown] could observe a leftover factory.  Clearing in
+            // SetUp guarantees the per-test starting state is identical
+            // regardless of prior fixture outcomes.
+            NetworkManager.ClearTransportFactory();
+        }
+
         [TearDown]
         public void TearDown()
         {
             // Tests share a static factory — always clear to avoid leaking
             // into the next fixture's SetUp.
+            NetworkManager.ClearTransportFactory();
+        }
+
+        [OneTimeTearDown]
+        public void OneTimeTearDownClearStaticState()
+        {
+            // A second sentinel: the [TearDown] above runs after every test;
+            // this one runs after every fixture and protects against a
+            // future test added below that forgets to clear in its own
+            // [TearDown] from poisoning the static field for the next
+            // fixture loaded by NUnit.
             NetworkManager.ClearTransportFactory();
         }
 

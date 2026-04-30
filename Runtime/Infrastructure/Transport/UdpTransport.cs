@@ -377,6 +377,19 @@ namespace RTMPE.Transport
                     throw new SocketException((int)SocketError.MessageSize);
                 }
             }
+            catch (SocketException sx)
+                when (sx.SocketErrorCode == SocketError.NoBufferSpaceAvailable)
+            {
+                // ENOBUFS — kernel send buffer exhausted.  Distinct from
+                // MessageSize: the datagram is well-formed and would
+                // succeed if the kernel had room.  Increment the dedicated
+                // drop counter so a saturated uplink is observable
+                // separately from oversized-payload bugs, then rethrow the
+                // original SocketException so existing callers that
+                // distinguish on SocketErrorCode continue to do so.
+                Interlocked.Increment(ref _sendBufferExhaustedCount);
+                throw;
+            }
             catch (ObjectDisposedException)
             {
                 // Disconnect() raced with us. Treat as a transport-closed signal —
@@ -384,6 +397,20 @@ namespace RTMPE.Transport
                 throw new InvalidOperationException("Transport was disconnected during Send.");
             }
         }
+
+        // Cumulative count of Send calls that hit ENOBUFS.  A non-zero
+        // sustained rate indicates uplink saturation — operators can
+        // distinguish "too many packets" from "packets too large" without
+        // parsing per-call exceptions.
+        private long _sendBufferExhaustedCount;
+
+        /// <summary>
+        /// Number of <see cref="Send"/> calls that surfaced ENOBUFS (kernel
+        /// send buffer exhaustion).  Exposed for backpressure dashboards;
+        /// never resets across the lifetime of the transport.
+        /// </summary>
+        public long SendBufferExhaustedCount =>
+            Interlocked.Read(ref _sendBufferExhaustedCount);
 
         /// <summary>
         /// Send a slice of a buffer without forcing the caller to allocate a
@@ -401,7 +428,15 @@ namespace RTMPE.Transport
                 throw new ObjectDisposedException(nameof(UdpTransport));
             if (buffer == null)
                 throw new ArgumentNullException(nameof(buffer));
-            if (offset < 0 || count < 0 || offset + count > buffer.Length)
+            // Bounds expressed in subtraction form (`count > available`) so
+            // a pathologically large pair (offset, count) cannot wrap
+            // `offset + count` to a negative int that bypasses the
+            // `> buffer.Length` test.  Same overflow class closed across
+            // every parser in the SDK; keeping the trust boundary precise
+            // here lets a misuse surface as a clean
+            // ArgumentOutOfRangeException at the call site rather than as
+            // a SocketException from deep inside SendTo.
+            if (offset < 0 || count < 0 || count > buffer.Length - offset)
                 throw new ArgumentOutOfRangeException(
                     nameof(count),
                     $"offset={offset}, count={count}, buffer.Length={buffer.Length}");

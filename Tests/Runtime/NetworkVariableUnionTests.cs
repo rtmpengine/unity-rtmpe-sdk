@@ -310,11 +310,19 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        public void WireFormat_DefaultIsV2_ForBackwardCompatibility()
+        public void WireFormat_DefaultIsV4_PreferStructuralVerifier()
         {
-            Assert.AreEqual(WireFormatVersion.V2, WireFormat.Default,
-                "The default must stay V2 so the SDK is compatible with any " +
-                "deployed gateway that has not yet been updated");
+            // V4 routes every variable update through the FlatBuffers
+            // structural verifier (closes the V2 (tag, payload)
+            // inconsistency class).  Deployments whose gateway still
+            // speaks V2 opt in explicitly via WireFormat.LegacyDefault
+            // — the constant exists so a single per-build switch flips
+            // the SDK's preferred shape without per-call-site edits.
+            Assert.AreEqual(WireFormatVersion.V4, WireFormat.Default,
+                "The preferred default is the structural-verifier shape; " +
+                "legacy V2 deployments use WireFormat.LegacyDefault explicitly.");
+            Assert.AreEqual(WireFormatVersion.V2, WireFormat.LegacyDefault,
+                "LegacyDefault must remain V2 so an unmodified gateway path is reachable.");
         }
 
         // ───────────────────────────────────────────────────────────────

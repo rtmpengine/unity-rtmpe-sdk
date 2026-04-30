@@ -45,7 +45,21 @@ namespace RTMPE.Sync
     /// Call <see cref="AddState"/> whenever a <c>StateDelta</c> is decoded for
     /// this object (typically wired to <c>NetworkManager.OnDataReceived</c>).
     /// </summary>
+    /// <remarks>
+    /// The <see cref="DefaultExecutionOrder"/> attribute pins this component
+    /// to a high (late) execution slot so render-time consumers — Camera
+    /// follows, animation IK, gameplay scripts that read transform.position —
+    /// see the interpolated pose for the current frame.  Without an explicit
+    /// order, Unity's registration-order tie-breaker would let any user
+    /// script with a higher script-execution priority observe the previous
+    /// frame's pose, producing a one-frame lag artefact that is hard to
+    /// reproduce because it depends on import ordering.  The chosen value
+    /// (10000) sits comfortably after default user scripts (0) and most
+    /// animation systems while leaving headroom (max int32) for downstream
+    /// post-processing components.
+    /// </remarks>
     [AddComponentMenu("RTMPE/Network Transform Interpolator")]
+    [DefaultExecutionOrder(10000)]
     public class NetworkTransformInterpolator : MonoBehaviour
     {
         // ── Inspector configuration ────────────────────────────────────────────
@@ -64,13 +78,18 @@ namespace RTMPE.Sync
                  "NetworkTransform._syncScale = false.")]
         [SerializeField] private bool _interpolateScale = false;
 
-        [Tooltip("Hard upper bound on accepted timestamps (seconds).  Defends " +
-                 "the interpolator against a hostile or buggy sender that puts " +
-                 "double.MaxValue (or any far-future value) into the timestamp " +
-                 "field — which would otherwise permanently freeze the buffer " +
-                 "because no subsequent timestamp could ever be greater. " +
-                 "24 hours of session time covers any realistic playback.")]
-        [SerializeField] private double _maxAcceptableTimestamp = 24.0 * 60.0 * 60.0;
+        [Tooltip("Maximum accepted skew (seconds) into the future relative to " +
+                 "the local clock.  Defends the interpolator against a hostile " +
+                 "or buggy sender that puts double.MaxValue (or any far-future " +
+                 "value) into the timestamp field — such a payload would " +
+                 "otherwise permanently freeze the buffer because no subsequent " +
+                 "timestamp could ever be greater.  10 seconds of forward skew " +
+                 "comfortably absorbs every realistic clock drift while still " +
+                 "rejecting double.MaxValue and similarly-absurd injections. " +
+                 "Expressed as a relative offset rather than an absolute wall " +
+                 "so persistent-world / social-VR sessions whose Time.timeAsDouble " +
+                 "exceeds 24h continue to interpolate normally.")]
+        [SerializeField] private double _maxFutureSkewSeconds = 10.0;
 
         // ── Buffer state ───────────────────────────────────────────────────────
 
@@ -203,7 +222,29 @@ namespace RTMPE.Sync
             // timestamp would compare strictly less than _latestTimestamp and
             // be silently dropped.  The interpolator has its own ingress
             // independent of the InputPayload parser and needs the same gate.
-            if (!double.IsFinite(timestamp) || timestamp >= _maxAcceptableTimestamp)
+            //
+            // Skew expressed RELATIVE to the local clock (Time.timeAsDouble),
+            // not as an absolute wall — Time.timeAsDouble is process-uptime
+            // and never resets within a session, so an absolute 24-hour wall
+            // froze every persistent-world / social-VR session past the
+            // first day of uptime.  10 seconds of forward skew comfortably
+            // absorbs every realistic clock drift while still rejecting
+            // double.MaxValue and similar far-future injections.
+            if (!double.IsFinite(timestamp)
+                || timestamp - UnityEngine.Time.timeAsDouble > _maxFutureSkewSeconds)
+                return;
+
+            // Reject non-finite components in the snapshot itself.  The
+            // network parser rejects NaN/Inf positions on the receive thread,
+            // but a caller that constructs a TransformState in user code (a
+            // test harness, a custom dispatcher) can bypass that path —
+            // and the downstream Vector3.Lerp / Quaternion.Slerp would then
+            // propagate NaN into _lastInterpolatedPose and from there into
+            // transform.position / transform.rotation, which Unity persists
+            // unchecked.  Quenching at ingress keeps the buffer free of
+            // poisoned entries and matches the snapshot's wire-format
+            // contract.
+            if (!IsFiniteSnapshot(state))
                 return;
 
             lock (_syncRoot)
@@ -326,7 +367,8 @@ namespace RTMPE.Sync
                 // ordering signal here.  Inline the buffer push so two
                 // adjacent ticks whose receiver-domain timestamps round to
                 // the same EMA value do not silently drop the second.
-                if (!double.IsFinite(timestamp) || timestamp >= _maxAcceptableTimestamp)
+                if (!double.IsFinite(timestamp)
+                    || timestamp - UnityEngine.Time.timeAsDouble > _maxFutureSkewSeconds)
                     return;
 
                 // Track the highest stored timestamp so a later receiver-clock
@@ -524,14 +566,14 @@ namespace RTMPE.Sync
             int    bufferSize             = 10,
             float  interpolationDelay     = 0.1f,
             bool   interpolateScale       = false,
-            double maxAcceptableTimestamp = 24.0 * 60.0 * 60.0)
+            double maxFutureSkewSeconds   = 10.0)
         {
             lock (_syncRoot)
             {
                 _bufferSize             = bufferSize;
                 _interpolationDelay     = interpolationDelay;
                 _interpolateScale       = interpolateScale;
-                _maxAcceptableTimestamp = maxAcceptableTimestamp;
+                _maxFutureSkewSeconds   = maxFutureSkewSeconds;
                 // Reset ring-buffer state for a consistent starting condition.
                 _buffer.Clear();
                 _head = 0;
@@ -550,5 +592,25 @@ namespace RTMPE.Sync
                 _clockOffset     = 0.0;
             }
         }
+
+        // Componentwise IsFinite over the position, rotation, and (when
+        // enabled) scale of an inbound TransformState.  Spelled with
+        // !IsNaN && !IsInfinity so the SDK compiles on Unity runtimes that
+        // do not expose float.IsFinite.
+        private bool IsFiniteSnapshot(TransformState s)
+        {
+            var p = s.Position;
+            var r = s.Rotation;
+            if (Bad(p.x) || Bad(p.y) || Bad(p.z)) return false;
+            if (Bad(r.x) || Bad(r.y) || Bad(r.z) || Bad(r.w)) return false;
+            if (_interpolateScale)
+            {
+                var c = s.Scale;
+                if (Bad(c.x) || Bad(c.y) || Bad(c.z)) return false;
+            }
+            return true;
+        }
+
+        private static bool Bad(float v) => float.IsNaN(v) || float.IsInfinity(v);
     }
 }

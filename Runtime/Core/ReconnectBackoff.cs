@@ -130,10 +130,17 @@ namespace RTMPE.Core
         public TimeSpan NextDelay()
         {
             var cap = ComputeExponentialCapMs(_attempt, _baseDelayMs, _maxDelayMs);
-            // Random.Next(maxExclusive) returns [0, maxExclusive).  Add 1 so
-            // the upper bound is inclusive — avoids the awkward "you can never
-            // hit exactly cap" artifact that makes T-N3-03 flaky.
-            var ms = _rng.Next(cap + 1);
+            // Random.Next(maxExclusive) returns [0, maxExclusive).  Compute
+            // the exclusive upper bound in long-domain arithmetic so a
+            // caller-supplied `maxDelayMs == int.MaxValue` (legal per the
+            // constructor) cannot wrap `cap + 1` to int.MinValue and surface
+            // an ArgumentOutOfRangeException out of Random.Next on the very
+            // first call.  When `cap` is already saturated at int.MaxValue
+            // the +1 saturation cannot increase the range further, so we
+            // clamp the upper bound at int.MaxValue and the random draw
+            // remains uniform over [0, int.MaxValue).
+            int upperExclusive = cap == int.MaxValue ? int.MaxValue : cap + 1;
+            var ms = _rng.Next(upperExclusive);
             // Saturating increment — once the backoff has saturated at
             // maxDelayMs the exact attempt number is irrelevant, so we clamp
             // at MaxAttemptForBackoff instead of allowing the counter to

@@ -119,9 +119,14 @@ namespace RTMPE.Sync
             byte constraint = 0;
 
             // ── Position (3 × f32 LE) ─────────────────────────────────────────
+            //
+            // Bounds expressed in subtraction form (`size > available`) so
+            // an `off` near int.MaxValue cannot wrap `off + N` to a negative
+            // value that bypasses the check.  Same discipline as the
+            // transform / spawn / RPC parsers.
             if ((changedMask & PhysicsPacketBuilder.ChangedPosition) != 0)
             {
-                if (off + 12 > payload.Length) return false;
+                if (12 > payload.Length - off) return false;
                 pos.x = ReadF32LE(payload, off); off += 4;
                 pos.y = ReadF32LE(payload, off); off += 4;
                 pos.z = ReadF32LE(payload, off); off += 4;
@@ -131,7 +136,7 @@ namespace RTMPE.Sync
             // ── Rotation (4 × f32 LE, x y z w) ──────────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedRotation) != 0)
             {
-                if (off + 16 > payload.Length) return false;
+                if (16 > payload.Length - off) return false;
                 rot.x = ReadF32LE(payload, off); off += 4;
                 rot.y = ReadF32LE(payload, off); off += 4;
                 rot.z = ReadF32LE(payload, off); off += 4;
@@ -164,7 +169,7 @@ namespace RTMPE.Sync
             // ── Velocity (3 × f32 LE) ─────────────────────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedVelocity) != 0)
             {
-                if (off + 12 > payload.Length) return false;
+                if (12 > payload.Length - off) return false;
                 vel.x = ReadF32LE(payload, off); off += 4;
                 vel.y = ReadF32LE(payload, off); off += 4;
                 vel.z = ReadF32LE(payload, off); off += 4;
@@ -174,7 +179,7 @@ namespace RTMPE.Sync
             // ── Angular velocity (3 × f32 LE) ─────────────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedAngularVelocity) != 0)
             {
-                if (off + 12 > payload.Length) return false;
+                if (12 > payload.Length - off) return false;
                 angVel.x = ReadF32LE(payload, off); off += 4;
                 angVel.y = ReadF32LE(payload, off); off += 4;
                 angVel.z = ReadF32LE(payload, off); off += 4;
@@ -184,16 +189,22 @@ namespace RTMPE.Sync
             // ── Sleep flag (u8) ───────────────────────────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedSleep) != 0)
             {
-                if (off + 1 > payload.Length) return false;
+                if (1 > payload.Length - off) return false;
                 sleep = payload[off++] != 0x00;
             }
 
             // ── Constraint mask (u8) ──────────────────────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedConstraints) != 0)
             {
-                if (off + 1 > payload.Length) return false;
+                if (1 > payload.Length - off) return false;
                 constraint = payload[off++];
             }
+
+            // Reject trailing residue.  A well-formed payload ends exactly
+            // where the last selected field's bytes end; surplus bytes are a
+            // protocol-drift / smuggling signal that would otherwise survive
+            // through replay-window dedup keyed on the full payload.
+            if (off != payload.Length) return false;
 
             state = new PhysicsState
             {
@@ -260,10 +271,13 @@ namespace RTMPE.Sync
             bool sleep      = false;
             byte constraint = 0;
 
+            // Bounds expressed in subtraction form to match the 3-D parser
+            // and the SDK-wide integer-overflow discipline.
+
             // ── Position (2 × f32 LE) ─────────────────────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedPosition) != 0)
             {
-                if (off + 8 > payload.Length) return false;
+                if (8 > payload.Length - off) return false;
                 pos.x = ReadF32LE(payload, off); off += 4;
                 pos.y = ReadF32LE(payload, off); off += 4;
                 if (!IsFinite(pos.x) || !IsFinite(pos.y)) return false;
@@ -272,7 +286,7 @@ namespace RTMPE.Sync
             // ── Rotation (1 × f32 LE, degrees) ───────────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedRotation) != 0)
             {
-                if (off + 4 > payload.Length) return false;
+                if (4 > payload.Length - off) return false;
                 rot = ReadF32LE(payload, off); off += 4;
                 if (!IsFinite(rot)) return false;
             }
@@ -280,7 +294,7 @@ namespace RTMPE.Sync
             // ── Velocity (2 × f32 LE) ─────────────────────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedVelocity) != 0)
             {
-                if (off + 8 > payload.Length) return false;
+                if (8 > payload.Length - off) return false;
                 vel.x = ReadF32LE(payload, off); off += 4;
                 vel.y = ReadF32LE(payload, off); off += 4;
                 if (!IsFinite(vel.x) || !IsFinite(vel.y)) return false;
@@ -289,7 +303,7 @@ namespace RTMPE.Sync
             // ── Angular velocity (1 × f32 LE, deg/s) ─────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedAngularVelocity) != 0)
             {
-                if (off + 4 > payload.Length) return false;
+                if (4 > payload.Length - off) return false;
                 angVel = ReadF32LE(payload, off); off += 4;
                 if (!IsFinite(angVel)) return false;
             }
@@ -297,16 +311,19 @@ namespace RTMPE.Sync
             // ── Sleep flag (u8) ───────────────────────────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedSleep) != 0)
             {
-                if (off + 1 > payload.Length) return false;
+                if (1 > payload.Length - off) return false;
                 sleep = payload[off++] != 0x00;
             }
 
             // ── Constraint mask (u8) ──────────────────────────────────────────
             if ((changedMask & PhysicsPacketBuilder.ChangedConstraints) != 0)
             {
-                if (off + 1 > payload.Length) return false;
+                if (1 > payload.Length - off) return false;
                 constraint = payload[off++];
             }
+
+            // Trailing-residue rejection — symmetric with the 3-D parser.
+            if (off != payload.Length) return false;
 
             state = new PhysicsState2D
             {

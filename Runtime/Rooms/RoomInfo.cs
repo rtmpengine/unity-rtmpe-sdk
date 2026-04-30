@@ -5,7 +5,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.Linq;
 
 namespace RTMPE.Rooms
 {
@@ -61,8 +60,28 @@ namespace RTMPE.Rooms
         /// guarantees exactly one host per non-empty room via the <c>is_host</c>
         /// column on <c>room_players</c>.
         /// </summary>
-        public string MasterId =>
-            Players?.FirstOrDefault(p => p != null && p.IsHost)?.PlayerId ?? string.Empty;
+        /// <remarks>
+        /// Implemented as a manual scan rather than
+        /// <c>Players.FirstOrDefault(p =&gt; p?.IsHost == true)</c> because
+        /// LINQ's enumerator + closure pair allocates ~80 B per getter
+        /// invocation and the property is on the hot path
+        /// (<c>NetworkManager.IsMasterClient</c> reads it from UI / gameplay
+        /// code that may poll every frame).
+        /// </remarks>
+        public string MasterId
+        {
+            get
+            {
+                var players = Players;
+                if (players == null) return string.Empty;
+                for (int i = 0; i < players.Length; i++)
+                {
+                    var p = players[i];
+                    if (p != null && p.IsHost) return p.PlayerId;
+                }
+                return string.Empty;
+            }
+        }
 
         /// <summary>
         /// The authoritative scene currently loaded by the room, read from the
@@ -105,7 +124,16 @@ namespace RTMPE.Rooms
             PlayerCount       = playerCount;
             MaxPlayers        = maxPlayers;
             IsPublic          = isPublic;
-            Players           = players ?? Array.Empty<PlayerInfo>();
+            // Defensive copy of the player roster.  The constructor caller
+            // (RoomManager / RoomPacketParser) builds the array imperatively
+            // during parse; without this copy a future caller that re-uses
+            // its scratch array across packets would silently mutate the
+            // RoomInfo snapshot — and the snapshot is supposed to be
+            // immutable for its entire lifetime.  An empty roster reuses
+            // the canonical Array.Empty&lt;T&gt;() singleton to avoid the copy.
+            Players           = (players != null && players.Length > 0)
+                ? (PlayerInfo[])players.Clone()
+                : Array.Empty<PlayerInfo>();
             // Defensive copy: an IReadOnlyDictionary surface does not prevent
             // the caller from holding a reference to the underlying mutable
             // Dictionary and mutating it after construction.  Copying here

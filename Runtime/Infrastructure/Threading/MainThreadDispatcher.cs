@@ -190,6 +190,24 @@ namespace RTMPE.Threading
         /// </summary>
         public long DroppedRentedPacketCount => Interlocked.Read(ref _droppedRentedPacketCount);
 
+        /// <summary>
+        /// Raised on the producer thread when the rented-buffer drop count
+        /// crosses the next power-of-two boundary (1, 2, 4, 8, …) — the same
+        /// log-cadence used by <see cref="RecordOverflow"/>, lifted into an
+        /// observable event so production code can wire up dashboards or
+        /// circuit breakers without polling
+        /// <see cref="DroppedRentedPacketCount"/> on a timer.  The argument
+        /// is the new total drop count.
+        /// </summary>
+        /// <remarks>
+        /// Fires from arbitrary producer threads and is invoked OUTSIDE the
+        /// internal enqueue lock.  Subscribers MUST be thread-safe and MUST
+        /// NOT re-enter the dispatcher synchronously — schedule any
+        /// follow-up work via <see cref="Enqueue(System.Action)"/> if the
+        /// reaction must run on the main thread.
+        /// </remarks>
+        public event System.Action<long> OnRentedPacketDropped;
+
         // Hook used to return a rented buffer to its origin pool when the
         // DropHead policy evicts an in-flight work item.  The original
         // network-thread caller already saw a true return for that item, so
@@ -314,12 +332,74 @@ namespace RTMPE.Threading
         /// the outcome — DropTail (default) discards the new action, DropHead
         /// removes the oldest pending action and admits the new one, and Throw
         /// raises <see cref="InvalidOperationException"/>.
+        /// <para>
+        /// Use <see cref="TryEnqueue(Action)"/> when the caller needs to know
+        /// whether the work was admitted (e.g. RPC-response continuations
+        /// whose dropped invocation would silently strand the request).
+        /// </para>
         /// </summary>
         public void Enqueue(Action action)
         {
             if (action == null) return;
             EnqueueCore(new WorkItem(action), RejectionKind.Generic);
         }
+
+        /// <summary>
+        /// Enqueue <paramref name="action"/> and report whether it was
+        /// admitted.  Returns <see langword="false"/> when the queue is at
+        /// capacity under DropTail (the action will never run), or when the
+        /// action was admitted at the cost of evicting an older work item
+        /// under DropHead (the caller is informed so observability paths
+        /// can surface the loss); the Throw policy still raises
+        /// <see cref="InvalidOperationException"/>.  Subscribe to
+        /// <see cref="OnGenericActionDropped"/> for an observability hook
+        /// equivalent to <see cref="OnRentedPacketDropped"/>.
+        /// </summary>
+        public bool TryEnqueue(Action action)
+        {
+            if (action == null) return false;
+            return EnqueueCore(new WorkItem(action), RejectionKind.Generic);
+        }
+
+        /// <summary>
+        /// Same accept/reject semantics as <see cref="TryEnqueue(Action)"/>
+        /// but for the closure-free state-pair overload.  Use this for RPC
+        /// timeout callbacks, ownership-grant continuations, scene-load
+        /// resolutions, and any other state-bearing main-thread dispatch
+        /// whose silent drop would corrupt application state.
+        /// </summary>
+        public bool TryEnqueue<TArg>(Action<TArg> action, TArg arg)
+        {
+            if (action == null) return false;
+            return EnqueueCore(new WorkItem(static state =>
+            {
+                var pair = ((Action<TArg>, TArg))state;
+                pair.Item1(pair.Item2);
+            }, (action, arg)), RejectionKind.Generic);
+        }
+
+        // Producer threads invoke this when a generic-shape work item
+        // (Action / Action<TArg>) is rejected by backpressure.  Symmetric
+        // with OnRentedPacketDropped — sized & gated identically (logged at
+        // power-of-two boundaries inside RecordOverflow) so dashboards can
+        // sum the two streams without policy drift.
+        private long _droppedGenericActionCount;
+
+        /// <summary>
+        /// Total number of <see cref="Enqueue(Action)"/> /
+        /// <see cref="TryEnqueue(Action)"/> / <see cref="TryEnqueue{TArg}(Action{TArg}, TArg)"/>
+        /// calls rejected by backpressure since construction.
+        /// </summary>
+        public long DroppedGenericActionCount => Interlocked.Read(ref _droppedGenericActionCount);
+
+        /// <summary>
+        /// Raised on the producer thread when the generic-action drop count
+        /// crosses the next power-of-two boundary.  Fires from arbitrary
+        /// producer threads OUTSIDE the dispatcher's internal enqueue lock.
+        /// Subscribers MUST be thread-safe and MUST NOT re-enter the
+        /// dispatcher synchronously.
+        /// </summary>
+        public event System.Action<long> OnGenericActionDropped;
 
         // Delegate slot used by the byte[] overload to record buffer-pair
         // rejections.  Carried through EnqueueCore so the rejection branch
@@ -435,7 +515,9 @@ namespace RTMPE.Threading
                         case DispatcherFullPolicy.Throw:
                             RecordOverflow();
                             if (kind == RejectionKind.RentedBuffer)
-                                Interlocked.Increment(ref _droppedRentedPacketCount);
+                                BumpRentedDropAndNotify();
+                            else
+                                BumpGenericDropAndNotify();
                             throw new InvalidOperationException(
                                 $"MainThreadDispatcher queue is full ({MaxQueueDepth} items). " +
                                 "FullPolicy=Throw rejected the new action.");
@@ -444,7 +526,9 @@ namespace RTMPE.Threading
                         default:
                             RecordOverflow();
                             if (kind == RejectionKind.RentedBuffer)
-                                Interlocked.Increment(ref _droppedRentedPacketCount);
+                                BumpRentedDropAndNotify();
+                            else
+                                BumpGenericDropAndNotify();
                             return false;
                     }
                 }
@@ -459,7 +543,7 @@ namespace RTMPE.Threading
             // comments above for the deadlock scenario this avoids.
             if (evictedRented)
             {
-                Interlocked.Increment(ref _droppedRentedPacketCount);
+                BumpRentedDropAndNotify();
                 if (evictedBuffer != null)
                 {
                     try { _bufferReturnHandler(evictedBuffer); }
@@ -472,6 +556,46 @@ namespace RTMPE.Threading
             }
 
             return result;
+        }
+
+        // Increments the rented-drop counter and raises the observability
+        // event on every power-of-two transition (1, 2, 4, 8, …).  Mirrors
+        // RecordOverflow's cadence so dashboards can correlate the two
+        // signals 1:1 without polling.  Subscriber exceptions are isolated
+        // so a buggy listener cannot starve the producer thread.
+        private void BumpRentedDropAndNotify()
+        {
+            long total = Interlocked.Increment(ref _droppedRentedPacketCount);
+            var handler = OnRentedPacketDropped;
+            if (handler == null) return;
+            if (total != 1 && (total & (total - 1)) != 0) return;
+            try { handler(total); }
+            catch (Exception ex)
+            {
+                Debug.LogError(
+                    $"[RTMPE] MainThreadDispatcher.OnRentedPacketDropped subscriber threw.\n{ex}");
+            }
+        }
+
+        // Symmetric counter + observability event for generic-shape work
+        // items (Action, Action<TArg>).  A dropped main-thread continuation
+        // is functionally indistinguishable from a network outage to the
+        // application code that posted it — without this signal,
+        // pending-RPC continuations, ownership-grant follow-ups, and
+        // scene-load resolutions vanish without operator-visible
+        // telemetry.
+        private void BumpGenericDropAndNotify()
+        {
+            long total = Interlocked.Increment(ref _droppedGenericActionCount);
+            var handler = OnGenericActionDropped;
+            if (handler == null) return;
+            if (total != 1 && (total & (total - 1)) != 0) return;
+            try { handler(total); }
+            catch (Exception ex)
+            {
+                Debug.LogError(
+                    $"[RTMPE] MainThreadDispatcher.OnGenericActionDropped subscriber threw.\n{ex}");
+            }
         }
 
         private void RecordOverflow()
@@ -553,6 +677,29 @@ namespace RTMPE.Threading
                 {
                     // Never swallow silently in production — log and continue.
                     Debug.LogError($"[RTMPE] MainThreadDispatcher: unhandled exception in dispatched action.\n{ex}");
+
+                    // Buffer-ownership contract on the successful path is
+                    // "the BufferAction returns the rental in its own
+                    // finally" (see NetworkManager.ProcessPacketAndReturn).
+                    // When the user's code throws BEFORE reaching that
+                    // finally, no one returns the buffer — the producer
+                    // already saw accepted=true and the consumer never
+                    // completed.  Without this catch-side return every
+                    // dispatched throw permanently drains a slot from the
+                    // ArrayPool, slowly starving the receive path.  We
+                    // route through the registered handler so non-default
+                    // pool wiring (tests, custom rentals) sees the same
+                    // path the eviction / drain branches already exercise.
+                    if (item.BufferAction != null && item.Buffer != null)
+                    {
+                        try { _bufferReturnHandler(item.Buffer); }
+                        catch (Exception bex)
+                        {
+                            Debug.LogError(
+                                $"[RTMPE] MainThreadDispatcher: BufferReturnHandler threw " +
+                                $"during in-flight return: {bex.Message}");
+                        }
+                    }
                 }
                 processed++;
             }

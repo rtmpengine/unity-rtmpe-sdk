@@ -37,6 +37,16 @@ namespace RTMPE.Rooms
         private const int FallbackMaxStringBytes = 256;
         private const int MaxNestingDepth        = 32;
 
+        // Strict UTF-8 codec.  The lax decoder silently substitutes U+FFFD
+        // for malformed bytes, which lets a hostile or compromised server
+        // smuggle bytes that survive the parse but mutate downstream
+        // string-equality (the existing _abandonedLobbyName defence in
+        // LobbyManager keys on string equality, which U+FFFD substitution
+        // defeats — two distinct lobby names can collapse to the same
+        // fingerprint).  Symmetric with M19-PROTO-04 / M19-RPC-04/05.
+        private static readonly UTF8Encoding StrictUtf8 =
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
         /// <summary>
         /// Parses a UTF-8 JSON array of room summaries from a lobby response
         /// payload.  Returns an empty list on parse failure (never throws).
@@ -71,7 +81,11 @@ namespace RTMPE.Rooms
 
             try
             {
-                var json = Encoding.UTF8.GetString(payload);
+                // Strict UTF-8 routes a malformed-byte payload through the
+                // existing bare-catch into the empty-list return path,
+                // exactly as a parser-throw would.  No new failure shape on
+                // the call site contract.
+                var json = StrictUtf8.GetString(payload);
                 ParseJsonArray(json, rooms, maxEntries, maxStringBytes);
             }
             catch

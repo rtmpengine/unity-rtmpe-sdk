@@ -355,6 +355,7 @@ namespace RTMPE.Tests
             bool ok = h.ValidateChallenge(
                 payload,
                 handshakeInitCiphertext: null,
+                HandshakeFlow.Reconnect,
                 out _,
                 out _,
                 pinnedServerStaticPub: pin);
@@ -382,6 +383,7 @@ namespace RTMPE.Tests
             bool ok = h.ValidateChallenge(
                 payload,
                 handshakeInitCiphertext: null,
+                HandshakeFlow.Reconnect,
                 out _,
                 out _,
                 pinnedServerStaticPub: staticPub);

@@ -36,6 +36,15 @@ namespace RTMPE.Rooms
     /// </summary>
     public sealed class MatchmakingManager
     {
+        // Strict UTF-8 codec.  The default Encoding.UTF8 silently substitutes
+        // U+FFFD for malformed sequences — a hostile gateway can use that to
+        // smuggle bytes through `room_id` / `room_code` / `error` strings
+        // that survive parse but mutate downstream string-equality
+        // invariants (e.g., a JoinRoom reply matched against a U+FFFD-folded
+        // RoomId).  Symmetric with M19-PROTO-04 / M19-RPC-04/05 / M18-UTF8-01.
+        private static readonly Encoding StrictUtf8 =
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
         // Default per-request timeout used when the caller does not pass an
         // explicit one.  30 s matches typical matchmaking SLA budgets and is
         // long enough to absorb a single server retry.
@@ -170,6 +179,17 @@ namespace RTMPE.Rooms
                     "StartMatchmaking: a matchmaking request is already in flight. " +
                     "Call CancelFindMatch() before issuing a new request.");
 
+            // NaN must be rejected explicitly — the prior chain admits NaN
+            // through the `!(timeoutSeconds > 0.0)` branch (which is true
+            // for NaN) and silently substitutes the default timeout.
+            // Silent coercion of pathological input across an API surface
+            // is inconsistent with the matchmaking-options validator (which
+            // throws ArgumentException for invalid options) and masks a
+            // caller-side bug behind a 30-second wait.
+            if (double.IsNaN(timeoutSeconds))
+                throw new ArgumentException(
+                    "timeoutSeconds must not be NaN.", nameof(timeoutSeconds));
+
             double effectiveTimeout;
             if (double.IsPositiveInfinity(timeoutSeconds))
                 effectiveTimeout = double.PositiveInfinity;
@@ -218,6 +238,16 @@ namespace RTMPE.Rooms
         /// Most callers pass <c>UnityEngine.Time.unscaledTimeAsDouble</c>.</param>
         public void Tick(double nowSeconds)
         {
+            // Reject pathological clock readings.  A NaN nowSeconds would
+            // make every comparison below return false (NaN < anything is
+            // false; NaN < pending.DeadlineSeconds is false), causing the
+            // timeout to fire on the next sane tick — but the deadline
+            // captured here would be NaN too, and once captured a NaN
+            // deadline would never compare strictly less than any future
+            // sample, permanently deferring the timeout.  Skipping the
+            // tick is the strictly safer behaviour.
+            if (double.IsNaN(nowSeconds) || double.IsNegativeInfinity(nowSeconds)) return;
+
             var pending = _pending;
             if (pending == null) return;
             if (double.IsPositiveInfinity(pending.TimeoutSeconds)) return;
@@ -264,7 +294,16 @@ namespace RTMPE.Rooms
                 return;
             }
 
-            var json = Encoding.UTF8.GetString(payload);
+            string json;
+            try
+            {
+                json = StrictUtf8.GetString(payload);
+            }
+            catch (DecoderFallbackException)
+            {
+                OnMatchmakingFailed?.Invoke("malformed response");
+                return;
+            }
 
             bool   ok      = ExtractBool(json, "ok");
             string errorMsg = ExtractString(json, "error");

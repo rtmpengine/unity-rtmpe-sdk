@@ -220,12 +220,15 @@ namespace RTMPE.Rooms
 
             // Sweep first so a back-pressured client whose responses are missing
             // does not get permanently locked out by stale book-keeping.
-            foreach (var (staleId, _) in _pendingCreates.SweepExpired(DateTime.UtcNow))
+            // Take a single monotonic-clock sample so Sweep and Register share
+            // a consistent view of "now" within this request-handling pass.
+            long nowTicks = PendingCreateTable<CreateRoomOptions>.NowTicks();
+            foreach (var (staleId, _) in _pendingCreates.SweepExpired(nowTicks))
             {
                 Debug.LogWarning(
                     $"[RTMPE] RoomManager: CreateRoom request {staleId} timed out " +
                     $"after {PendingCreateTtlSeconds}s with no response. Discarding.");
-                OnRoomError?.Invoke("CreateRoom timed out");
+                SafeRaise(OnRoomError, "CreateRoom timed out");
             }
 
             if (_pendingCreates.IsFull)
@@ -236,7 +239,7 @@ namespace RTMPE.Rooms
             }
 
             var opts      = options ?? new CreateRoomOptions();
-            var requestId = _pendingCreates.Register(opts, DateTime.UtcNow);
+            var requestId = _pendingCreates.Register(opts, nowTicks);
 
             var payload = RoomPacketBuilder.BuildCreateRoomPayload(opts);
             var packet  = _packetBuilder.Build(PacketType.RoomCreate, PacketFlags.Reliable, payload);
@@ -351,7 +354,7 @@ namespace RTMPE.Rooms
                             $"SetRoomProperties: key '{key}' is reserved (prefix '{ReservedPropertyKeys.Prefix}') " +
                             "and may only be written by the room's master client. Request not sent.";
                         Debug.LogWarning("[RTMPE] RoomManager." + error);
-                        OnRoomError?.Invoke(error);
+                        SafeRaise(OnRoomError, error);
                         return;
                     }
                 }
@@ -538,7 +541,7 @@ namespace RTMPE.Rooms
             if (version <= _currentRoom.PropertiesVersion) return; // monotonic guard
 
             _currentRoom = _currentRoom.WithProperties(properties, version);
-            OnRoomPropertiesChanged?.Invoke(_currentRoom);
+            SafeRaise(OnRoomPropertiesChanged, _currentRoom);
         }
 
         /// <summary>
@@ -575,7 +578,7 @@ namespace RTMPE.Rooms
             if (updated == null) return; // playerId not on roster
 
             _currentRoom = _currentRoom.WithPlayers(newRoster);
-            OnPlayerPropertiesChanged?.Invoke(playerId, updated);
+            SafeRaise(OnPlayerPropertiesChanged, playerId, updated);
         }
 
         // ── Response handlers ──────────────────────────────────────────────────
@@ -615,12 +618,12 @@ namespace RTMPE.Rooms
                     _onLocalPlayerIdResolved?.Invoke(localPlayerId);
                 }
 
-                OnRoomCreated?.Invoke(_currentRoom);
+                SafeRaise(OnRoomCreated, _currentRoom);
             }
             else
             {
                 Debug.LogWarning($"[RTMPE] RoomManager: CreateRoom failed — {error}");
-                OnRoomError?.Invoke(error ?? "Unknown error");
+                SafeRaise(OnRoomError, error ?? "Unknown error");
             }
         }
 
@@ -683,7 +686,7 @@ namespace RTMPE.Rooms
                     // callbacks would observe (state==Connected, room==A)
                     // — an impossible-in-steady-state combination.
                     _currentRoom = null;
-                    OnRoomLeft?.Invoke();
+                    SafeRaise(OnRoomLeft);
                 }
 
                 _currentRoom = room;
@@ -695,12 +698,12 @@ namespace RTMPE.Rooms
                     _onLocalPlayerIdResolved?.Invoke(localPlayerId);
                 }
 
-                OnRoomJoined?.Invoke(room);
+                SafeRaise(OnRoomJoined, room);
             }
             else
             {
                 Debug.LogWarning($"[RTMPE] RoomManager: JoinRoom failed — {error}");
-                OnRoomError?.Invoke(error ?? "Unknown error");
+                SafeRaise(OnRoomError, error ?? "Unknown error");
             }
         }
 
@@ -712,7 +715,7 @@ namespace RTMPE.Rooms
                 return;
             }
 
-            OnPlayerJoined?.Invoke(player);
+            SafeRaise(OnPlayerJoined, player);
         }
 
         private void HandleLeavePacket(byte[] payload)
@@ -741,11 +744,11 @@ namespace RTMPE.Rooms
             {
                 _currentRoom   = null;
                 _localPlayerId = string.Empty;
-                OnRoomLeft?.Invoke();
+                SafeRaise(OnRoomLeft);
             }
             else
             {
-                OnRoomError?.Invoke("LeaveRoom failed");
+                SafeRaise(OnRoomError, "LeaveRoom failed");
             }
         }
 
@@ -757,7 +760,7 @@ namespace RTMPE.Rooms
                 return;
             }
 
-            OnPlayerLeft?.Invoke(playerId);
+            SafeRaise(OnPlayerLeft, playerId);
         }
 
         private void HandleListResponse(byte[] payload)
@@ -768,7 +771,7 @@ namespace RTMPE.Rooms
                 return;
             }
 
-            OnRoomListReceived?.Invoke(rooms);
+            SafeRaise(OnRoomListReceived, rooms);
         }
 
         // ── Phase 2 inbound handlers ──────────────────────────────────────────
@@ -794,7 +797,7 @@ namespace RTMPE.Rooms
             {
                 _currentRoom = RehostRoom(_currentRoom, newMasterId);
             }
-            OnMasterClientChanged?.Invoke(previousMasterId ?? string.Empty, newMasterId ?? string.Empty);
+            SafeRaise(OnMasterClientChanged, previousMasterId ?? string.Empty, newMasterId ?? string.Empty);
         }
 
         /// <summary>
@@ -816,8 +819,8 @@ namespace RTMPE.Rooms
             {
                 _currentRoom = RemovePlayerFromRoom(_currentRoom, targetPlayerId);
             }
-            OnPlayerKicked?.Invoke(kickerId ?? string.Empty, targetPlayerId);
-            OnPlayerLeft?.Invoke(targetPlayerId);
+            SafeRaise(OnPlayerKicked, kickerId ?? string.Empty, targetPlayerId);
+            SafeRaise(OnPlayerLeft, targetPlayerId);
         }
 
         /// <summary>
@@ -834,7 +837,7 @@ namespace RTMPE.Rooms
                 Debug.LogWarning("[RTMPE] RoomManager: malformed SceneLoaded broadcast.");
                 return;
             }
-            OnAllPlayersSceneLoaded?.Invoke(sceneName ?? string.Empty);
+            SafeRaise(OnAllPlayersSceneLoaded, sceneName ?? string.Empty);
         }
 
         /// <summary>
@@ -921,6 +924,59 @@ namespace RTMPE.Rooms
 
             Debug.LogWarning($"[RTMPE] RoomManager.{method}: requires InRoom state (current: {state}).");
             return false;
+        }
+
+        // ── Subscriber-isolated event invocation ───────────────────────────────
+        //
+        // Every public OnRoom* / OnPlayer* event is fired during inbound
+        // packet processing.  A throwing application subscriber would
+        // propagate up through HandleRoomPacket → NetworkManager.ProcessPacket
+        // and short-circuit the rest of the inbound buffer for that frame,
+        // leaving subsequent same-tick packets to act against half-applied
+        // state.  Walk each multicast invocation list explicitly so the
+        // failure of one subscriber does not deny delivery to its siblings.
+        // Same discipline as M19-SYNC-01 (NetworkVariable.OnValueChanged) and
+        // M19-CORE-07 (ReliableChannel callbacks).
+
+        private static void SafeRaise(Action handler)
+        {
+            if (handler == null) return;
+            var subs = handler.GetInvocationList();
+            for (int i = 0; i < subs.Length; i++)
+            {
+                try { ((Action)subs[i])(); }
+                catch (Exception ex) { LogSubscriberThrow(ex); }
+            }
+        }
+
+        private static void SafeRaise<T>(Action<T> handler, T arg)
+        {
+            if (handler == null) return;
+            var subs = handler.GetInvocationList();
+            for (int i = 0; i < subs.Length; i++)
+            {
+                try { ((Action<T>)subs[i])(arg); }
+                catch (Exception ex) { LogSubscriberThrow(ex); }
+            }
+        }
+
+        private static void SafeRaise<T1, T2>(Action<T1, T2> handler, T1 a1, T2 a2)
+        {
+            if (handler == null) return;
+            var subs = handler.GetInvocationList();
+            for (int i = 0; i < subs.Length; i++)
+            {
+                try { ((Action<T1, T2>)subs[i])(a1, a2); }
+                catch (Exception ex) { LogSubscriberThrow(ex); }
+            }
+        }
+
+        private static void LogSubscriberThrow(Exception ex)
+        {
+            Debug.LogError(
+                "[RTMPE] RoomManager: event subscriber threw " +
+                $"{ex.GetType().Name}: {ex.Message}.  Continuing with " +
+                "remaining subscribers.");
         }
     }
 }

@@ -275,12 +275,15 @@ namespace RTMPE.Infrastructure.Serialization
                 case JoinRoomResponse joinRoom:
                     ValidateJoinRoomResponse(joinRoom);
                     break;
+                case NetworkTransformState transformState:
+                    ValidateNetworkTransformState(transformState);
+                    break;
 
                 // ── Types for which structural verification is sufficient ──────
                 //
                 // Each entry below has been individually audited (2026-04-27):
                 //
-                // DespawnPayload, PlayerState, NetworkTransformState:
+                // DespawnPayload, PlayerState:
                 //   Contain only string identifiers and scalar fixed-size fields.
                 //   FlatBuffers structural verifier bounds all string and field
                 //   lengths within the 16 KB MTU; no float fields are present.
@@ -375,12 +378,19 @@ namespace RTMPE.Infrastructure.Serialization
                     var variant = update.Value<NetworkVariableString>();
                     if (variant.HasValue)
                     {
-                        var s = variant.Value.Value;
-                        if (s != null
-                            && Encoding.UTF8.GetByteCount(s) > SafeFlatBufferAccessors.MaxTotalVectorElements)
+                        // Probe the on-wire UTF-8 byte length WITHOUT materialising the
+                        // string.  The schema accessor's `Value` property allocates a
+                        // fresh string for every access, which converts a one-byte
+                        // attacker advantage into a multi-KiB heap allocation per
+                        // datagram on the receive boundary.  GetValueBytes returns the
+                        // backing ArraySegment whose Count is the structurally-validated
+                        // byte length.
+                        var bytes = variant.Value.GetValueBytes();
+                        int byteLen = bytes.HasValue ? bytes.Value.Count : 0;
+                        if (byteLen > SafeFlatBufferAccessors.MaxTotalVectorElements)
                         {
                             throw new InvalidOperationException(
-                                "NetworkVariableUpdateV2.String UTF-8 length exceeds cap");
+                                "NetworkVariableUpdateV2.String UTF-8 length exceeds cap: " + byteLen);
                         }
                     }
                     break;
@@ -451,6 +461,56 @@ namespace RTMPE.Infrastructure.Serialization
             {
                 throw new InvalidOperationException(
                     "JoinRoomResponse total vector elements exceeds cap: " + total);
+            }
+        }
+
+        // NetworkTransformState carries Vec3 Position / Velocity (3 × f32 each)
+        // and Quaternion Rotation (4 × f32) — twelve attacker-controlled IEEE 754
+        // values.  A single NaN or Infinity assigned to a Unity transform or a
+        // Rigidbody silently destabilises PhysX (body disappears, joints detach)
+        // and every plausibility-cap further down the pipeline short-circuits
+        // through the NaN-comparison loophole (`> bound` returns false for NaN).
+        // Reject at the wire boundary, BEFORE any consumer reads the field.
+        private static void ValidateNetworkTransformState(NetworkTransformState state)
+        {
+            var pos = state.Position;
+            if (pos.HasValue)
+            {
+                var v = pos.Value;
+                if (!SafeFlatBufferAccessors.IsFinite(v.X)
+                 || !SafeFlatBufferAccessors.IsFinite(v.Y)
+                 || !SafeFlatBufferAccessors.IsFinite(v.Z))
+                {
+                    throw new InvalidOperationException(
+                        "NetworkTransformState.Position is not finite");
+                }
+            }
+
+            var rot = state.Rotation;
+            if (rot.HasValue)
+            {
+                var q = rot.Value;
+                if (!SafeFlatBufferAccessors.IsFinite(q.X)
+                 || !SafeFlatBufferAccessors.IsFinite(q.Y)
+                 || !SafeFlatBufferAccessors.IsFinite(q.Z)
+                 || !SafeFlatBufferAccessors.IsFinite(q.W))
+                {
+                    throw new InvalidOperationException(
+                        "NetworkTransformState.Rotation is not finite");
+                }
+            }
+
+            var vel = state.Velocity;
+            if (vel.HasValue)
+            {
+                var v = vel.Value;
+                if (!SafeFlatBufferAccessors.IsFinite(v.X)
+                 || !SafeFlatBufferAccessors.IsFinite(v.Y)
+                 || !SafeFlatBufferAccessors.IsFinite(v.Z))
+                {
+                    throw new InvalidOperationException(
+                        "NetworkTransformState.Velocity is not finite");
+                }
             }
         }
 

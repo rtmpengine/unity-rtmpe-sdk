@@ -193,10 +193,24 @@ namespace RTMPE.Editor
 
         private void DrawStepTestConn()
         {
-            EditorGUILayout.LabelField("Connection Test", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField("Configuration Validation", EditorStyles.boldLabel);
 
-            if (GUILayout.Button("Ping Gateway"))
-                PingGateway();
+            // The button used to read "Ping Gateway" — but ValidateConfiguration
+            // does not open a socket; it only confirms that the wizard's own
+            // input fields are well-formed.  The previous label produced a
+            // false sense of network connectivity that masked misconfigured
+            // firewalls / routing during onboarding.  Live ping/echo testing
+            // belongs in the runtime, behind a manager that owns the
+            // transport.
+            if (GUILayout.Button("Validate Configuration"))
+                ValidateConfiguration();
+
+            EditorGUILayout.HelpBox(
+                "This step checks that the API key and gateway port fields " +
+                "look valid.  It does NOT contact the gateway — open the " +
+                "Network Debugger window after pressing Play to verify " +
+                "actual connectivity.",
+                MessageType.None);
 
             if (!string.IsNullOrEmpty(_statusMsg))
             {
@@ -315,25 +329,82 @@ namespace RTMPE.Editor
 
         private void AddNetworkManagerToScene()
         {
+            // Resolve (or create) a NetworkSettings asset before instantiating
+            // the component so the freshly-added NetworkManager is wired to a
+            // real, on-disk asset rather than left with a null _settings
+            // reference that would force CreateDefault() at runtime and lose
+            // any project-specific configuration.
+            var settings = ResolveOrCreateNetworkSettings();
+
             var go = new GameObject("NetworkManager");
-            go.AddComponent<NetworkManager>();
+            var nm = go.AddComponent<NetworkManager>();
             Undo.RegisterCreatedObjectUndo(go, "Add NetworkManager");
+
+            if (settings != null)
+            {
+                var so = new SerializedObject(nm);
+                var prop = so.FindProperty("_settings");
+                if (prop != null)
+                {
+                    prop.objectReferenceValue = settings;
+                    so.ApplyModifiedProperties();
+                }
+            }
+
             EditorSceneManager.MarkSceneDirty(
                 EditorSceneManager.GetActiveScene());
             _networkManagerFound = true;
             Repaint();
         }
 
-        private void PingGateway()
+        // Find the first NetworkSettings asset in the project, or create a
+        // default one at Assets/RTMPE/NetworkSettings.asset (creating the
+        // parent folder when missing).  Multiple existing assets are
+        // tolerated — the first hit wins so the wizard never blocks on an
+        // ambiguous project layout.
+        private static NetworkSettings ResolveOrCreateNetworkSettings()
         {
-            // In a real implementation, this would open a UDP socket to the gateway.
-            // For the Editor wizard, we simply validate the configuration values.
+            var guids = AssetDatabase.FindAssets("t:NetworkSettings");
+            if (guids != null && guids.Length > 0)
+            {
+                var path = AssetDatabase.GUIDToAssetPath(guids[0]);
+                var existing = AssetDatabase.LoadAssetAtPath<NetworkSettings>(path);
+                if (existing != null) return existing;
+            }
+
+            const string folder    = "Assets/RTMPE";
+            const string assetPath = folder + "/NetworkSettings.asset";
+
+            if (!AssetDatabase.IsValidFolder(folder))
+                AssetDatabase.CreateFolder("Assets", "RTMPE");
+
+            var created = ScriptableObject.CreateInstance<NetworkSettings>();
+            AssetDatabase.CreateAsset(created, assetPath);
+            AssetDatabase.SaveAssets();
+            return created;
+        }
+
+        private void ValidateConfiguration()
+        {
+            // Configuration-only check.  Live socket round-trip is intentionally
+            // not performed here — the wizard runs in the Editor before any
+            // NetworkManager bootstrap, and a half-baked Connect+Disconnect
+            // dance would drown out misconfigured-firewall errors more than it
+            // surfaces them.  Use the runtime Network Debugger window to see
+            // real connectivity once the project is in Play mode.
+            //
+            // Port range: full IANA-valid 1..65535.  The previous gate
+            // (> 1024 and < 65535) silently rejected the perfectly valid port
+            // 1024 and the highest port 65535, frustrating integrators on
+            // self-hosted gateways pinned to non-default ports.
             _testPassed = !string.IsNullOrWhiteSpace(_apiKey)
-                       && _gatewayPort is > 1024 and < 65535;
+                       && _gatewayPort is >= 1 and <= 65535;
 
             _statusMsg = _testPassed
-                ? $"✅  Configuration valid — {_gatewayHost}:{_gatewayPort}"
-                : "❌  Please fill in a valid API key and gateway port.";
+                ? $"✅  Configuration looks valid — {_gatewayHost}:{_gatewayPort}.  " +
+                  "Press Play and open the Network Debugger window to verify the " +
+                  "gateway is actually reachable."
+                : "❌  Provide a non-empty API key and a port in the range 1–65535.";
             Repaint();
         }
 

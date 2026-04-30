@@ -186,11 +186,20 @@ namespace RTMPE.Rooms
                 if (!TryReadString(payload, ref offset, out string roomId))   return false;
                 if (!TryReadString(payload, ref offset, out string roomCode)) return false;
                 if (!TryReadString(payload, ref offset, out string name))     return false;
-                if (offset + 3 > payload.Length)                              return false;
+                if (offset > payload.Length - 3)                              return false;
 
                 int playerCount = payload[offset++];
                 int maxPlayers  = payload[offset++];
                 bool isPublic   = payload[offset++] != 0;
+
+                // Reject impossibly-sized rosters before allocating the
+                // PlayerInfo[].  Every player record needs at least
+                // MinPlayerInfoBytes bytes; if the declared count would
+                // require more bytes than the remaining payload, the packet
+                // is malformed and a malicious server is attempting an
+                // alloc-amplification attack against the heap.
+                int remaining = payload.Length - offset;
+                if ((long)playerCount * MinPlayerInfoBytes > remaining) return false;
 
                 // Read player roster
                 var players = new PlayerInfo[playerCount];
@@ -293,6 +302,18 @@ namespace RTMPE.Rooms
             const int MaxRoomCount = 256;
             if (roomCount > MaxRoomCount) return false;
 
+            // Each room summary needs at minimum 4 length-prefixes (8 bytes)
+            // for the four string fields plus 3 trailing bytes
+            // (player_count, max_players, is_public).  Reject when the
+            // declared count cannot possibly fit in the remaining payload
+            // — the per-iteration TryReadString check catches this too,
+            // but a pre-allocation guard avoids the worst-case
+            // `RoomInfo[256]` heap allocation on a single byte of
+            // attacker-controlled count.
+            const int MinRoomSummaryBytes = 4 * 2 + 3;
+            int remainingForRooms = payload.Length - offset;
+            if ((long)roomCount * MinRoomSummaryBytes > remainingForRooms) return false;
+
             rooms = new RoomInfo[roomCount];
             for (int i = 0; i < roomCount; i++)
             {
@@ -300,7 +321,7 @@ namespace RTMPE.Rooms
                 if (!TryReadString(payload, ref offset, out string roomCode)) return false;
                 if (!TryReadString(payload, ref offset, out string name))     return false;
                 if (!TryReadString(payload, ref offset, out string state))    return false;
-                if (offset + 3 > payload.Length)                              return false;
+                if (offset > payload.Length - 3)                              return false;
 
                 int playerCount = payload[offset++];
                 int maxPlayers  = payload[offset++];
@@ -314,24 +335,83 @@ namespace RTMPE.Rooms
 
         // ── Internal helpers ───────────────────────────────────────────────────
 
+        // Hard ceiling that no per-call cap can exceed.  16-bit length fields
+        // top out at 65 535, so 4 096 is already two orders of magnitude
+        // above any legitimate field; anything larger is treated as
+        // protocol-violation by every well-behaved gateway.
+        private const int HardMaxStringBytes = 4096;
+        private const int DefaultMaxStringBytes = 4096;
+
+        // Configurable cap surfaced for NetworkManager to align with
+        // <c>NetworkSettings.maxLobbyStringBytes</c>.  Static rather than
+        // threaded through every Parse* method to avoid touching the broad
+        // public API surface; the field is written once on
+        // <c>NetworkManager.Awake</c> and never again from production code.
+        // Reads are non-volatile because the only concurrent reader is the
+        // single main-thread parser.
+        private static int _configuredMaxStringBytes = DefaultMaxStringBytes;
+
+        /// <summary>
+        /// Wire the per-parser string-length cap to a deployment-supplied
+        /// value (typically <c>NetworkSettings.maxLobbyStringBytes</c>).
+        /// Values are clamped to the documented [16, 4096] range so a
+        /// misconfigured Inspector field cannot disable the parser's
+        /// defensive ceiling.  Called by <c>NetworkManager.Awake</c>;
+        /// idempotent.
+        /// </summary>
+        public static void ConfigureMaxStringBytes(int maxStringBytes)
+        {
+            if (maxStringBytes < 16) maxStringBytes = 16;
+            if (maxStringBytes > HardMaxStringBytes) maxStringBytes = HardMaxStringBytes;
+            _configuredMaxStringBytes = maxStringBytes;
+        }
+
+        /// <summary>
+        /// Reset the per-parser string-length cap to the package default.
+        /// Test seam used by <c>[TearDown]</c> hooks that want a clean
+        /// starting state between fixtures.
+        /// </summary>
+        public static void ResetMaxStringBytesForTests()
+        {
+            _configuredMaxStringBytes = DefaultMaxStringBytes;
+        }
+
+        // Strict UTF-8 decoder.  The default <see cref="Encoding.UTF8"/>
+        // silently replaces malformed sequences with U+FFFD, which lets a
+        // hostile server smuggle bytes that survive the parser but mutate
+        // upstream string-comparison invariants (reserved-key checks, scene
+        // names).  The strict variant throws <see cref="DecoderFallbackException"/>
+        // on the first invalid sequence; the parser converts that into a
+        // clean parse-failure return.
+        private static readonly Encoding StrictUtf8 = new UTF8Encoding(
+            encoderShouldEmitUTF8Identifier: false,
+            throwOnInvalidBytes: true);
+
         /// <summary>
         /// Read a length-prefixed UTF-8 string: [len:2 LE][data:len].
         /// </summary>
         internal static bool TryReadString(byte[] buf, ref int offset, out string value)
         {
             value = null;
-            if (offset + 2 > buf.Length) return false;
+            // Use subtraction not addition for the boundary check so
+            // `offset + 2` cannot overflow into a permissive read on a
+            // pathological large `offset`.  The same pattern is applied to
+            // every multi-byte read in this file.
+            if (buf == null || offset < 0 || offset > buf.Length - 2) return false;
 
             int len = ReadU16LE(buf, ref offset);
 
-            // Cap individual string length for defense-in-depth.
-            const int MaxStringBytes = 4096;
-            if (len > MaxStringBytes) return false;
+            // Per-call cap from the configured setting (typically 256 from
+            // NetworkSettings.maxLobbyStringBytes); the hard 4 096-byte
+            // ceiling is enforced regardless via the clamp in
+            // <see cref="ConfigureMaxStringBytes"/>.
+            if (len > _configuredMaxStringBytes) return false;
 
             if (len == 0) { value = string.Empty; return true; }
-            if (offset + len > buf.Length) return false;
+            if (len > buf.Length - offset) return false;
 
-            value = Encoding.UTF8.GetString(buf, offset, len);
+            try { value = StrictUtf8.GetString(buf, offset, len); }
+            catch (DecoderFallbackException) { return false; }
             offset += len;
             return true;
         }
@@ -347,7 +427,7 @@ namespace RTMPE.Rooms
 
             if (!TryReadString(buf, ref offset, out string playerId))    return false;
             if (!TryReadString(buf, ref offset, out string displayName)) return false;
-            if (offset + 2 > buf.Length)                                 return false;
+            if (buf == null || offset > buf.Length - 2)                  return false;
 
             bool isHost  = buf[offset++] != 0;
             bool isReady = buf[offset++] != 0;
@@ -355,6 +435,9 @@ namespace RTMPE.Rooms
             player = new PlayerInfo(playerId, displayName, isHost, isReady);
             return true;
         }
+
+        // Smallest legal serialised PlayerInfo: 2 (id_len=0) + 0 + 2 (name_len=0) + 0 + 1 (is_host) + 1 (is_ready).
+        internal const int MinPlayerInfoBytes = 6;
 
         private static int ReadU16LE(byte[] buf, ref int offset)
         {

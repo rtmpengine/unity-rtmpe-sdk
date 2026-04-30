@@ -167,6 +167,20 @@ namespace RTMPE.Rpc
             // the offset==-1 path; downstream argument-type validation in
             // NetworkBehaviour.DispatchEnhancedRpc rejects nulls bound to
             // non-nullable parameters.
+            //
+            // Pre-flight allocation guard.  Each parameter occupies AT LEAST
+            // one byte on the wire (the type tag); a paramCount of 255 with
+            // only a few bytes of payload remaining is otherwise allowed to
+            // allocate a 255-element object[] before the per-param truncation
+            // check fires.  Reject before the allocation when the declared
+            // count cannot fit even one type tag per parameter.
+            if (paramCount > payload.Length - offset)
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] EnhancedRpcPacketParser: declared paramCount {paramCount} " +
+                    $"cannot fit in remaining {payload.Length - offset} bytes (method 0x{methodId:X8}).");
+                return false;
+            }
             var args = new object[paramCount];
             for (int i = 0; i < paramCount; i++)
             {

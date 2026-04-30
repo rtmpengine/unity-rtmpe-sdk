@@ -93,6 +93,19 @@ namespace RTMPE.Core
         /// <param name="newOwnerPlayerId">Target player's room UUID.</param>
         public void RequestOwnershipTransfer(ulong objectId, string newOwnerPlayerId)
         {
+            // Argument validation runs BEFORE the registry / ownership
+            // checks because the latter return silently — a caller with
+            // a null target playerId would otherwise observe the same
+            // no-op as a caller targeting an unknown objectId, masking the
+            // programming error.  Surface the contract violation as an
+            // ArgumentException so test fixtures and integrators catch the
+            // misuse at the call site instead of debugging a missing
+            // ownership-grant on the peer.
+            if (string.IsNullOrEmpty(newOwnerPlayerId))
+                throw new System.ArgumentException(
+                    "newOwnerPlayerId must not be null or empty.",
+                    nameof(newOwnerPlayerId));
+
             var obj = _registry.Get(objectId);
             if (obj == null)
             {
@@ -105,12 +118,6 @@ namespace RTMPE.Core
                 Debug.LogError(
                     $"[OwnershipManager] Cannot request ownership transfer for object {objectId}: " +
                     $"local player is not the current owner.");
-                return;
-            }
-
-            if (string.IsNullOrEmpty(newOwnerPlayerId))
-            {
-                Debug.LogError("[OwnershipManager] newOwnerPlayerId must not be null or empty.");
                 return;
             }
 
@@ -203,14 +210,70 @@ namespace RTMPE.Core
                     return id;
                 }
             }
-            // Saturation fallback: still register what the allocator gave us;
-            // an in-flight collision drops the older entry's TTL when its
-            // deadline lapses, so the system self-heals.
+            // Saturation fallback.
+            //
+            // Earlier revisions used `id = 1u` whenever the CSPRNG returned
+            // zero on the final attempt — a deterministic sentinel that two
+            // colliding allocators would land on simultaneously, allowing a
+            // hostile gateway to race a forged response against id=1 and
+            // close a legitimate request.  The sentinel is replaced with a
+            // probe past 1 that finds the first id not currently
+            // outstanding; saturation is therefore a soft-failure where
+            // the chosen id is *guaranteed* unused at allocation time.
+            //
+            // Probe range is bounded by the cap on simultaneous outstanding
+            // requests — if every id in [1, cap+1] is taken, the manager is
+            // genuinely saturated and we evict the oldest pending entry by
+            // deadline so the new request can proceed without collision.
             id = RequestIdAllocator.Next();
-            if (id == 0) id = 1u;
-            _outstanding.Add(id);
-            _outstandingDeadlineMs[id] = NowMs() + OutstandingRequestTtlMs;
-            return id;
+            if (id != 0 && !_outstanding.Contains(id))
+            {
+                _outstanding.Add(id);
+                _outstandingDeadlineMs[id] = NowMs() + OutstandingRequestTtlMs;
+                return id;
+            }
+
+            const int FallbackProbeRange = 256;
+            for (uint candidate = 1u; candidate <= FallbackProbeRange; candidate++)
+            {
+                if (!_outstanding.Contains(candidate))
+                {
+                    _outstanding.Add(candidate);
+                    _outstandingDeadlineMs[candidate] = NowMs() + OutstandingRequestTtlMs;
+                    return candidate;
+                }
+            }
+
+            // Genuine saturation: evict the entry with the earliest deadline
+            // (= most likely already-orphaned) and reuse its slot.  Better
+            // than a deterministic-collision sentinel because the evicted
+            // request gets its own well-defined cancellation rather than a
+            // silent hand-off.
+            uint evictId = 0u;
+            long evictDeadline = long.MaxValue;
+            foreach (var kv in _outstandingDeadlineMs)
+            {
+                if (kv.Value < evictDeadline)
+                {
+                    evictDeadline = kv.Value;
+                    evictId       = kv.Key;
+                }
+            }
+            if (evictId != 0u)
+            {
+                _outstanding.Remove(evictId);
+                _outstandingDeadlineMs.Remove(evictId);
+                _outstanding.Add(evictId);
+                _outstandingDeadlineMs[evictId] = NowMs() + OutstandingRequestTtlMs;
+                return evictId;
+            }
+
+            // Unreachable in practice — _outstanding cannot be empty AND
+            // every probe candidate occupied — but keep a defined return
+            // for the static analyser.
+            _outstanding.Add(1u);
+            _outstandingDeadlineMs[1u] = NowMs() + OutstandingRequestTtlMs;
+            return 1u;
         }
 
         private static long NowMs()

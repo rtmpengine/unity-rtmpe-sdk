@@ -629,13 +629,22 @@ namespace RTMPE.Sync
     /// </summary>
     public sealed class NetworkVariableListString : NetworkVariableList<string>
     {
+        // Strict UTF-8 codec — the lax form silently substitutes U+FFFD for
+        // malformed sequences, which lets a hostile peer smuggle bytes that
+        // survive the decode but mutate downstream string-equality
+        // invariants (kill-feed names compared against reserved sentinels,
+        // chat-channel keys, etc.).  Symmetric with NetworkVariableString
+        // and the RPC stack.
+        private static readonly UTF8Encoding StrictUtf8 =
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
         public NetworkVariableListString(NetworkBehaviour owner, ushort variableId)
             : base(owner, variableId) { }
 
         protected override void WriteElement(BinaryWriter writer, string value)
         {
             string s = value ?? string.Empty;
-            byte[] bytes = Encoding.UTF8.GetBytes(s);
+            byte[] bytes = StrictUtf8.GetBytes(s);
             if (bytes.Length > ushort.MaxValue)
                 throw new ArgumentException(
                     $"NetworkVariableListString element is {bytes.Length} UTF-8 bytes — " +
@@ -650,7 +659,27 @@ namespace RTMPE.Sync
             ushort len = reader.ReadUInt16();
             if (len == 0) return string.Empty;
             byte[] bytes = reader.ReadBytes(len);
-            return Encoding.UTF8.GetString(bytes);
+            // BinaryReader.ReadBytes returns FEWER than the requested count
+            // when the underlying stream ends early — no exception is raised.
+            // Without this guard a truncated FullSync element would decode as
+            // a short string and leave the receiver's list permanently out of
+            // sync with the owner.  Surface a clean EndOfStreamException so
+            // the caller's existing element-failure handling drops the whole
+            // payload (already wired in the FullSync apply path).
+            if (bytes.Length != len)
+                throw new EndOfStreamException(
+                    $"NetworkVariableListString.ReadElement: declared {len} UTF-8 bytes, " +
+                    $"only {bytes.Length} available — payload truncated.");
+            try
+            {
+                return StrictUtf8.GetString(bytes);
+            }
+            catch (DecoderFallbackException ex)
+            {
+                throw new EndOfStreamException(
+                    "NetworkVariableListString.ReadElement: malformed UTF-8 in element payload.",
+                    ex);
+            }
         }
     }
 }

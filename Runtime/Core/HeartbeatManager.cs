@@ -43,6 +43,15 @@ namespace RTMPE.Core
         private long    _pendingSendTick; // Stopwatch ticks at the time of the FIRST send for the current heartbeat cycle (for RTT)
         private int     _missedAcks;
         private bool    _awaitingAck;
+        // Monotone cycle identifier — increments once per logical heartbeat
+        // cycle (initial send), held constant across retransmits within the
+        // same cycle, and observable via <see cref="CurrentCycleId"/> for
+        // diagnostics and integration tests.  An ack is consumed by the
+        // cycle that was outstanding at receive time; subsequent acks for
+        // the same cycle (e.g. retransmit duplicate) are ignored — the
+        // boolean witness `_awaitingAck` enforces single-shot acceptance,
+        // and the cycle counter makes the witness inspectable.
+        private uint    _cycleId;
 
         private readonly PacketBuilder _builder;
         private readonly Stopwatch     _clock;
@@ -60,6 +69,35 @@ namespace RTMPE.Core
         /// The caller should disconnect and attempt reconnect.
         /// </summary>
         public event Action OnHeartbeatTimeout;
+
+        /// <summary>
+        /// Invoked when a successful ack measures an RTT above
+        /// <see cref="RttSpikeThresholdMs"/>.  The argument is the offending
+        /// RTT in milliseconds.  Subscribers can use this to log network-
+        /// quality regressions, surface a UI indicator, or feed an adaptive
+        /// quality controller without polling <see cref="OnRttUpdated"/> on
+        /// every ack.  Spikes are surfaced ONCE per occurrence — the
+        /// manager fires this event only on the offending sample, not for
+        /// the trailing samples that may also exceed the threshold within
+        /// the same network event.
+        /// </summary>
+        public event Action<float> OnRttSpikeDetected;
+
+        /// <summary>
+        /// RTT (in ms) above which <see cref="OnRttSpikeDetected"/> fires.
+        /// Default 1000 ms — well above any healthy LAN / wired regional
+        /// link, just under the threshold where RUDP retransmits would
+        /// already be visible to gameplay code.  Settable so deployments
+        /// targeting cellular networks (where 500 ms+ is normal) can raise
+        /// it; clamped to a positive minimum so a misconfiguration cannot
+        /// fire on every ack.
+        /// </summary>
+        public int RttSpikeThresholdMs
+        {
+            get => _rttSpikeThresholdMs;
+            set => _rttSpikeThresholdMs = value < 1 ? 1 : value;
+        }
+        private int _rttSpikeThresholdMs = 1_000;
 
         // ── Construction ──────────────────────────────────────────────────────
 
@@ -105,11 +143,31 @@ namespace RTMPE.Core
             _awaitingAck     = false;
             _lastSendTick    = 0;
             _pendingSendTick = 0;
+            // Cycle id is reset only on (re-)Start so an external observer
+            // that latched the previous cycle id and queries
+            // <see cref="CurrentCycleId"/> after Stop sees a stable zero
+            // until the next cycle actually begins — avoiding ambiguous
+            // "cycle 7 from a previous session" reads while the manager
+            // is dormant.
+            _cycleId         = 0;
             _clock.Restart();
         }
 
         /// <summary>True while the heartbeat loop is active.</summary>
         public bool IsRunning => _running;
+
+        /// <summary>
+        /// Most-recently-issued heartbeat cycle identifier.  Zero before the
+        /// first send; otherwise increments once per cycle (initial send),
+        /// held constant across retransmits within the same cycle.  Surfaced
+        /// for telemetry hooks and integration tests that need to assert
+        /// per-cycle ack semantics.
+        /// </summary>
+        public uint CurrentCycleId => _cycleId;
+
+        /// <summary>True between the initial send of a cycle and the
+        /// successful (non-stale) ack that resolves it; false otherwise.</summary>
+        public bool IsAwaitingAck => _awaitingAck;
 
         /// <summary>
         /// Stop the heartbeat loop. No-op if not running.
@@ -146,6 +204,7 @@ namespace RTMPE.Core
                 _lastSendTick    = nowMs;
                 _pendingSendTick = nowMs;  // start of this heartbeat cycle
                 _awaitingAck     = true;
+                _cycleId        += 1;      // unsigned wrap is acceptable; only relative ordering matters
             }
             else if (_awaitingAck && nowMs - _lastSendTick >= _intervalMs)
             {
@@ -189,12 +248,36 @@ namespace RTMPE.Core
             long nowMs = _clock.ElapsedMilliseconds;
             if (_pendingSendTick <= 0) return;
             long ageMs = nowMs - _pendingSendTick;
-            if (ageMs < 0 || ageMs > (long)_intervalMs * StaleAckIntervalMultiplier)
+            if (ageMs < 0)
             {
-                // Drop without firing OnRttUpdated.  We still clear
-                // _awaitingAck so the next Tick can issue a fresh
-                // heartbeat instead of being permanently parked waiting
-                // for the ghost.
+                // Negative age is a clock-anomaly path — Stopwatch
+                // ElapsedMilliseconds is documented as monotonic, so a
+                // negative ageMs implies a clock-source swap or counter
+                // overflow.  Drop the ack without firing OnRttUpdated and
+                // without altering miss accounting: a clock anomaly is
+                // not evidence that the channel delivered anything from
+                // the gateway, so resetting _missedAcks here would
+                // reward an attacker / hardware-clock fault with cycle-
+                // accounting drift.  Clearing _awaitingAck is still
+                // correct so the next Tick can issue a fresh heartbeat.
+                _awaitingAck = false;
+                return;
+            }
+            if (ageMs > (long)_intervalMs * StaleAckIntervalMultiplier)
+            {
+                // Staleness path: the ack arrived AFTER the pendingSend
+                // window closed.  Reset _missedAcks alongside
+                // _awaitingAck because a ghost ack IS evidence that the
+                // channel just delivered something from the gateway —
+                // whatever caused the previous miss(es) is unlikely to
+                // still hold.  Without the reset, misses accumulated
+                // during a transient outage carry into the next cycle,
+                // surfacing OnHeartbeatTimeout after a single miss
+                // instead of the configured threshold and producing
+                // spurious disconnects on healthy links (e.g. Wi-Fi →
+                // cellular hand-off where the staleness gate trips
+                // exactly once).
+                _missedAcks  = 0;
                 _awaitingAck = false;
                 return;
             }
@@ -208,6 +291,16 @@ namespace RTMPE.Core
             _awaitingAck = false;
 
             OnRttUpdated?.Invoke(rttMs);
+
+            // Anomaly hook: an RTT above the configured spike threshold
+            // typically indicates a network event (Wi-Fi → cellular hand-
+            // off, ISP congestion, queue-bloat).  Surface it once per
+            // affected sample so dashboards see the spike without
+            // listeners having to filter every OnRttUpdated event
+            // themselves.  Per-cycle one-shot semantics: the next ack on
+            // the next cycle gets its own spike check.
+            if (rttMs > _rttSpikeThresholdMs)
+                OnRttSpikeDetected?.Invoke(rttMs);
         }
     }
 }

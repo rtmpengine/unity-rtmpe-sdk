@@ -375,10 +375,26 @@ namespace RTMPE.Core
                 // Admission already runs before this point, so failure here
                 // is strictly post-admission and never a false-positive
                 // cap-headroom restore.
+                //
+                // When the failure lands AFTER _registry.Register / the
+                // prefab-map insertion (e.g. a user OnNetworkSpawn callback
+                // throws inside SetSpawned), the eager-increment rollback
+                // alone leaves the registry in an inconsistent state: the
+                // counter has been rolled back but the registry slot is
+                // still occupied.  Later in the session, when the
+                // not-properly-spawned GameObject is destroyed, the
+                // OnExternallyDestroyed path decrements the counter a
+                // SECOND time — undercounting the live population by one
+                // and silently extending the per-room spawn cap.  Roll
+                // back the registry insertion together with the counter
+                // so the live-set / counter / prefab-map invariant is
+                // exact across every failure path.
                 if (!committed)
                 {
                     if (_spawnsThisSecond > 0) _spawnsThisSecond--;
                     if (_currentSpawnCount > 0) _currentSpawnCount--;
+                    _registry.Unregister(objectId);
+                    _prefabOfObject.Remove(objectId);
                 }
             }
         }

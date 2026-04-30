@@ -68,8 +68,15 @@ namespace RTMPE.Rpc
             [FieldOffset(0)] public int   Int;
         }
 
+        // Strict UTF-8 codec.  Decoding paths route every malformed sequence
+        // into a DecoderFallbackException, which the ReadParam call sites
+        // translate into the standard `offset = -1; return null` failure
+        // contract.  Encoding paths are unaffected — every valid C# string
+        // round-trips through the strict encoder identically to the lax
+        // form, so production callers see no behavioural difference for
+        // well-formed inputs.
         private static readonly UTF8Encoding Utf8 =
-            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
         // ── Measurement ───────────────────────────────────────────────────────
 
@@ -156,11 +163,17 @@ namespace RTMPE.Rpc
             }
             if (value is string str)
             {
-                byte[] strBytes = Utf8.GetBytes(str);
-                if (strBytes.Length > ushort.MaxValue)
+                // Pre-check the encoded byte count BEFORE materialising the
+                // UTF-8 byte array.  GetByteCount is non-allocating per BCL
+                // contract, so a 100 MiB string is rejected without paying
+                // 100 MiB of heap allocation.  Same alloc-amplification
+                // surface closed for ApiKeyCipher in M19-CRYPTO-01.
+                int strByteCount = Utf8.GetByteCount(str);
+                if (strByteCount > ushort.MaxValue)
                     throw new ArgumentException(
-                        $"String param encodes to {strBytes.Length} bytes — exceeds 65535-byte wire limit.",
+                        $"String param encodes to {strByteCount} bytes — exceeds 65535-byte wire limit.",
                         nameof(value));
+                byte[] strBytes = Utf8.GetBytes(str);
                 buf[offset++] = RpcTypeId.String;
                 WriteU16LE(buf, offset, (ushort)strBytes.Length); offset += 2;
                 Buffer.BlockCopy(strBytes, 0, buf, offset, strBytes.Length);
@@ -210,12 +223,15 @@ namespace RTMPE.Rpc
                 buf[offset++] = RpcTypeId.INetworkSerializable;
 
                 string typeName = ns.GetType().FullName ?? string.Empty;
-                byte[] nameBytes = Utf8.GetBytes(typeName);
-                if (nameBytes.Length > ushort.MaxValue)
+                // Pre-check before allocating the encoded byte array — same
+                // alloc-amplification discipline as the String branch above.
+                int nameByteCount = Utf8.GetByteCount(typeName);
+                if (nameByteCount > ushort.MaxValue)
                     throw new ArgumentException(
-                        $"INetworkSerializable type name '{typeName}' is {nameBytes.Length} bytes — " +
+                        $"INetworkSerializable type name '{typeName}' is {nameByteCount} bytes — " +
                         $"exceeds {ushort.MaxValue}-byte wire limit.",
                         nameof(value));
+                byte[] nameBytes = Utf8.GetBytes(typeName);
 
                 WriteU16LE(buf, offset, (ushort)nameBytes.Length); offset += 2;
                 if (nameBytes.Length > 0)
@@ -302,7 +318,9 @@ namespace RTMPE.Rpc
                     if (data.Length - offset < 2) { offset = -1; return null; }
                     ushort strLen = ReadU16LE(data, offset); offset += 2;
                     if (data.Length - offset < strLen) { offset = -1; return null; }
-                    string str = Utf8.GetString(data, offset, strLen);
+                    string str;
+                    try { str = Utf8.GetString(data, offset, strLen); }
+                    catch (DecoderFallbackException) { offset = -1; return null; }
                     offset += strLen;
                     return str;
                 }
@@ -353,9 +371,13 @@ namespace RTMPE.Rpc
                     if (data.Length - offset < 2) { offset = -1; return null; }
                     ushort nameLen = ReadU16LE(data, offset); offset += 2;
                     if (data.Length - offset < nameLen) { offset = -1; return null; }
-                    string typeName = nameLen == 0
-                        ? string.Empty
-                        : Utf8.GetString(data, offset, nameLen);
+                    string typeName;
+                    if (nameLen == 0) typeName = string.Empty;
+                    else
+                    {
+                        try { typeName = Utf8.GetString(data, offset, nameLen); }
+                        catch (DecoderFallbackException) { offset = -1; return null; }
+                    }
                     offset += nameLen;
 
                     if (data.Length - offset < 2) { offset = -1; return null; }

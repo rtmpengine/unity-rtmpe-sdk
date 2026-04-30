@@ -44,13 +44,34 @@ namespace RTMPE.Crypto.Internal
         // SHA-256 digest length in bytes.
         private const int HashLen = 32;
 
+        // Working ceiling on the optional info parameter.  RFC 5869 places no
+        // upper bound on info; in this SDK it is always assembled from a
+        // short fixed prefix plus two 32-byte public keys (~64–96 B in
+        // practice).  Capping the input keeps the per-block intermediate
+        // allocation bounded for any future caller that might pass a
+        // larger value — the 4 KiB ceiling is well above every legitimate
+        // call site and well below the allocation-amplification surface
+        // (255 blocks × ~4 KiB ≈ 1 MiB total).
+        private const int MaxInfoLen = 4096;
+
         /// <summary>
         /// HKDF-Extract: PRK = HMAC-SHA256(salt, IKM).
         /// If <paramref name="salt"/> is null or empty the RFC 5869 default
-        /// (HashLen zero bytes) is used.
+        /// (HashLen zero bytes) is used.  <paramref name="ikm"/> must be
+        /// non-null; passing null surfaces the misuse at the call site as a
+        /// clean ArgumentNullException rather than as an opaque
+        /// NullReferenceException deep inside HMACSHA256.ComputeHash.
         /// </summary>
         internal static byte[] Extract(byte[] salt, byte[] ikm)
         {
+            // Symmetric contract with Expand(prk, ...) which already throws
+            // ArgumentNullException on null prk.  An ECDH shared-secret of
+            // zero bytes is allowed (RFC 5869 §2.2 admits empty IKM); only
+            // a null reference is rejected.
+            if (ikm == null)
+                throw new ArgumentNullException(nameof(ikm),
+                    "HKDF-Extract requires a non-null IKM (input keying material).");
+
             if (salt == null || salt.Length == 0)
                 salt = new byte[HashLen]; // default salt: HashLen zero bytes
 
@@ -67,9 +88,21 @@ namespace RTMPE.Crypto.Internal
         /// </summary>
         internal static byte[] Expand(byte[] prk, byte[] info, int outputLength)
         {
+            if (prk == null)
+                throw new ArgumentNullException(nameof(prk),
+                    "HKDF-Expand requires a non-null pseudo-random key.");
             if (outputLength < 1 || outputLength > 255 * HashLen)
                 throw new ArgumentOutOfRangeException(nameof(outputLength),
                     "HKDF-Expand output length must be between 1 and 255 * HashLen bytes.");
+
+            // RFC 5869 §2.3 permits info to be empty; treat null as the same
+            // empty-info case rather than dereferencing it on the inner
+            // BlockCopy.  An accidental null would otherwise surface as an
+            // opaque NullReferenceException far from the call site.
+            if (info == null) info = Array.Empty<byte>();
+            if (info.Length > MaxInfoLen)
+                throw new ArgumentOutOfRangeException(nameof(info),
+                    $"HKDF-Expand info parameter is {info.Length} bytes; maximum is {MaxInfoLen}.");
 
             var okm    = new byte[outputLength];
             var t_prev = Array.Empty<byte>();

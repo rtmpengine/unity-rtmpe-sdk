@@ -141,10 +141,14 @@ namespace RTMPE.Sync
             var rot   = new Quaternion(0f, 0f, 0f, 0f); // raw zero — NOT identity; caller checks mask
             var scale = Vector3.zero;
 
-            // Position (3 × f32 LE) — conditional on bit 0x01
+            // Position (3 × f32 LE) — conditional on bit 0x01.  Bounds are
+            // expressed in subtraction form (`size > available`) so the
+            // additive form's int-wrap surface — `off` near int.MaxValue
+            // would let `off + N` wrap to a negative value and bypass the
+            // check — does not apply here.
             if ((changedMask & ChangedPosition) != 0)
             {
-                if (off + POSITION_SIZE > payload.Length) return false;
+                if (POSITION_SIZE > payload.Length - off) return false;
                 pos.x = ReadF32LE(payload, off);     off += 4;
                 pos.y = ReadF32LE(payload, off);     off += 4;
                 pos.z = ReadF32LE(payload, off);     off += 4;
@@ -154,7 +158,7 @@ namespace RTMPE.Sync
             // Rotation (4 × f32 LE, x y z w) — conditional on bit 0x02
             if ((changedMask & ChangedRotation) != 0)
             {
-                if (off + ROTATION_SIZE > payload.Length) return false;
+                if (ROTATION_SIZE > payload.Length - off) return false;
                 rot.x = ReadF32LE(payload, off);     off += 4;
                 rot.y = ReadF32LE(payload, off);     off += 4;
                 rot.z = ReadF32LE(payload, off);     off += 4;
@@ -182,12 +186,18 @@ namespace RTMPE.Sync
             // Scale (3 × f32 LE) — conditional on bit 0x04
             if ((changedMask & ChangedScale) != 0)
             {
-                if (off + SCALE_SIZE > payload.Length) return false;
+                if (SCALE_SIZE > payload.Length - off) return false;
                 scale.x = ReadF32LE(payload, off);   off += 4;
                 scale.y = ReadF32LE(payload, off);   off += 4;
                 scale.z = ReadF32LE(payload, off);   off += 4;
                 if (!IsFinite(scale.x) || !IsFinite(scale.y) || !IsFinite(scale.z)) return false;
             }
+
+            // Reject trailing residue.  A well-formed StateDelta ends exactly
+            // where the last selected field's bytes end; surplus bytes are a
+            // protocol-drift / smuggling signal that the higher-level decoder
+            // would otherwise carry forward without observing.
+            if (off != payload.Length) return false;
 
             state = new TransformState { Position = pos, Rotation = rot, Scale = scale };
             return true;

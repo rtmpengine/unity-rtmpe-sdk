@@ -217,18 +217,30 @@ namespace RTMPE.Rpc
         {
             var map = new Dictionary<uint, (MethodInfo Method, RtmpeRpcAttribute Attr)>();
 
-            // Scan all public instance methods declared on this specific type.
-            // We do NOT include inherited methods — a base class registers its own
-            // map separately, preventing duplicate dispatch when a derived type
-            // overrides or shadows an RPC method.
+            // Scan public instance methods INCLUDING those inherited from
+            // base classes.  The hash key is `ComputeMethodId(type.Name,
+            // method.Name)` — keyed on the runtime type's name, not the
+            // declaring type — so a [RtmpeRpc] method declared on a base
+            // class participates in dispatch under the runtime subtype's
+            // hash on both sides of the wire.  Without inheritance, a
+            // common OO pattern (BasePlayer : NetworkBehaviour declaring
+            // a shared `[RtmpeRpc] Damage(int)` that subclasses inherit)
+            // would silently fail at dispatch time on every Subclass
+            // instance.  C#'s method-resolution rules handle override /
+            // shadow correctly: GetMethods returns the most-derived
+            // implementation for virtual methods, and shadowed methods
+            // surface as the derived-type's declaration — which is the
+            // intended dispatch target in both cases.
             var methods = type.GetMethods(
                 BindingFlags.Instance |
-                BindingFlags.Public   |
-                BindingFlags.DeclaredOnly);
+                BindingFlags.Public);
 
             foreach (var mi in methods)
             {
-                var attr = mi.GetCustomAttribute<RtmpeRpcAttribute>(inherit: false);
+                // `inherit: true` so a [RtmpeRpc] attribute placed on a
+                // base-class virtual method is honoured on the override
+                // even when the subclass redeclaration omits the attribute.
+                var attr = mi.GetCustomAttribute<RtmpeRpcAttribute>(inherit: true);
                 if (attr == null) continue;
 
                 uint id = ComputeMethodId(type.Name, mi.Name);
@@ -246,6 +258,13 @@ namespace RTMPE.Rpc
                 // Check for intra-type collision (same type, two methods hash to same ID).
                 if (map.ContainsKey(id))
                 {
+                    // Object's `Equals` / `GetHashCode` / `ToString` /
+                    // `MemberwiseClone` etc. are inherited by every type —
+                    // they do not carry [RtmpeRpc] so they never reach
+                    // here.  Any duplicate at this point is therefore a
+                    // genuine same-name [RtmpeRpc] definition (e.g. an
+                    // overload) which is unsupported by the FNV-keyed
+                    // dispatch table.
                     Debug.LogError(
                         $"[RTMPE] RpcRegistry: method '{type.Name}.{mi.Name}' has FNV-1a " +
                         $"hash 0x{id:X8} that collides with another [RtmpeRpc] method on the " +
@@ -276,14 +295,17 @@ namespace RTMPE.Rpc
             var collisions = new List<string>();
             var seen       = new Dictionary<uint, string>();
 
+            // Match BuildMap's discovery scope so the validator and the
+            // dispatch path see the same set of [RtmpeRpc] methods.
+            // Inherited [RtmpeRpc] attributes participate in dispatch and
+            // therefore must participate in collision validation too.
             var methods = type.GetMethods(
                 BindingFlags.Instance |
-                BindingFlags.Public   |
-                BindingFlags.DeclaredOnly);
+                BindingFlags.Public);
 
             foreach (var mi in methods)
             {
-                var attr = mi.GetCustomAttribute<RtmpeRpcAttribute>(inherit: false);
+                var attr = mi.GetCustomAttribute<RtmpeRpcAttribute>(inherit: true);
                 if (attr == null) continue;
 
                 uint id = ComputeMethodId(type.Name, mi.Name);

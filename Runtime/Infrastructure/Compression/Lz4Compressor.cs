@@ -139,7 +139,17 @@ namespace RTMPE.Infrastructure.Compression
 
             // Ratio gate runs BEFORE allocating the output buffer so that a
             // crafted prefix cannot force us to materialise the full ceiling.
-            if (declaredLen / (uint)compressedPayload > MaxCompressionRatio)
+            //
+            // Use exact long-domain arithmetic (`declaredLen > compressedPayload
+            // * MaxCompressionRatio`) rather than integer division.  The
+            // truncating-divide form admitted ratios up to `(MaxCompressionRatio
+            // + 1) - 1/compressedPayload` due to floor-rounding — e.g. with
+            // compressedPayload = 1 the gate accepted any declaredLen up to
+            // 100 × 1 + (compressedPayload - 1), silently doubling the named
+            // ceiling around the small-payload boundary.  Multiplication-based
+            // comparison is the canonical fix and keeps the named constant the
+            // actual ceiling.
+            if ((long)declaredLen > (long)compressedPayload * MaxCompressionRatio)
                 throw new InvalidOperationException(
                     $"LZ4: compression ratio {declaredLen}/{compressedPayload} exceeds " +
                     $"maximum {MaxCompressionRatio}.");

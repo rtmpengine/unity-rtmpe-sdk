@@ -175,6 +175,13 @@ namespace RTMPE.Sync
                  "client-side prediction noise.")]
         [SerializeField] [Range(0.5f, 20f)] private float _ownerReconcileSnapThreshold = 3.0f;
 
+        [Tooltip("Rotation error threshold (degrees) above which the owner snaps to the " +
+                 "server-confirmed rotation.  Defaults to 30°, matching the legacy " +
+                 "behaviour; titles with tight reconciliation tolerances (competitive " +
+                 "shooters) typically lower this; titles with loose tolerances (casual " +
+                 "ragdoll) raise it.  Tune in tandem with the position threshold.")]
+        [SerializeField] [Range(1f, 180f)] private float _ownerReconcileRotationSnapDegrees = 30.0f;
+
         // ── Inspector — Dead reckoning ─────────────────────────────────────────
 
         [Header("Dead Reckoning")]
@@ -594,6 +601,25 @@ namespace RTMPE.Sync
                 _rateBucketTokens -= 1f;
             }
 
+            // ── Componentwise finiteness gate ─────────────────────────────────
+            // Reject ANY inbound packet whose vector or quaternion fields
+            // carry NaN / +Inf / -Inf in a sync field that this packet
+            // claims to update.  PhysX has been observed to enter an
+            // unrecoverable state on a single non-finite assignment to
+            // Rigidbody.position / .velocity (the body either disappears
+            // from the simulation or stops responding to forces); the
+            // velocity cap above happens to reject NaN.sqrMagnitude (NaN >
+            // anything is false → the comparison passes through), so the
+            // explicit IsFinite gate is the only authoritative defence.
+            if ((changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
+                && !IsFiniteVector(incoming.Position)) return;
+            if ((changedMask & PhysicsPacketBuilder.ChangedVelocity) != 0
+                && !IsFiniteVector(incoming.Velocity)) return;
+            if ((changedMask & PhysicsPacketBuilder.ChangedAngularVelocity) != 0
+                && !IsFiniteVector(incoming.AngularVelocity)) return;
+            if ((changedMask & PhysicsPacketBuilder.ChangedRotation) != 0
+                && !IsFiniteQuaternion(incoming.Rotation)) return;
+
             // ── Plausibility caps on velocity / angular velocity ──────────────
             if (settings != null)
             {
@@ -776,11 +802,21 @@ namespace RTMPE.Sync
             if (_syncRotation && (changedMask & PhysicsPacketBuilder.ChangedRotation) != 0)
             {
                 Quaternion sr = serverState.Rotation;
+                // IsFinite must precede the magnitude band gate: a NaN component
+                // makes magSq=NaN, and NaN<0.81 / NaN>1.21 are both false, so the
+                // band check would silently pass a corrupt quaternion through.
+                if (!IsFiniteQuaternion(sr))
+                {
+                    Debug.LogWarning(
+                        "[RTMPE] NetworkRigidbody.ApplyReconciliation: rejected non-finite " +
+                        $"server rotation {sr} — keeping local state.", this);
+                    return;
+                }
                 float magSq = sr.x * sr.x + sr.y * sr.y + sr.z * sr.z + sr.w * sr.w;
                 if (magSq < 0.81f || magSq > 1.21f) return; // [0.9², 1.1²] band
 
                 float angleErr = Quaternion.Angle(_rb.rotation, sr);
-                if (angleErr > 30f) // 30° divergence → snap
+                if (angleErr > _ownerReconcileRotationSnapDegrees)
                 {
                     // Same FixedUpdate-aligned deferral as the position branch
                     // above: a direct write here would land between physics
@@ -795,6 +831,16 @@ namespace RTMPE.Sync
             => !float.IsNaN(v.x) && !float.IsInfinity(v.x)
             && !float.IsNaN(v.y) && !float.IsInfinity(v.y)
             && !float.IsNaN(v.z) && !float.IsInfinity(v.z);
+
+        // Quaternion finiteness used by ApplyRemoteState's inbound gate.
+        // Includes the w component because PhysX may carry a finite x/y/z
+        // alongside a NaN w after a divide-by-zero recovery, which Unity
+        // would otherwise persist as a corrupt rotation.
+        private static bool IsFiniteQuaternion(Quaternion q)
+            => !float.IsNaN(q.x) && !float.IsInfinity(q.x)
+            && !float.IsNaN(q.y) && !float.IsInfinity(q.y)
+            && !float.IsNaN(q.z) && !float.IsInfinity(q.z)
+            && !float.IsNaN(q.w) && !float.IsInfinity(q.w);
 
         // ── Public API ─────────────────────────────────────────────────────────
 

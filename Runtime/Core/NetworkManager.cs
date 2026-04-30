@@ -634,23 +634,28 @@ namespace RTMPE.Core
         /// Never returns null after <c>Awake</c> — the inner context forwards
         /// to <see cref="RoomManager"/> and no-ops (with a log) if the session
         /// has not yet been authenticated.
-        ///
-       /// Thread safety: the lazy-init uses
-        /// <see cref="System.Threading.Interlocked.CompareExchange{T}(ref T,T,T)"/>
-        /// so concurrent access from the main thread plus a background thread
-        /// (e.g. a transport callback that inadvertently touches it) only ever
-        /// retains a single instance.  Production callers MUST still access
-        /// from the Unity main thread; this safeguard prevents accidental
-        /// double-allocation during SDK bootstraps.
         /// </summary>
+        /// <remarks>
+        /// Thread safety: <see cref="LocalPlayer"/> MUST be accessed from the
+        /// Unity main thread.  Transport callbacks are marshalled onto the
+        /// main thread by <see cref="Infrastructure.Threading.MainThreadDispatcher"/>
+        /// before they reach this getter, and gameplay code is single-threaded
+        /// by Unity convention.  Earlier revisions used
+        /// <see cref="System.Threading.Interlocked.CompareExchange{T}(ref T,T,T)"/>
+        /// to harden against an inadvertent off-thread caller; the CAS pattern
+        /// allocated a throwaway <see cref="LocalPlayerContext"/> on every
+        /// getter call until the field was populated and re-allocated again
+        /// on every CAS-loser path — both costs incurred on the hot main
+        /// thread for a contract the rest of the SDK does not actually
+        /// permit being violated.
+        /// </remarks>
         public LocalPlayerContext LocalPlayer
         {
             get
             {
-                var existing = _localPlayer;
-                if (existing != null) return existing;
-                var fresh = new LocalPlayerContext(() => _roomManager, () => _localPlayerStringId);
-                return System.Threading.Interlocked.CompareExchange(ref _localPlayer, fresh, null) ?? fresh;
+                if (_localPlayer == null)
+                    _localPlayer = new LocalPlayerContext(() => _roomManager, () => _localPlayerStringId);
+                return _localPlayer;
             }
         }
         private LocalPlayerContext _localPlayer;
@@ -671,18 +676,21 @@ namespace RTMPE.Core
         /// Networked-scene management façade.  Drives room-wide scene
         /// transitions through the reserved <c>__scene</c> custom property
         /// and surfaces <c>SceneLoaded</c> (0x2F) readiness aggregation.
-        /// Thread-safe lazy-init via <see cref="System.Threading.Interlocked"/>
-        /// follows the same pattern as <see cref="LocalPlayer"/>.
         /// </summary>
+        /// <remarks>
+        /// Thread safety: same main-thread-only contract as
+        /// <see cref="LocalPlayer"/>; see that property's remarks for why
+        /// the previous <see cref="System.Threading.Interlocked.CompareExchange{T}(ref T,T,T)"/>
+        /// pattern was retired.
+        /// </remarks>
         public NetworkSceneManager Scene
         {
             get
             {
-                var existing = _sceneManager;
-                if (existing != null) return existing;
                 if (_roomManager == null) return null;
-                var fresh = new NetworkSceneManager(() => _roomManager);
-                return System.Threading.Interlocked.CompareExchange(ref _sceneManager, fresh, null) ?? fresh;
+                if (_sceneManager == null)
+                    _sceneManager = new NetworkSceneManager(() => _roomManager);
+                return _sceneManager;
             }
         }
         private NetworkSceneManager _sceneManager;
@@ -806,6 +814,20 @@ namespace RTMPE.Core
             // errors honour the verbose-logs preference instead of being
             // ingested as crashes by every reporter installed in the host app.
             RtmpeLog.SetActiveSettings(_settings);
+
+            // Mirror the deployment's lobby/room string-length cap into the
+            // packet parser's static budget so the parser rejects oversize
+            // strings consistently with the inspector contract — without
+            // this hand-off the parser's hard 4 KiB ceiling silently
+            // overrides a stricter value the operator configured.
+            RoomPacketParser.ConfigureMaxStringBytes(_settings.maxLobbyStringBytes);
+
+            // Coerce any non-finite world-bounds vectors back to a sane
+            // default.  An OnValidate hook covers the Editor path; this
+            // call covers runtime asset loads (Addressables, AssetBundles)
+            // and code-built NetworkSettings instances that would otherwise
+            // bypass the Editor-only validation.
+            _settings.EnsureFiniteWorldBoundsForRuntime();
 
             // Resolve the runtime tick interval from the settings' configured
             // tickRate.  TickInterval is guarded against division by zero by
@@ -1330,6 +1352,23 @@ namespace RTMPE.Core
             //  (Recreate runs atomically with respect to the above.)
             lock (_sceneTransitionLock)
             {
+                // Symmetric detach against the prior instance.  Replacing
+                // _roomManager with a new instance leaves the old instance
+                // unreferenced from this field, but a transport callback
+                // already in-flight on a worker thread may still reach the
+                // old delegate list and invoke our handler against
+                // already-replaced state.  Detaching first guarantees the
+                // old instance dispatches no further callbacks regardless
+                // of the GC schedule.
+                if (_roomManager != null)
+                {
+                    _roomManager.OnRoomJoined          -= OnRoomManagerJoined;
+                    _roomManager.OnRoomLeft            -= OnRoomManagerLeft;
+                    _roomManager.OnRoomCreated         -= OnRoomManagerCreated;
+                    _roomManager.OnPlayerLeft          -= OnRoomManagerPlayerLeft;
+                    _roomManager.OnPlayerJoined        -= OnRoomManagerPlayerJoined;
+                }
+
                 // RoomManager shares PacketBuilder with the rest of the outbound
                 // pipeline so room packets use a single monotonic sequence counter
                 // — using an independent counter would be a protocol violation
@@ -1357,10 +1396,25 @@ namespace RTMPE.Core
                 var ownership = new OwnershipManager(registry, this);
                 _spawnManager = new SpawnManager(registry, ownership, this);
 
-                _roomManager.OnPlayerLeft   += playerId => _spawnManager?.OnPlayerLeftRoom(playerId);
-                _roomManager.OnPlayerJoined += _ => _spawnManager?.MarkAllVariablesDirtyForResync();
+                // Use named-method delegates (not inline lambdas) so the
+                // delegate instances are not re-allocated per call to
+                // RecreateRoomAndSpawnManagers, which fires on every
+                // reconnect / scene load.  Inline lambdas would also
+                // capture `this` implicitly and prevent the JIT from
+                // caching the delegate; method-group references hit the
+                // delegate cache and are emitted as a static field by Roslyn.
+                _roomManager.OnPlayerLeft   += OnRoomManagerPlayerLeft;
+                _roomManager.OnPlayerJoined += OnRoomManagerPlayerJoined;
             }
         }
+
+        // Named handlers extracted from the previous inline lambdas — see
+        // RecreateRoomAndSpawnManagers above for the allocation rationale.
+        private void OnRoomManagerPlayerLeft(string playerId)
+            => _spawnManager?.OnPlayerLeftRoom(playerId);
+
+        private void OnRoomManagerPlayerJoined(PlayerInfo _)
+            => _spawnManager?.MarkAllVariablesDirtyForResync();
 
         /// <summary>
         /// **N-1** — shortcut reconnect using a previously-issued reconnect
@@ -1669,7 +1723,8 @@ namespace RTMPE.Core
 
             if (_transport.LocalEndPoint == null)
             {
-                LogDebug("Transport did not bind within 2 s — timeout coroutine will handle failure.");
+                if (IsDebugLogEnabled)
+                    LogDebug("Transport did not bind within 2 s — timeout coroutine will handle failure.");
                 yield break;
             }
 
@@ -1702,7 +1757,8 @@ namespace RTMPE.Core
 
             if (_transport.LocalEndPoint == null)
             {
-                LogDebug("ReconnectInit: transport did not bind within 2 s — timeout coroutine will handle failure.");
+                if (IsDebugLogEnabled)
+                    LogDebug("ReconnectInit: transport did not bind within 2 s — timeout coroutine will handle failure.");
                 yield break;
             }
 
@@ -1875,6 +1931,43 @@ namespace RTMPE.Core
         private long _lastBadVersionWarnTicks;
         private long _lastAeadFailWarnTicks;
         private long _lastMissingEncryptionWarnTicks;
+        private long _lastInboundFloodWarnTicks;
+        private long _lastPreSessionGameDataWarnTicks;
+
+        // Inbound packet rate limiter (token bucket).  The SDK has exactly
+        // one peer (the gateway), so this is effectively a hostile-gateway
+        // / replay-amplifier defence: a flood of legitimately-AEAD-valid
+        // packets from a compromised gateway cannot saturate the main thread
+        // with handler dispatches.  Defaults — 1500 pps sustained / 3000 pps
+        // burst — are an order of magnitude above legitimate 30 Hz × 16-
+        // player traffic (~480 pps) so steady-state play is unaffected, and
+        // are also above the dispatcher's own MaxQueueDepth refill rate so
+        // the bucket never becomes the bottleneck for healthy traffic.  All
+        // accesses run on the main thread inside ProcessPacket — no
+        // synchronisation required.
+        private const float MaxInboundBudgetTokens     = 3000f;
+        private const float InboundBudgetRefillPerSec  = 1500f;
+        private long  _inboundBudgetLastRefillTicks;
+        private float _inboundBudgetTokens             = MaxInboundBudgetTokens;
+        private long  _droppedInboundFloodPacketCount;
+
+        // Defence-in-depth: explicit session-established flag.  Game-data
+        // packet handlers (Spawn / VariableUpdate / RPC / property
+        // broadcasts) require BOTH _state == InRoom AND
+        // _sessionEstablished — currently equivalent because InRoom is only
+        // reachable after a successful SessionAck, but the redundant gate
+        // closes any future state-machine refactor that decouples the two.
+        // Set in OnSessionAck; cleared in TransitionTo(Disconnected).
+        private bool _sessionEstablished;
+
+        /// <summary>
+        /// Number of inbound packets dropped because the per-second token
+        /// bucket was exhausted.  Surfaced for backpressure observability —
+        /// any persistent non-zero rate means either a hostile gateway or a
+        /// configuration mismatch (legitimate burst above the cap).
+        /// </summary>
+        public long DroppedInboundFloodPacketCount =>
+            System.Threading.Interlocked.Read(ref _droppedInboundFloodPacketCount);
 
         // Returns true when the per-site one-second gate has elapsed and the
         // caller should emit its warning.  Stopwatch ticks are monotonic so
@@ -1890,6 +1983,64 @@ namespace RTMPE.Core
                 ref lastWarnTicks, now, prev) == prev;
         }
 
+        // Token-bucket inbound packet admission.  Refills at
+        // <see cref="InboundBudgetRefillPerSec"/> tokens/second, capped at
+        // <see cref="MaxInboundBudgetTokens"/>.  Returns false when the bucket
+        // is empty — the caller drops the packet to bound CPU under flood.
+        // Main-thread-only; mirrors the single-thread invariant of
+        // ProcessPacket (the bucket cannot underflow into negatives because
+        // each call decrements at most once).
+        private bool TryConsumeInboundBudget()
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            long prev = _inboundBudgetLastRefillTicks;
+            if (prev == 0)
+            {
+                _inboundBudgetLastRefillTicks = now;
+            }
+            else if (now > prev)
+            {
+                double elapsedSec = (now - prev) / (double)System.Diagnostics.Stopwatch.Frequency;
+                _inboundBudgetTokens = Math.Min(
+                    MaxInboundBudgetTokens,
+                    _inboundBudgetTokens + (float)(elapsedSec * InboundBudgetRefillPerSec));
+                _inboundBudgetLastRefillTicks = now;
+            }
+
+            if (_inboundBudgetTokens >= 1f)
+            {
+                _inboundBudgetTokens -= 1f;
+                return true;
+            }
+            return false;
+        }
+
+        // Game-data packet types — payloads that mutate session-bound state
+        // and therefore require _sessionEstablished AND _state == InRoom
+        // before they are dispatched.  Pre-session traffic is dropped at
+        // the gate; post-session-but-pre-room traffic is dropped at each
+        // handler's existing InRoom check (defence-in-depth).
+        private static bool RequiresActiveSession(PacketType type)
+        {
+            switch (type)
+            {
+                case PacketType.Spawn:
+                case PacketType.Despawn:
+                case PacketType.VariableUpdate:
+                case PacketType.Rpc:
+                case PacketType.RpcResponse:
+                case PacketType.RpcBufferReplay:
+                case PacketType.RoomPropertyUpdate:
+                case PacketType.PlayerPropertyUpdate:
+                case PacketType.StateSync:
+                case PacketType.Data:
+                case PacketType.DataAck:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         // Length-aware overload — `data` may be a pool-rented buffer whose
         // physical .Length exceeds the meaningful packet size.  All header
         // and payload-bound checks therefore use the explicit
@@ -1900,6 +2051,25 @@ namespace RTMPE.Core
             {
                 if (ShouldWarn(ref _lastBadHeaderWarnTicks))
                     Debug.LogWarning("[RTMPE] Dropped packet: too short to contain a valid header.");
+                return;
+            }
+
+            // Bound CPU under hostile flood.  The token bucket runs BEFORE any
+            // header / AEAD work so a replay-amplification attack against a
+            // valid encrypted packet at line-rate cannot saturate the main
+            // thread.  Legitimate 30 Hz × 16-player traffic (~480 pps) is an
+            // order of magnitude below the cap; surfaces drops via
+            // <see cref="DroppedInboundFloodPacketCount"/>.
+            if (!TryConsumeInboundBudget())
+            {
+                System.Threading.Interlocked.Increment(ref _droppedInboundFloodPacketCount);
+                if (ShouldWarn(ref _lastInboundFloodWarnTicks))
+                    Debug.LogWarning(
+                        "[RTMPE] Inbound packet rate exceeded " +
+                        $"{InboundBudgetRefillPerSec:F0} pps (burst {MaxInboundBudgetTokens:F0}); " +
+                        "dropping. Sustained drops indicate either a hostile gateway " +
+                        "flood or legitimate traffic above the cap — inspect " +
+                        "DroppedInboundFloodPacketCount.");
                 return;
             }
 
@@ -1979,6 +2149,25 @@ namespace RTMPE.Core
                         "state and must be AEAD-protected once the session is " +
                         "established — accepting it would let an off-path " +
                         "attacker race a forged frame against the gateway's reply.");
+                return;
+            }
+
+            // Centralised pre-dispatch session gate.  Game-data packet
+            // handlers each carry their own InRoom check (defence-in-depth),
+            // but routing the packet THROUGH the dispatcher first costs CPU
+            // and surface area; rejecting at the gate is cheaper and
+            // eliminates the implicit-state assumption that "InRoom implies
+            // SessionEstablished".  A future state-machine refactor that
+            // decouples the two cannot leak game-data dispatch through this
+            // path.
+            if (RequiresActiveSession(packetType) && !_sessionEstablished)
+            {
+                if (ShouldWarn(ref _lastPreSessionGameDataWarnTicks))
+                    Debug.LogWarning(
+                        $"[RTMPE] Dropped packet: {packetType} arrived before " +
+                        "SessionAck completed. Game-data packets are only valid " +
+                        "after the session is established; pre-session traffic " +
+                        "is rejected as a state-machine integrity check.");
                 return;
             }
 
@@ -2138,10 +2327,19 @@ namespace RTMPE.Core
             // path leaves _lastHandshakeInitCiphertext == null, which the
             // handler maps to the agreed absent-sentinel (32 × 0x00) — replay
             // defence in that flow is provided by the single-use reconnect
-            // token instead.
+            // token instead.  The flow argument is derived from the in-flight
+            // reconnect token so the handler can reject any future state where
+            // the two indicators disagree (defence-in-depth against refactor
+            // mistakes that accidentally engage the absent-sentinel path).
+            var handshakeFlow = !string.IsNullOrEmpty(_reconnectToken)
+                              && _lastHandshakeInitCiphertext == null
+                ? HandshakeFlow.Reconnect
+                : HandshakeFlow.Init;
+
             if (!_handshakeHandler.ValidateChallenge(
                     payload,
                     _lastHandshakeInitCiphertext,
+                    handshakeFlow,
                     out _,                                    // serverEphemeralPub (stored inside handler)
                     out var verifiedServerStaticPub,          // captured for TOFU persistence
                     resolution.PinToEnforce))
@@ -2263,6 +2461,13 @@ namespace RTMPE.Core
                 _timeoutCoroutine = null;
             }
 
+            // Mark the session live BEFORE the state transition so any
+            // observer hooked into TransitionTo (e.g. user-supplied
+            // OnConnected handlers) sees a consistent snapshot.  The flag
+            // is the centralised pre-dispatch gate's witness: without it
+            // RequiresActiveSession-typed packets are dropped.
+            _sessionEstablished = true;
+
             TransitionTo(NetworkState.Connected);
 
             // Start keep-alive heartbeat.
@@ -2280,6 +2485,21 @@ namespace RTMPE.Core
             // Cleanup path is also updated to explicitly unsubscribe — the
             // implicit "_heartbeatManager = null drops the chain" contract is
             // load-bearing.
+            // Reconnect path: a previous SessionAck may have wired event
+            // handlers onto an earlier HeartbeatManager.  Stop and detach the
+            // old one explicitly before assigning the new instance so the
+            // old multicast list cannot accumulate stale per-cycle
+            // subscriptions across reconnect bursts.  Stop() is idempotent
+            // and safe even when the manager has not yet started.
+            if (_heartbeatManager != null)
+            {
+                _heartbeatManager.Stop();
+                _heartbeatManager.OnHeartbeatTimeout -= OnHeartbeatTimeout;
+                // OnRttUpdated was wired to a fresh closure on each session,
+                // so the old delegate list is unreachable once
+                // _heartbeatManager is replaced — no symmetric -= needed.
+            }
+
             _heartbeatManager = new HeartbeatManager(_settings.heartbeatIntervalMs, _packetBuilder);
             _heartbeatManager.OnRttUpdated     += rtt => { LastRttMs = rtt; SafeRaise(OnRttUpdated, rtt, nameof(OnRttUpdated)); };
             _heartbeatManager.OnHeartbeatTimeout += OnHeartbeatTimeout;
@@ -2486,7 +2706,8 @@ namespace RTMPE.Core
             var payload = PacketParser.ExtractPayload(data);
             if (!SpawnPacketParser.TryParseSpawn(payload, out var spawnData))
             {
-                LogDebug("Spawn packet: malformed payload, dropped.");
+                if (IsDebugLogEnabled)
+                    LogDebug("Spawn packet: malformed payload, dropped.");
                 return;
             }
 
@@ -2561,7 +2782,8 @@ namespace RTMPE.Core
             // Legacy RPC path.
             if (!RpcPacketParser.TryParseRequest(payload, out var request))
             {
-                LogDebug("RPC request: malformed payload, dropped.");
+                if (IsDebugLogEnabled)
+                    LogDebug("RPC request: malformed payload, dropped.");
                 return;
             }
 
@@ -2964,7 +3186,8 @@ namespace RTMPE.Core
             // Initial assignment from "no owner" to a roster member is
             // permitted — the gateway authoritatively assigns ownership at
             // spawn time and may emit a separate Transfer to bind it.
-            bool initialAssignment = string.IsNullOrEmpty(target.OwnerPlayerId);
+            bool initialAssignment = string.IsNullOrEmpty(target.OwnerPlayerId)
+                                  && IsRosterMember(newOwner);
 
             // Self-initiated transfer: the local player asked the gateway
             // to relay this grant on their behalf.  We tolerate the gateway
@@ -3129,6 +3352,15 @@ namespace RTMPE.Core
         {
             var prev = _state;
             if (prev == next) return;
+
+            // Clear the session-established witness BEFORE the state assignment
+            // and event raise so observers (OnDisconnected callbacks) cannot
+            // observe a "Disconnected with _sessionEstablished == true"
+            // inconsistent snapshot.  Reconnecting is intentionally retained
+            // because the existing session keys remain in use until the new
+            // SessionAck either confirms the migration or replaces them.
+            if (next == NetworkState.Disconnected || next == NetworkState.Disconnecting)
+                _sessionEstablished = false;
 
             _state = next;
             LogDebug($"State: {prev} \u2192 {next}");
@@ -3401,8 +3633,23 @@ namespace RTMPE.Core
                 // instances.  Without nulling _networkThread and stopping
                 // _connectCoroutine the next attempt would call Start() on a
                 // terminated thread and leak the in-flight handshake coroutine.
+                //
+                // Disconnect the transport explicitly.  NetworkThread.Stop()
+                // only calls Disconnect when its Join times out, leaving the
+                // socket bound on the normal-Stop path.  EnsureNetworkThreadReady
+                // (the next retry) constructs a NEW NetworkThread that will
+                // call _transport.Connect() against the already-bound socket;
+                // a custom transport whose Connect is non-idempotent (or
+                // raises "already bound") fails the retry silently.  Force a
+                // closed-socket baseline so each retry starts identically
+                // regardless of which Stop path the previous attempt took.
                 _networkThread?.Stop();
                 _networkThread = null;
+                try { _transport?.Disconnect(); }
+                catch (Exception ex)
+                {
+                    RtmpeLog.Warn($"[NM] Transport disconnect on timeout teardown threw: {ex.Message}");
+                }
                 if (_connectCoroutine != null)
                 {
                     StopCoroutine(_connectCoroutine);
@@ -3485,6 +3732,21 @@ namespace RTMPE.Core
             // or violate the gateway's monotonic sequence/nonce contract.
             _pendingLiveRpcs?.Clear();
             _pendingLiveRpcs = null;
+
+            // Drain the static RequestIdAllocator pending map at session
+            // boundary.  Without this, OnTimeout closures captured during the
+            // previous session continue to live in the global static across
+            // reconnect / domain reload — PurgeExpired would later fire them
+            // against torn-down NetworkManager state, and a delayed forged
+            // reply on a previously-allocated request_id would still
+            // correlate against the old slot.  Synthetic-timeout invocation
+            // is the cleanest contract: pending callers see "session ended"
+            // signalled through the same hook they registered for.
+            try { Rpc.RequestIdAllocator.DropPending(); }
+            catch (Exception ex)
+            {
+                RtmpeLog.Warn($"[NM] RequestIdAllocator.DropPending threw on session boundary: {ex.Message}");
+            }
             _batchPending?.Clear();
             System.Threading.Interlocked.Exchange(ref _replayInProgress, 0);
 
@@ -4287,6 +4549,24 @@ namespace RTMPE.Core
                     // (or skipped the value entirely on a stale-tick rejection).
                     ms.Position = valueStart + valueLen;
                 }
+
+                // Strict trailing-bytes check.  A well-formed VariableUpdate
+                // batch ends exactly at the last variable's value_bytes; any
+                // residue indicates either a sender bug or a deliberate
+                // amplification attempt.  Surface it via a rate-limited
+                // warning instead of silently ignoring — silent tolerance
+                // hides protocol drift across versions and lets an attacker
+                // smuggle bytes through without raising any signal.
+                if (ms.Position != ms.Length)
+                {
+                    if (ShouldWarn(ref _lastVariableUpdateTrailingWarnTicks))
+                        Debug.LogWarning(
+                            "[RTMPE] VariableUpdate: " +
+                            $"{ms.Length - ms.Position} trailing byte(s) after " +
+                            $"{varCount} declared variable(s) for objectId {objectId}; " +
+                            "rejecting packet to prevent protocol-drift smuggling.");
+                    return;
+                }
             }
             catch (Exception ex)
             {
@@ -4294,6 +4574,8 @@ namespace RTMPE.Core
                     LogDebug($"VariableUpdate: parse error for objectId {objectId}: {ex.Message}");
             }
         }
+
+        private long _lastVariableUpdateTrailingWarnTicks;
 
         // ── Variable update send path ─────────────────────────────────
 
@@ -4748,23 +5030,26 @@ namespace RTMPE.Core
                 ? _settings.jwtSignatureAlgorithm
                 : NetworkSettings.JwtSignatureAlgorithm.None;
 
+            // RFC 8725 §3.1: reject `alg=none` (and missing alg) unconditionally,
+            // regardless of pin configuration, so a misconfigured verifier cannot
+            // accept an unsigned token.
+            if (header == null || string.IsNullOrEmpty(header.alg))
+            {
+                error = GenericSignatureFailure;
+                return false;
+            }
+            if (string.Equals(header.alg, "none", StringComparison.OrdinalIgnoreCase))
+            {
+                error = GenericSignatureFailure;
+                return false;
+            }
+
             if (algMode == NetworkSettings.JwtSignatureAlgorithm.None)
             {
                 WarnJwtSignatureUnverifiedOnce();
             }
             else
             {
-                if (header == null || string.IsNullOrEmpty(header.alg))
-                {
-                    error = GenericSignatureFailure;
-                    return false;
-                }
-                if (string.Equals(header.alg, "none", StringComparison.OrdinalIgnoreCase))
-                {
-                    error = GenericSignatureFailure;
-                    return false;
-                }
-
                 if (!TryDecodeBase64Url(parts[2], out byte[] sig))
                 {
                     error = GenericSignatureFailure;
@@ -4839,7 +5124,12 @@ namespace RTMPE.Core
                 : 120;
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-            if (dto.exp != 0 && now > dto.exp + skew)
+            if (dto.exp <= 0)
+            {
+                error = "JWT missing exp claim";
+                return false;
+            }
+            if (now > dto.exp + skew)
             {
                 error = $"JWT exp {dto.exp} is in the past (now={now}, skew={skew}s)";
                 return false;
@@ -4850,15 +5140,21 @@ namespace RTMPE.Core
                 return false;
             }
 
-            if (!string.IsNullOrEmpty(expectedIssuer)
-                && !string.Equals(dto.iss, expectedIssuer, StringComparison.Ordinal))
+            if (string.IsNullOrEmpty(expectedIssuer))
+            {
+                WarnJwtIssuerUnconfiguredOnce();
+            }
+            else if (!string.Equals(dto.iss, expectedIssuer, StringComparison.Ordinal))
             {
                 error = $"JWT iss '{dto.iss ?? string.Empty}' does not match expected issuer";
                 return false;
             }
 
-            if (!string.IsNullOrEmpty(expectedAudience)
-                && !string.Equals(dto.aud, expectedAudience, StringComparison.Ordinal))
+            if (string.IsNullOrEmpty(expectedAudience))
+            {
+                WarnJwtAudienceUnconfiguredOnce();
+            }
+            else if (!string.Equals(dto.aud, expectedAudience, StringComparison.Ordinal))
             {
                 error = $"JWT aud '{dto.aud ?? string.Empty}' does not match expected audience";
                 return false;
@@ -4902,6 +5198,47 @@ namespace RTMPE.Core
         /// </summary>
         internal static void ResetJwtSignatureUnverifiedWarningForTests()
             => System.Threading.Interlocked.Exchange(ref _jwtSignatureUnverifiedWarned, 0);
+
+        // Misconfiguration advisories: an empty expected iss/aud silently
+        // disables that check. Surface a one-shot LogError so operators see
+        // the gap in CI / production log scrapes without breaking deployments
+        // that have not yet rotated to a pinned issuer/audience.
+        private static int _jwtIssuerUnconfiguredWarned;
+        private static int _jwtAudienceUnconfiguredWarned;
+
+        private static void WarnJwtIssuerUnconfiguredOnce()
+        {
+            if (System.Threading.Interlocked.CompareExchange(
+                    ref _jwtIssuerUnconfiguredWarned, 1, 0) == 0)
+            {
+                Debug.LogError(
+                    "[RTMPE] NetworkSettings.jwtExpectedIssuer is empty — " +
+                    "SessionAck JWT 'iss' claim is NOT being validated. " +
+                    "Production deployments MUST configure jwtExpectedIssuer " +
+                    "so a token minted for a different tenant cannot be " +
+                    "accepted by this client.");
+            }
+        }
+
+        private static void WarnJwtAudienceUnconfiguredOnce()
+        {
+            if (System.Threading.Interlocked.CompareExchange(
+                    ref _jwtAudienceUnconfiguredWarned, 1, 0) == 0)
+            {
+                Debug.LogError(
+                    "[RTMPE] NetworkSettings.jwtExpectedAudience is empty — " +
+                    "SessionAck JWT 'aud' claim is NOT being validated. " +
+                    "Production deployments MUST configure jwtExpectedAudience " +
+                    "so a token minted for a different relying party cannot " +
+                    "be accepted by this client.");
+            }
+        }
+
+        internal static void ResetJwtIssuerUnconfiguredWarningForTests()
+            => System.Threading.Interlocked.Exchange(ref _jwtIssuerUnconfiguredWarned, 0);
+
+        internal static void ResetJwtAudienceUnconfiguredWarningForTests()
+            => System.Threading.Interlocked.Exchange(ref _jwtAudienceUnconfiguredWarned, 0);
 
         /// <summary>
         /// Instance shim that resolves keying material from <see cref="_settings"/>

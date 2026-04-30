@@ -37,6 +37,21 @@ namespace RTMPE.Sync
         public const int MaxEntries = byte.MaxValue;
 
         /// <summary>
+        /// Hard ceiling on a single legacy 0x41 entry payload inside a
+        /// batch.  The wire-format length prefix permits up to 65 535 bytes
+        /// per entry, but the SDK's largest legitimate per-object update
+        /// (16 NetworkVariableString objects each at the 65 535-byte wire
+        /// cap) sits an order of magnitude below the 16 KiB working ceiling,
+        /// and a single batch packet must in any case fit within the local
+        /// MTU + per-packet AEAD overhead.  Capping here rejects an entry
+        /// whose declared size, while structurally legal, is an
+        /// allocation-amplification surface — a 255-entry batch each
+        /// claiming 65 535 bytes would otherwise force ~16 MiB of
+        /// per-entry allocation BEFORE any inner-payload validation runs.
+        /// </summary>
+        public const int MaxEntryPayloadBytes = 16 * 1024;
+
+        /// <summary>
         /// Build a batch payload over <paramref name="count"/> entries from
         /// <paramref name="payloads"/>.  Returns the batch bytes.  Throws when
         /// any entry exceeds <see cref="ushort.MaxValue"/> bytes (the per-
@@ -98,13 +113,29 @@ namespace RTMPE.Sync
             if (dispatch == null) throw new ArgumentNullException(nameof(dispatch));
 
             int count = batch[0];
+
+            // Pre-flight allocation guard.  A malicious sender setting
+            // count = 255 with each entry claiming the maximum 65 535-byte
+            // payload would otherwise force the dispatcher to attempt
+            // ~16 MiB of `new byte[]` allocations — well above any
+            // legitimate batch.  Reject early when the declared count
+            // cannot possibly fit in the remaining bytes (each entry
+            // requires at least the 2-byte length prefix).
+            int minBytesNeeded = 1 + count * 2;
+            if (minBytesNeeded > batch.Length) return -1;
+
             int off = 1;
             for (int i = 0; i < count; i++)
             {
-                if (off + 2 > batch.Length) return -1;
+                if (off > batch.Length - 2) return -1;
                 int len = batch[off] | (batch[off + 1] << 8);
                 off += 2;
-                if (off + len > batch.Length) return -1;
+                if (len > batch.Length - off) return -1;
+                // Per-entry working ceiling.  See MaxEntryPayloadBytes
+                // remarks: a structurally-legal 65 535-byte entry is
+                // allocation-amplification when 255 of them appear in a
+                // single batch.  Reject before the per-entry alloc.
+                if (len > MaxEntryPayloadBytes) return -1;
 
                 var inner = new byte[len];
                 if (len > 0)
@@ -112,6 +143,13 @@ namespace RTMPE.Sync
                 off += len;
                 dispatch(inner);
             }
+
+            // Strict trailing-bytes check.  A well-formed batch ends
+            // exactly at the last entry's payload; trailing residue is a
+            // protocol-drift / smuggling signal.  Returning -1 surfaces
+            // the anomaly to the caller (which the receive path logs)
+            // instead of silently accepting the partial parse.
+            if (off != batch.Length) return -1;
             return count;
         }
     }

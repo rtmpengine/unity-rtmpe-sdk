@@ -37,6 +37,15 @@ namespace RTMPE.Rooms
     /// </summary>
     public static class PropertyJson
     {
+        // Hard cap on the number of entries the decoder will accept inside a
+        // single "properties" object.  Production payloads carry ≤ 20 keys
+        // (the documented Custom Properties contract), so a payload with
+        // hundreds of entries is either a misuse or a hostile sender trying
+        // to drive the receiver's dictionary growth into multi-MB allocation.
+        // The 256 ceiling sits an order of magnitude above any legitimate
+        // shape while bounding the worst-case per-payload heap pressure.
+        internal const int MaxPropertiesPerPayload = 256;
+
         // ─── Type-tag constants ────────────────────────────────────────────
         //
        // These MUST match `entities.PropertyType*` strings in the Go server.
@@ -326,6 +335,12 @@ namespace RTMPE.Rooms
                 Expect(json, ref pos, ':');
                 SkipWhitespace(json, ref pos);
                 var val = ReadPropertyValue(json, ref pos);
+                // Reject before the dictionary grows past the working
+                // ceiling so the heap allocation stays bounded for any
+                // single payload regardless of sender intent.
+                if (props.Count >= MaxPropertiesPerPayload && !props.ContainsKey(key))
+                    throw new FormatException(
+                        $"PropertyJson: payload exceeds {MaxPropertiesPerPayload}-entry cap");
                 props[key] = val;
                 SkipWhitespace(json, ref pos);
                 if (Peek(json, pos) == ',') { pos++; continue; }
@@ -377,7 +392,15 @@ namespace RTMPE.Rooms
             switch (type)
             {
                 case TagInt:
-                    return PropertyValue.OfInt(int.Parse(raw, CultureInfo.InvariantCulture));
+                    if (!int.TryParse(
+                            raw,
+                            NumberStyles.Integer,
+                            CultureInfo.InvariantCulture,
+                            out int parsedInt))
+                        throw new FormatException(
+                            "PropertyJson: integer property value '" + raw +
+                            "' is outside Int32 range or malformed");
+                    return PropertyValue.OfInt(parsedInt);
                 case TagFloat:
                     return PropertyValue.OfFloat(ParseFiniteFloat(raw));
                 case TagBool:
@@ -412,7 +435,20 @@ namespace RTMPE.Rooms
 
         private static float[] ReadFloatArray(string raw, int expected)
         {
-            var parts = raw.Trim().TrimStart('[').TrimEnd(']').Split(',');
+            // The wire shape REQUIRES the surrounding brackets — `[1,2,3]`,
+            // not `1,2,3`.  TrimStart/TrimEnd alone are no-ops when the
+            // brackets are absent, which would silently accept an
+            // unbracketed scalar list as a Vector3 / Color and let a
+            // malformed gateway smuggle a typed payload through with the
+            // wrong shape.  Validate the delimiters explicitly before
+            // splitting so a structural mismatch surfaces a clean
+            // FormatException at the parse site.
+            var trimmed = raw.Trim();
+            if (trimmed.Length < 2 || trimmed[0] != '[' || trimmed[trimmed.Length - 1] != ']')
+                throw new FormatException(
+                    "PropertyJson: float array must be enclosed in [...]");
+            var inner = trimmed.Substring(1, trimmed.Length - 2);
+            var parts = inner.Split(',');
             if (parts.Length != expected)
                 throw new FormatException($"PropertyJson: expected array length {expected}, got {parts.Length}");
             var result = new float[expected];
@@ -541,7 +577,18 @@ namespace RTMPE.Rooms
                 }
                 else
                 {
-                    sb.Append(s[pos]);
+                    char raw = s[pos];
+                    // Reject embedded control characters (U+0000..U+001F)
+                    // including the NUL byte explicitly.  RFC 8259 §7
+                    // requires control chars to be escaped via \uXXXX;
+                    // accepting them silently lets a hostile sender
+                    // smuggle a NUL terminator past the parser, where it
+                    // then truncates display strings in C/native interop
+                    // bindings that scan for `\0`.
+                    if (raw < 0x20)
+                        throw new FormatException(
+                            $"PropertyJson: unescaped control character U+{(int)raw:X4} at {pos}");
+                    sb.Append(raw);
                     pos++;
                 }
             }
@@ -558,7 +605,22 @@ namespace RTMPE.Rooms
             while (pos < s.Length && s[pos] >= '0' && s[pos] <= '9') pos++;
             if (start == pos)
                 throw new FormatException($"PropertyJson: expected integer at {pos}");
-            return int.Parse(s.Substring(start, pos - start), CultureInfo.InvariantCulture);
+
+            // Use TryParse so a value above int.MaxValue (e.g. an
+            // accidental u32 sent by a buggy gateway) surfaces as a clean
+            // FormatException at the parse site instead of an
+            // OverflowException that cracks the entire property decode in
+            // mid-stream.  The caller's catch translates this into a
+            // localised "drop this property" rather than a session-wide
+            // "drop the whole packet".
+            if (!int.TryParse(
+                    s.Substring(start, pos - start),
+                    NumberStyles.Integer,
+                    CultureInfo.InvariantCulture,
+                    out int parsed))
+                throw new FormatException(
+                    $"PropertyJson: integer at {start} is outside Int32 range");
+            return parsed;
         }
 
         // Brace counts inside string literals must not affect structural depth;

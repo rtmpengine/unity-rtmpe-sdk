@@ -26,8 +26,16 @@ namespace RTMPE.Rpc
     /// </summary>
     internal sealed class RtmpeBinaryReader : IRtmpeReader
     {
+        // Strict UTF-8 decoder.  The lax form silently substitutes U+FFFD
+        // for any malformed byte sequence — that lets a peer with control
+        // over a string-typed RPC parameter smuggle bytes that survive the
+        // decode but mutate downstream string-equality invariants (room
+        // names, scene paths, type-name lookups).  throwOnInvalidBytes
+        // surfaces the corruption as a DecoderFallbackException; the
+        // ReadString call site catches and routes it through the existing
+        // _failed flag so the parser drops the message cleanly.
         private static readonly UTF8Encoding Utf8 =
-            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
         private readonly byte[] _data;
         private          int    _pos;
@@ -39,7 +47,13 @@ namespace RTMPE.Rpc
             _data = data ?? throw new ArgumentNullException(nameof(data));
             if ((uint)startOffset > (uint)data.Length)
                 throw new ArgumentOutOfRangeException(nameof(startOffset));
-            if (byteCount < 0 || startOffset + byteCount > data.Length)
+            // Bounds expressed in subtraction form (`byteCount > available`)
+            // so a pathologically large `byteCount` cannot wrap
+            // `startOffset + byteCount` to a negative int that bypasses the
+            // `> data.Length` test and silently extends the readable window
+            // past the buffer.  Same overflow class closed across the rest
+            // of the SDK's parsers.
+            if (byteCount < 0 || byteCount > data.Length - startOffset)
                 throw new ArgumentOutOfRangeException(nameof(byteCount));
             _pos    = startOffset;
             _end    = startOffset + byteCount;
@@ -113,9 +127,22 @@ namespace RTMPE.Rpc
             _pos += 2;
             if (len == 0) return string.Empty;
             if (!Require(len)) return string.Empty;
-            string s = Utf8.GetString(_data, _pos, len);
-            _pos += len;
-            return s;
+            try
+            {
+                string s = Utf8.GetString(_data, _pos, len);
+                _pos += len;
+                return s;
+            }
+            catch (DecoderFallbackException)
+            {
+                // Malformed UTF-8 — surface through the existing failure
+                // flag so the caller's HasFailed check rejects the entire
+                // message instead of returning a partial U+FFFD-laundered
+                // string that would mismatch the peer's view.
+                _failed = true;
+                _pos += len;
+                return string.Empty;
+            }
         }
 
         public byte[] ReadBytes()

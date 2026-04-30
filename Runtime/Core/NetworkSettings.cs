@@ -503,5 +503,72 @@ namespace RTMPE.Core
             s.name = "RTMPESettings (runtime default)";
             return s;
         }
+
+        /// <summary>
+        /// Coerce any non-finite (NaN / Infinity) values configured on
+        /// world-bounds Vector3 fields back to a sane default.  Reachable
+        /// from the Inspector when an artist accidentally drags the value
+        /// into a degenerate state, and from runtime callers that build a
+        /// settings object via <see cref="ScriptableObject.CreateInstance{T}()"/>
+        /// and assign Vector3.PositiveInfinity.  Without this guard the
+        /// reconciliation bounds-check at <c>NetworkTransform.ApplyReconciliation</c>
+        /// short-circuits to false on every comparison, silently disabling
+        /// the bound entirely.
+        /// </summary>
+        /// <remarks>
+        /// Called from <see cref="OnValidate"/> in the Editor and from
+        /// <see cref="EnsureFiniteWorldBoundsForRuntime"/> by the runtime
+        /// after asset load — both are idempotent and safe to invoke
+        /// repeatedly.
+        /// </remarks>
+        internal void EnsureFiniteWorldBoundsForRuntime()
+        {
+            worldBoundsCenter  = ClampVector3Finite(worldBoundsCenter,  Vector3.zero);
+            worldBoundsExtents = ClampVector3Finite(
+                worldBoundsExtents,
+                new Vector3(10_000f, 10_000f, 10_000f));
+            // Extents must be non-negative; a negative half-extent reverses
+            // the inside-out test and accepts every server position as
+            // out-of-bounds.  Clamp to zero rather than abs() so an
+            // accidentally-negative configuration surfaces as an obviously-
+            // empty box rather than a silently-mirrored one.
+            if (worldBoundsExtents.x < 0f) worldBoundsExtents.x = 0f;
+            if (worldBoundsExtents.y < 0f) worldBoundsExtents.y = 0f;
+            if (worldBoundsExtents.z < 0f) worldBoundsExtents.z = 0f;
+
+            // Range attributes only fire from the Inspector — assets loaded
+            // through Addressables / AssetBundle / direct deserialisation
+            // bypass that path.  Mirror the Inspector floors at runtime so
+            // a degenerate setting (zero or negative) cannot silently
+            // disable the spawn-rate gate or the room-wide spawn cap.
+            if (maxSpawnsPerSecond           < 1)     maxSpawnsPerSecond           = 1;
+            if (maxSpawnsPerSecond           > 1000)  maxSpawnsPerSecond           = 1000;
+            if (maxSpawnsPerRoom             < 100)   maxSpawnsPerRoom             = 100;
+            if (maxSpawnsPerRoom             > 50000) maxSpawnsPerRoom             = 50000;
+            if (maxNetworkVariableListSize   < 1)     maxNetworkVariableListSize   = 1;
+            if (maxNetworkVariableListSize   > 65535) maxNetworkVariableListSize   = 65535;
+        }
+
+        private static Vector3 ClampVector3Finite(Vector3 candidate, Vector3 fallback)
+        {
+            if (!IsFiniteFloat(candidate.x)
+             || !IsFiniteFloat(candidate.y)
+             || !IsFiniteFloat(candidate.z))
+                return fallback;
+            return candidate;
+        }
+
+        private static bool IsFiniteFloat(float v)
+            => !float.IsNaN(v) && !float.IsInfinity(v);
+
+#if UNITY_EDITOR
+        private void OnValidate()
+        {
+            // Inspector-time hardening.  Range attributes already clamp the
+            // numeric scalars; the world-bounds Vector3 fields have no
+            // Range support, so the finiteness guard runs here.
+            EnsureFiniteWorldBoundsForRuntime();
+        }
+#endif
     }
 }

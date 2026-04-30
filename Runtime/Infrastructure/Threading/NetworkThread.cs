@@ -269,8 +269,24 @@ namespace RTMPE.Threading
         {
             if (!_running || ownedData == null || ownedData.Length == 0) return;
             // Caller-owned arrays are sent in full; they must not be returned to
-            // the pool because they were never rented from it.
+            // the pool because they were never rented from it.  Send's
+            // try/catch wraps the rented-buffer return contract on
+            // Enqueue-throw — there is no symmetric resource to release
+            // here (the caller still holds the reference and the GC
+            // reclaims it once it goes out of scope), so this path
+            // intentionally has no try/catch.
             _sendQueue.Enqueue(new SendItem(ownedData, ownedData.Length, fromPool: false));
+
+            // Stop()-race recovery, symmetric with Send.  Without it, an
+            // ownedData byte[] enqueued AFTER the worker drained but BEFORE
+            // the entry guard observed the new _running=false is silently
+            // lost in the queue (the next Start() would transmit it, possibly
+            // violating handshake ordering, or process exit drops it
+            // entirely).  DrainAndReleasePending is idempotent and only
+            // touches pool-rented items, so non-pooled SendItems passed here
+            // are still GC-cleaned by reference loss — but the rented items
+            // sharing the queue are returned to the pool either way.
+            if (!_running) DrainAndReleasePending();
         }
 
         /// <inheritdoc/>
@@ -436,7 +452,17 @@ namespace RTMPE.Threading
                     // Zero-copy delivery: one buffer, one synchronous call.
                     // After all subscribers return the buffer goes back to
                     // the pool and is reused on the next receive.
-                    rentedHandler(rented, 0, length);
+                    //
+                    // Per-subscriber isolation: a buggy integrator subscriber
+                    // that throws would otherwise (a) prevent every later
+                    // subscriber from observing the packet for this datagram
+                    // and (b) propagate out of DispatchReceived to TryReceive's
+                    // outer catch, which fires OnError and tears down the
+                    // receive loop.  Walk the invocation list explicitly so
+                    // each subscriber's exception is caught and logged without
+                    // affecting siblings.  Same discipline as M19-SYNC-01 and
+                    // M19-CORE-07.
+                    InvokeRentedSubscribers(rentedHandler, rented, length);
                 }
                 else if (legacyHandler != null)
                 {
@@ -447,12 +473,51 @@ namespace RTMPE.Threading
                     // `rented` and we copy out once into the exact-sized array.
                     var packet = new byte[length];
                     Buffer.BlockCopy(rented, 0, packet, 0, length);
-                    legacyHandler(packet);
+                    InvokeLegacySubscribers(legacyHandler, packet);
                 }
             }
             finally
             {
                 ArrayPool<byte>.Shared.Return(rented, clearArray: true);
+            }
+        }
+
+        private static void InvokeRentedSubscribers(
+            RentedPacketHandler handler, byte[] rented, int length)
+        {
+            var subs = handler.GetInvocationList();
+            for (int i = 0; i < subs.Length; i++)
+            {
+                try
+                {
+                    ((RentedPacketHandler)subs[i])(rented, 0, length);
+                }
+                catch (Exception ex)
+                {
+                    UnityEngine.Debug.LogError(
+                        "[RTMPE] NetworkThread: rented-packet subscriber threw " +
+                        $"{ex.GetType().Name}: {ex.Message}.  Continuing with " +
+                        "remaining subscribers.");
+                }
+            }
+        }
+
+        private static void InvokeLegacySubscribers(Action<byte[]> handler, byte[] packet)
+        {
+            var subs = handler.GetInvocationList();
+            for (int i = 0; i < subs.Length; i++)
+            {
+                try
+                {
+                    ((Action<byte[]>)subs[i])(packet);
+                }
+                catch (Exception ex)
+                {
+                    UnityEngine.Debug.LogError(
+                        "[RTMPE] NetworkThread: legacy packet subscriber threw " +
+                        $"{ex.GetType().Name}: {ex.Message}.  Continuing with " +
+                        "remaining subscribers.");
+                }
             }
         }
     }

@@ -92,8 +92,27 @@ namespace RTMPE.Sync
         public override void Serialize(BinaryWriter writer) => writer.Write(Value);
 
         /// <inheritdoc/>
+        /// <remarks>
+        /// Defensive validation against malicious or corrupted payloads:
+        /// non-finite floats (NaN, ±Infinity) are rejected so an
+        /// <c>OnValueChanged</c> subscriber that pipes the value into a UI
+        /// lerp, a HP-bar fill, or any cumulative float math cannot inherit
+        /// a NaN that would freeze the consumer permanently.  On rejection
+        /// the prior value is preserved (no event fires) and a Unity warning
+        /// is logged.
+        /// </remarks>
         public override void Deserialize(BinaryReader reader)
-            => SetValueWithoutNotify(reader.ReadSingle());
+        {
+            float v = reader.ReadSingle();
+            if (float.IsNaN(v) || float.IsInfinity(v))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] NetworkVariableFloat.Deserialize: rejected non-finite " +
+                    $"value {v} — keeping prior value.");
+                return;
+            }
+            SetValueWithoutNotify(v);
+        }
     }
 
     // ── bool ───────────────────────────────────────────────────────────────────
@@ -151,13 +170,30 @@ namespace RTMPE.Sync
         }
 
         /// <inheritdoc/>
+        /// <remarks>
+        /// Componentwise finiteness gate.  A NaN/Inf component would otherwise
+        /// reach an <c>OnValueChanged</c> subscriber that assigns to
+        /// <c>transform.position</c> or <c>transform.localScale</c>, which
+        /// Unity persists indefinitely and which culls the affected
+        /// GameObject's renderer until a domain reload.  Mirrors the
+        /// Quaternion validation discipline already in place.
+        /// </remarks>
         public override void Deserialize(BinaryReader reader)
         {
-            SetValueWithoutNotify(new Vector3(
-                reader.ReadSingle(),
-                reader.ReadSingle(),
-                reader.ReadSingle()));
+            float x = reader.ReadSingle();
+            float y = reader.ReadSingle();
+            float z = reader.ReadSingle();
+            if (!IsFinite(x) || !IsFinite(y) || !IsFinite(z))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] NetworkVariableVector3.Deserialize: rejected non-finite " +
+                    $"vector ({x},{y},{z}) — keeping prior value.");
+                return;
+            }
+            SetValueWithoutNotify(new Vector3(x, y, z));
         }
+
+        private static bool IsFinite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
     }
 
     // ── Quaternion ─────────────────────────────────────────────────────────────

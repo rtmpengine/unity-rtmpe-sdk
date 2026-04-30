@@ -12,6 +12,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 
 namespace RTMPE.Rooms
 {
@@ -22,25 +23,36 @@ namespace RTMPE.Rooms
     /// the same primitive can be reused for any request/response correlator
     /// where the server cannot yet echo a correlator id.
     /// </summary>
+    /// <remarks>
+    /// Time-base: entries are timestamped with monotonic
+    /// <c>Stopwatch.GetTimestamp()</c> ticks rather than wall-clock
+    /// <c>DateTime.UtcNow</c>.  A user clock change (mobile NTP step on
+    /// Wi-Fi → cellular hand-off) used to either lock the table (no entries
+    /// ever expire — slot exhausted at MaxPendingCreates) or storm-evict
+    /// every in-flight CreateRoom request, breaking room creation under
+    /// exactly the conditions where reliable delivery matters most.  The
+    /// monotonic timestamp is unaffected by clock jumps and is the standard
+    /// time-base for relative-deadline correlators across the SDK.
+    /// </remarks>
     /// <typeparam name="T">Per-request payload (e.g. CreateRoomOptions).</typeparam>
     public sealed class PendingCreateTable<T>
     {
-        private readonly int    _capacity;
-        private readonly double _ttlSeconds;
+        private readonly int  _capacity;
+        private readonly long _ttlTicks;
 
         private readonly Dictionary<Guid, Entry> _byId    = new Dictionary<Guid, Entry>();
         private readonly Queue<Guid>             _byOrder = new Queue<Guid>();
 
         private readonly struct Entry
         {
-            public readonly Guid     Id;
-            public readonly T        Payload;
-            public readonly DateTime SentAtUtc;
-            public Entry(Guid id, T payload, DateTime sentAtUtc)
+            public readonly Guid Id;
+            public readonly T    Payload;
+            public readonly long SentAtTicks; // Stopwatch.GetTimestamp()
+            public Entry(Guid id, T payload, long sentAtTicks)
             {
-                Id        = id;
-                Payload   = payload;
-                SentAtUtc = sentAtUtc;
+                Id          = id;
+                Payload     = payload;
+                SentAtTicks = sentAtTicks;
             }
         }
 
@@ -48,26 +60,35 @@ namespace RTMPE.Rooms
         {
             if (capacity   <= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
             if (ttlSeconds <= 0) throw new ArgumentOutOfRangeException(nameof(ttlSeconds));
-            _capacity   = capacity;
-            _ttlSeconds = ttlSeconds;
+            _capacity = capacity;
+            _ttlTicks = (long)(ttlSeconds * Stopwatch.Frequency);
         }
 
         public int  Count  => _byId.Count;
         public bool IsFull => _byId.Count >= _capacity;
 
         /// <summary>
+        /// Read the current monotonic clock.  Exposed so callers (e.g.
+        /// RoomManager) can pass a single sample to both Register and
+        /// SweepExpired, giving the two operations a consistent view of
+        /// "now" within a single request-handling pass.
+        /// </summary>
+        public static long NowTicks() => Stopwatch.GetTimestamp();
+
+        /// <summary>
         /// Allocate a fresh GUID, store the request payload, and return the
         /// allocated id.  Caller is responsible for calling <see cref="IsFull"/>
-        /// first; calling Register on a full table throws.
+        /// first; calling Register on a full table throws.  Use
+        /// <see cref="NowTicks"/> for the timestamp argument.
         /// </summary>
-        public Guid Register(T payload, DateTime sentAtUtc)
+        public Guid Register(T payload, long sentAtTicks)
         {
             if (IsFull)
                 throw new InvalidOperationException(
                     "PendingCreateTable: capacity exceeded — call IsFull first.");
 
             var id = Guid.NewGuid();
-            _byId[id] = new Entry(id, payload, sentAtUtc);
+            _byId[id] = new Entry(id, payload, sentAtTicks);
             _byOrder.Enqueue(id);
             return id;
         }
@@ -122,21 +143,22 @@ namespace RTMPE.Rooms
         }
 
         /// <summary>
-        /// Remove every entry whose <c>SentAtUtc</c> is older than
-        /// <paramref name="now"/> minus the configured TTL.  Returns the
-        /// (id, payload) tuples for the caller to surface to its observers
-        /// (RoomManager fires OnRoomError so applications never silently lose
-        /// an in-flight CreateRoom request).
+        /// Remove every entry whose monotonic <c>SentAtTicks</c> is older
+        /// than <paramref name="nowTicks"/> minus the configured TTL.
+        /// Returns the (id, payload) tuples for the caller to surface to
+        /// its observers (RoomManager fires OnRoomError so applications
+        /// never silently lose an in-flight CreateRoom request).  Use
+        /// <see cref="NowTicks"/> for the timestamp argument.
         /// </summary>
-        public IEnumerable<(Guid id, T payload)> SweepExpired(DateTime now)
+        public IEnumerable<(Guid id, T payload)> SweepExpired(long nowTicks)
         {
             if (_byId.Count == 0) yield break;
 
-            DateTime  cutoff = now.AddSeconds(-_ttlSeconds);
+            long cutoff = nowTicks - _ttlTicks;
             List<Guid> stale = null;
             foreach (var kv in _byId)
             {
-                if (kv.Value.SentAtUtc <= cutoff)
+                if (kv.Value.SentAtTicks <= cutoff)
                     (stale ??= new List<Guid>()).Add(kv.Key);
             }
             if (stale == null) yield break;

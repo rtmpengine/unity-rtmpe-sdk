@@ -45,7 +45,20 @@ namespace RTMPE.Core
         public static string DisplayName(string name)
         {
             if (string.IsNullOrEmpty(name)) return string.Empty;
-            return name[0] + "***";
+            char first = name[0];
+            // Replace control characters (including the embedded NUL) with
+            // a visible glyph before logging.  A literal NUL would otherwise
+            // truncate the line at any downstream sink that uses C-style
+            // string parsing (strlen, strncpy in native crash reporters,
+            // log aggregators that bridge through `char*`).
+            if (first < 0x20 || first == 0x7F) first = '?';
+            // string.Concat(char, string) yields the same shape as the
+            // char's ToString concatenated to "***" — using it explicitly
+            // sidesteps a `char + string` overload-resolution surprise on
+            // older C# language levels where the left-hand char widens to
+            // int first and the resulting "0x3F***" form would silently
+            // ship through to the log.
+            return string.Concat(first.ToString(), "***");
         }
 
         /// <summary>
@@ -98,6 +111,18 @@ namespace RTMPE.Core
         {
             if (value == null) return "<null>";
             if (value.Length == 0) return "<empty>";
+            // Surface inputs that contain control characters (including
+            // embedded NUL) as a dedicated sentinel rather than emitting
+            // the raw prefix.  An embedded NUL in the prefix would survive
+            // through C# string operations but truncate the eventual log
+            // line at any sink that bridges through C-style strings,
+            // collapsing two distinct identifiers into the same fingerprint.
+            int prefixLen = value.Length <= 4 ? value.Length : 4;
+            for (int i = 0; i < prefixLen; i++)
+            {
+                char c = value[i];
+                if (c < 0x20 || c == 0x7F) return "<ctrl>***";
+            }
             if (value.Length <= 4) return value + "***";
             return value.Substring(0, 4) + "***";
         }

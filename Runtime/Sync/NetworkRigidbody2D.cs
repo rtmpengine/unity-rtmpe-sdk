@@ -316,6 +316,17 @@ namespace RTMPE.Sync
             if (_enableDeadReckoning && timeSincePacket < _deadReckoningTimeout && _syncVelocity)
                 targetPos = _receivedState.Position + _receivedState.Velocity * timeSincePacket;
 
+            // Frame-rate-independent smoothing.  The naive `dt * rate` lerp
+            // coefficient produces a visibly-different time-to-converge at
+            // every Project-Settings physics step (50 / 60 / 120 Hz), and at
+            // 30 Hz it can exceed 1 — which silently degenerates into an
+            // instant snap.  The exponential form `1 - exp(-rate * dt)`
+            // converges to the same proportion of the remaining error per
+            // unit of wall-clock time regardless of dt, matching the
+            // discipline already in use in the 3-D companion.
+            float posLerpT = 1f - Mathf.Exp(-_positionCorrectionSpeed * Time.fixedDeltaTime);
+            float rotLerpT = 1f - Mathf.Exp(-_rotationCorrectionSpeed * Time.fixedDeltaTime);
+
             // ── Position correction ───────────────────────────────────────────
             if (_syncPosition)
             {
@@ -329,9 +340,7 @@ namespace RTMPE.Sync
                 }
                 else
                 {
-                    Vector2 corrected = Vector2.Lerp(
-                        _rb.position, targetPos,
-                        Time.fixedDeltaTime * _positionCorrectionSpeed);
+                    Vector2 corrected = Vector2.Lerp(_rb.position, targetPos, posLerpT);
                     if (_makeRemoteKinematic)
                         _rb.position = corrected;
                     else
@@ -344,8 +353,7 @@ namespace RTMPE.Sync
             if (_syncRotation)
             {
                 float correctedAngle = Mathf.LerpAngle(
-                    _rb.rotation, _receivedState.Rotation,
-                    Time.fixedDeltaTime * _rotationCorrectionSpeed);
+                    _rb.rotation, _receivedState.Rotation, rotLerpT);
                 if (_makeRemoteKinematic)
                     _rb.rotation = correctedAngle;
                 else
@@ -357,15 +365,19 @@ namespace RTMPE.Sync
             {
                 if (_syncVelocity)
                     _rb.SetLinearVelocity(Vector2.Lerp(
-                        _rb.GetLinearVelocity(), _receivedState.Velocity,
-                        Time.fixedDeltaTime * _positionCorrectionSpeed));
+                        _rb.GetLinearVelocity(), _receivedState.Velocity, posLerpT));
 
                 if (_syncAngularVelocity)
                     _rb.angularVelocity = Mathf.Lerp(
-                        _rb.angularVelocity, _receivedState.AngularVelocity,
-                        Time.fixedDeltaTime * _rotationCorrectionSpeed);
+                        _rb.angularVelocity, _receivedState.AngularVelocity, rotLerpT);
             }
         }
+
+        // Componentwise finiteness predicate used by the inbound gate.  Mirrors
+        // the 3-D component's helper.  NaN/Inf comparison short-circuits the
+        // plausibility caps that follow, so any non-finite value must be
+        // rejected before those caps run.
+        private static bool IsFinite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
 
         // ── Internal API (called by NetworkManager) ────────────────────────────
 
@@ -375,6 +387,29 @@ namespace RTMPE.Sync
         /// </summary>
         internal void ApplyRemoteState(PhysicsState2D incoming, byte changedMask)
         {
+            // Componentwise finiteness gate.  Mirrors the 3-D component: the
+            // plausibility caps further down compare with `>` operators which
+            // short-circuit to false for NaN — letting NaN propagate into
+            // Rigidbody2D.position / linearVelocity puts Box2D into an
+            // unrecoverable state on most Unity versions (body disappears,
+            // joints detach).  Reject the entire packet rather than persist
+            // a corrupt sub-field.
+            if ((changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
+                && (!IsFinite(incoming.Position.x) || !IsFinite(incoming.Position.y)))
+                return;
+
+            if ((changedMask & PhysicsPacketBuilder.ChangedRotation) != 0
+                && !IsFinite(incoming.Rotation))
+                return;
+
+            if ((changedMask & PhysicsPacketBuilder.ChangedVelocity) != 0
+                && (!IsFinite(incoming.Velocity.x) || !IsFinite(incoming.Velocity.y)))
+                return;
+
+            if ((changedMask & PhysicsPacketBuilder.ChangedAngularVelocity) != 0
+                && !IsFinite(incoming.AngularVelocity))
+                return;
+
             var settings = NetworkManager.Instance?.Settings;
 
             // Per-object inbound rate limit (token-bucket).  See NetworkRigidbody

@@ -374,6 +374,15 @@ namespace RTMPE.Core
                     $"{_networkObjectId} → overwriting with {objectId}. " +
                     "Possible duplicate Spawn packet received via reliable transport retransmit.");
 
+            // Clear the externally-evicted latch so a pool-recycled instance
+            // starts each spawn with the same baseline as a fresh
+            // GameObject.  Without the reset, the latch set during the
+            // previous DestroyLocal would short-circuit OnDestroy on the
+            // next user-driven Object.Destroy(go), skipping
+            // OnExternallyDestroyed and leaking one slot from
+            // SpawnManager._currentSpawnCount per pool re-acquire cycle.
+            _externallyEvicted = false;
+
             _networkObjectId = objectId;
             _ownerPlayerId   = ownerId ?? string.Empty;
 

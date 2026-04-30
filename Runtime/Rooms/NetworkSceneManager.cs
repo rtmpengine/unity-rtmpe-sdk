@@ -132,20 +132,21 @@ namespace RTMPE.Rooms
 
             EnsureBound();
             var rooms = _bound;
+            // Surface state-order violations as InvalidOperationException so
+            // a caller that runs LoadScene before joining a room (or as a
+            // non-master) gets a stack trace pointing at the misuse rather
+            // than a silent log line that they may not see in a CI run or
+            // a release-mode build with logs filtered.  ArgumentException
+            // for null/empty already established the throw-on-misuse
+            // contract for this method (line 131); the state checks now
+            // mirror it.
             if (rooms == null || !rooms.IsInRoom)
-            {
-                Debug.LogWarning("[RTMPE] NetworkSceneManager.LoadScene: must be in a room.");
-                return;
-            }
+                throw new InvalidOperationException(
+                    "NetworkSceneManager.LoadScene: caller must be joined to a room.");
             // Only the master client may instruct the room to change scene.
-            // Non-master callers are rejected here rather than letting the server
-            // silently discard the property update, giving developers immediate
-            // feedback instead of a silent no-op that is hard to diagnose.
             if (NetworkManager.Instance == null || !NetworkManager.Instance.IsMasterClient)
-            {
-                Debug.LogError("[RTMPE] NetworkSceneManager.LoadScene: only the master client may change the scene.");
-                return;
-            }
+                throw new InvalidOperationException(
+                    "NetworkSceneManager.LoadScene: only the master client may change the scene.");
 
             // Robustness: prune any NetworkObjects whose GameObjects were
             // destroyed by an out-of-band scene unload BEFORE the server

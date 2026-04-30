@@ -246,15 +246,37 @@ namespace RTMPE.Core
 
     /// <summary>
     /// Default state-sync wire format used when no explicit negotiation has
-    /// taken place.  Matches the format that all currently-deployed gateways
-    /// emit, so the SDK is byte-compatible against any unmodified server.
+    /// taken place.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="WireFormatVersion.V4"/> is the recommended default once the
+    /// gateway has been upgraded to emit it, because V4 routes every variable
+    /// update through the FlatBuffers structural verifier — a malformed table
+    /// is rejected before any application accessor is invoked, closing the
+    /// (tag, payload) inconsistency class that V2's raw-bytes shape leaves
+    /// open to defensive parsing in the consumer.
+    /// </para>
+    /// <para>
+    /// <see cref="LegacyDefault"/> is retained as a separate constant for
+    /// deployments whose gateway has not yet been upgraded — flipping a
+    /// single per-build constant flips the SDK's preferred shape without
+    /// requiring per-call-site source edits.
+    /// </para>
+    /// </remarks>
     public static class WireFormat
     {
         /// <summary>
-        /// Default negotiated value used by builders / readers when no per-
-        /// session override has been supplied.
+        /// Preferred negotiated value when the deployment's gateway speaks
+        /// the structural-verifier shape.  Default for greenfield deployments.
         /// </summary>
-        public const WireFormatVersion Default = WireFormatVersion.V2;
+        public const WireFormatVersion Default = WireFormatVersion.V4;
+
+        /// <summary>
+        /// Wire format used by gateways that have not been upgraded.  Kept as
+        /// a named constant so a deployment that still depends on the legacy
+        /// shape can opt in explicitly rather than silently inheriting it.
+        /// </summary>
+        public const WireFormatVersion LegacyDefault = WireFormatVersion.V2;
     }
 }

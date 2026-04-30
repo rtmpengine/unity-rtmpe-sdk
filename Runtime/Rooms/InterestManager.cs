@@ -344,10 +344,22 @@ namespace RTMPE.Rooms
             var nm = NetworkManager.Instance;
             if (nm == null || !nm.IsInRoom) return;
 
-            _accumulator += Time.deltaTime;
-            if (_accumulator < UpdateInterval) return;
+            // Sanity-clamp the inspector-supplied interval before consuming
+            // it.  Range attributes only fire from the Inspector; an asset
+            // loaded via Addressables / AssetBundle / reflection can carry
+            // a non-finite or zero/negative value, which would poison
+            // `_accumulator` (NaN propagates through every subsequent `+=`)
+            // and silently stall interest broadcasts for the rest of the
+            // session.  A local read keeps the public field intact for the
+            // diagnostics path while ensuring the timer math is sound.
+            float interval = UpdateInterval;
+            if (float.IsNaN(interval) || float.IsInfinity(interval) || interval <= 0f)
+                interval = 0.1f;
 
-            _accumulator -= UpdateInterval;
+            _accumulator += Time.deltaTime;
+            if (_accumulator < interval) return;
+
+            _accumulator -= interval;
             SendCurrentPosition(nm);
         }
 

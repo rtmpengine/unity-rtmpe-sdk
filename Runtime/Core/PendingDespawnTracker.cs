@@ -43,6 +43,15 @@ namespace RTMPE.Core
         // UDP-reordered despawns on a real link.
         public const int MaxEntries = 1024;
 
+        // Hysteresis threshold for re-arming the cap-warning latch.  When
+        // the live count falls back below this watermark, the next
+        // saturation episode is treated as a fresh event and emits a new
+        // operator warning.  Half of MaxEntries gives generous headroom so
+        // a flapping count near saturation does not produce log spam, but
+        // a meaningful drainage between distinct flood episodes does
+        // re-enable the diagnostic.
+        private const int CapWarnRearmThreshold = MaxEntries / 2;
+
         private readonly Dictionary<ulong, long> _expiryByObjectId =
             new Dictionary<ulong, long>(16);
         private readonly LinkedList<ulong> _order =
@@ -91,6 +100,14 @@ namespace RTMPE.Core
                 foreach (var id in stale)
                     RemoveAll(id);
             }
+            // Hysteresis re-arm: once the post-prune count has dropped
+            // back below the watermark, the next cap-eviction is treated
+            // as a fresh saturation episode.  Without this, the latch
+            // fired exactly once per process — a flooding attacker who
+            // tripped it early in a session could continue evicting
+            // legitimate entries silently for the rest of the session.
+            if (_capWarned && _expiryByObjectId.Count <= CapWarnRearmThreshold)
+                _capWarned = false;
         }
 
         /// <summary>
@@ -163,6 +180,11 @@ namespace RTMPE.Core
                 _order.Remove(node);
                 _nodes.Remove(objectId);
             }
+            // Same hysteresis re-arm as in Prune: a Consume that drops the
+            // live count below the watermark closes the prior saturation
+            // episode and re-enables the warning latch for the next.
+            if (_capWarned && _expiryByObjectId.Count <= CapWarnRearmThreshold)
+                _capWarned = false;
             return true;
         }
 

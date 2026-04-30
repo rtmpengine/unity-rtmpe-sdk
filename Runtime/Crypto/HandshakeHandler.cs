@@ -41,6 +41,31 @@ using RTMPE.Crypto.Internal;
 namespace RTMPE.Crypto
 {
     /// <summary>
+    /// Distinguishes the two transcript-hash flows the gateway accepts.
+    /// Used by <see cref="HandshakeHandler.ValidateChallenge"/> to make the
+    /// flow choice explicit at the API boundary instead of inferring it from
+    /// a nullable ciphertext argument.
+    /// </summary>
+    public enum HandshakeFlow
+    {
+        /// <summary>
+        /// First-time handshake.  The caller MUST supply the exact
+        /// <c>HandshakeInit</c> ciphertext bytes that were transmitted; the
+        /// transcript is bound by SHA-256 over those bytes.
+        /// </summary>
+        Init = 0,
+
+        /// <summary>
+        /// Reconnect handshake.  The caller MUST NOT supply
+        /// <c>HandshakeInit</c> ciphertext — the transcript uses the all-zero
+        /// absent sentinel instead, and replay defence is provided by the
+        /// single-use reconnect token presented via
+        /// <c>ReconnectInit</c>.
+        /// </summary>
+        Reconnect = 1,
+    }
+
+    /// <summary>
     /// Per-session handshake state machine.
     /// Create one instance per <c>Connect()</c> call; discard on disconnect.
     /// Implements <see cref="IDisposable"/> — call Dispose() (or use a using-statement)
@@ -85,6 +110,16 @@ namespace RTMPE.Crypto
         /// HandshakeInit ciphertext (reconnect flow).  Replay defence in that
         /// flow is provided by the single-use reconnect token instead.
         /// </summary>
+        /// <remarks>
+        /// The all-zero sentinel is the on-the-wire constant that the gateway
+        /// (`crypto/server_auth.rs::CLIENT_INIT_HASH_ABSENT`) also uses; the
+        /// two values MUST stay byte-for-byte identical.  The defence-in-depth
+        /// hardening lives in <see cref="ValidateChallenge"/>: the
+        /// <see cref="HandshakeFlow.Reconnect"/> branch is reachable ONLY when
+        /// the caller explicitly opts in, closing the implicit-signaling
+        /// vector where a future refactor could accidentally pass
+        /// <see langword="null"/> ciphertext on a fresh-init path.
+        /// </remarks>
         private static readonly byte[] ClientInitHashAbsent = new byte[ClientInitHashLen];
 
         // ── Per-session ephemeral key pair ───────────────────────────────────
@@ -130,6 +165,16 @@ namespace RTMPE.Crypto
         /// is no inbound ciphertext and replay defence is provided by the
         /// single-use reconnect token instead.
         /// </param>
+        /// <param name="flow">
+        /// Explicit flow selector.  Eliminates the implicit-signaling vector in
+        /// which a future refactor could pass <see langword="null"/> ciphertext
+        /// on a fresh-Init path and silently engage the all-zero absent
+        /// sentinel.  The flow MUST agree with
+        /// <paramref name="handshakeInitCiphertext"/>: <see cref="HandshakeFlow.Init"/>
+        /// requires non-null ciphertext, <see cref="HandshakeFlow.Reconnect"/>
+        /// requires <see langword="null"/> ciphertext.  Mismatch returns
+        /// <see langword="false"/>.
+        /// </param>
         /// <param name="serverEphemeralPub">Receives the server's X25519 ephemeral public key.</param>
         /// <param name="serverStaticPub">Receives the server's Ed25519 static public key.</param>
         /// <param name="pinnedServerStaticPub">
@@ -143,6 +188,7 @@ namespace RTMPE.Crypto
         public bool ValidateChallenge(
             byte[] challengePayload,
             byte[] handshakeInitCiphertext,
+            HandshakeFlow flow,
             out byte[] serverEphemeralPub,
             out byte[] serverStaticPub,
             byte[] pinnedServerStaticPub = null)
@@ -152,6 +198,26 @@ namespace RTMPE.Crypto
 
             if (challengePayload == null || challengePayload.Length != 128)
                 return false;
+
+            // Defensive enum-value gate.  An out-of-range cast such as
+            // `(HandshakeFlow)999` would otherwise satisfy neither of the
+            // two consistency checks below and silently fall through to the
+            // absent-sentinel branch (`flow == Init ? Sha256(...) : ABSENT`).
+            // Reject any value that is not exactly `Init` or `Reconnect` so
+            // a future enum extension cannot accidentally engage the
+            // reconnect transcript shape on an unrelated caller.
+            if (flow != HandshakeFlow.Init && flow != HandshakeFlow.Reconnect)
+                return false;
+
+            // Explicit flow consistency.  Without this gate the absent-sentinel
+            // path was reachable any time the caller passed null ciphertext —
+            // a refactor hazard.  Now the caller MUST opt in to the reconnect
+            // transcript shape, and a mismatched call shape is rejected before
+            // any cryptographic work is performed.
+            bool ciphertextProvided = handshakeInitCiphertext != null
+                                   && handshakeInitCiphertext.Length > 0;
+            if (flow == HandshakeFlow.Init && !ciphertextProvided)     return false;
+            if (flow == HandshakeFlow.Reconnect && ciphertextProvided) return false;
 
             // Parse the three fields.
             var ephemeral = new byte[32];
@@ -184,7 +250,7 @@ namespace RTMPE.Crypto
             //  • init flow:      SHA-256(HandshakeInit ciphertext bytes)
             //  • reconnect flow: 32 × 0x00 (the absent-sentinel agreed with
             //                    the gateway in `CLIENT_INIT_HASH_ABSENT`).
-            byte[] clientInitHash = handshakeInitCiphertext != null
+            byte[] clientInitHash = flow == HandshakeFlow.Init
                 ? Sha256(handshakeInitCiphertext)
                 : ClientInitHashAbsent;
 

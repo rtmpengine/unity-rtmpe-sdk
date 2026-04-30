@@ -257,7 +257,22 @@ namespace RTMPE.Rpc
             // The default verifier is non-null (see initialiser); a caller
             // that explicitly assigns null falls back to "structural-only"
             // semantics — zero rejected, every non-zero accepted.
-            return hook == null || hook(senderId);
+            if (hook == null) return true;
+            // Verifier hooks must fail-closed: a buggy integrator delegate
+            // (NRE on a stale roster reference, Dictionary mutation in
+            // flight, …) must drop the packet rather than abort the parse
+            // boundary.  Unhandled propagation here would tear down the
+            // EnhancedRpcPacketParser and silently consume the rest of the
+            // inbound buffer.
+            try { return hook(senderId); }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogError(
+                    "[RTMPE] EnhancedRpcVerifier.SenderVerifier threw " +
+                    $"{ex.GetType().Name}: {ex.Message}.  Treating as deny — " +
+                    "fix the verifier delegate to fail-closed.");
+                return false;
+            }
         }
 
         /// <summary>
@@ -270,7 +285,16 @@ namespace RTMPE.Rpc
         public static bool IsObjectAcceptable(ulong objectId)
         {
             var hook = ObjectExistsVerifier;
-            return hook == null || hook(objectId);
+            if (hook == null) return true;
+            // Same fail-closed discipline as IsSenderAcceptable above.
+            try { return hook(objectId); }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogError(
+                    "[RTMPE] EnhancedRpcVerifier.ObjectExistsVerifier threw " +
+                    $"{ex.GetType().Name}: {ex.Message}.  Treating as deny.");
+                return false;
+            }
         }
     }
 }

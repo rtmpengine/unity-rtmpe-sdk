@@ -92,6 +92,16 @@ namespace RTMPE.Crypto.Internal
             var result = new byte[32];
             int copy = Math.Min(raw.Length, 32);
             Buffer.BlockCopy(raw, 0, result, 0, copy);
+            // Wipe the BCL-allocated scratch buffer before it falls to the
+            // GC.  `raw` carries either the X25519 shared-secret or the
+            // public-key bytes; a managed-heap dump (mobile core dump,
+            // Mono GC trace, Editor crash report) recovered between this
+            // return and the next gen-0 sweep would otherwise expose the
+            // bytes that, post HKDF-Expand, directly yield both directional
+            // session keys.  Caller-owned buffers are explicitly wiped at
+            // their respective lifetime boundaries; this is the one
+            // helper-internal residue point that can be wiped cheaply.
+            Array.Clear(raw, 0, raw.Length);
             return result;
         }
 

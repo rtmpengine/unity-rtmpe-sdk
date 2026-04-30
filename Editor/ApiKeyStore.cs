@@ -101,7 +101,34 @@ namespace RTMPE.Editor
             if (!string.IsNullOrEmpty(legacy))
             {
                 Save(legacy);
-                EditorPrefs.DeleteKey(LegacyPlaintextPref);
+
+                // Confirm the secure store can return the key before
+                // discarding the only surviving copy. Read back directly
+                // instead of recursing into Load() (which would re-enter
+                // this migration branch).
+                string readback = null;
+                try
+                {
+                    if (!TryReadFromOsKeychain(out readback)) readback = null;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[RTMPE] OS keychain read failed: {ex.GetType().Name} — {ex.Message}");
+                    readback = null;
+                }
+                if (string.IsNullOrEmpty(readback)) readback = TryReadFallback();
+
+                if (readback == legacy)
+                {
+                    EditorPrefs.DeleteKey(LegacyPlaintextPref);
+                }
+                else
+                {
+                    Debug.LogWarning(
+                        "[RTMPE] Legacy API key migration could not verify the new " +
+                        "secure-store entry; preserving the legacy EditorPrefs entry " +
+                        "so the key is not lost. Migration will retry on next load.");
+                }
                 return legacy;
             }
 
@@ -323,8 +350,7 @@ namespace RTMPE.Editor
                 CreateNoWindow = true,
             };
             using var p = Process.Start(psi);
-            p.WaitForExit(5_000);
-            return p.ExitCode == 0;
+            return TryWaitForCleanExit(p, 5_000, out int exit) && exit == 0;
         }
 
         private static bool TryReadMacKeychain(out string apiKey)
@@ -340,8 +366,7 @@ namespace RTMPE.Editor
             };
             using var p = Process.Start(psi);
             string stdout = p.StandardOutput.ReadToEnd();
-            p.WaitForExit(5_000);
-            if (p.ExitCode != 0) return false;
+            if (!TryWaitForCleanExit(p, 5_000, out int exit) || exit != 0) return false;
             apiKey = stdout.TrimEnd('\r', '\n');
             return !string.IsNullOrEmpty(apiKey);
         }
@@ -355,7 +380,7 @@ namespace RTMPE.Editor
                 RedirectStandardError = true, CreateNoWindow = true,
             };
             using var p = Process.Start(psi);
-            p.WaitForExit(5_000);
+            TryWaitForCleanExit(p, 5_000, out _);
         }
 
         private static string EscapeShell(string s) => s.Replace("\\", "\\\\").Replace("\"", "\\\"");
@@ -379,8 +404,7 @@ namespace RTMPE.Editor
             using var p = Process.Start(psi);
             p.StandardInput.Write(apiKey);
             p.StandardInput.Close();
-            p.WaitForExit(5_000);
-            return p.ExitCode == 0;
+            return TryWaitForCleanExit(p, 5_000, out int exit) && exit == 0;
         }
 
         private static bool TryReadSecretTool(out string apiKey)
@@ -397,8 +421,11 @@ namespace RTMPE.Editor
             };
             using var p = Process.Start(psi);
             apiKey = p.StandardOutput.ReadToEnd();
-            p.WaitForExit(5_000);
-            if (p.ExitCode != 0) { apiKey = null; return false; }
+            if (!TryWaitForCleanExit(p, 5_000, out int exit) || exit != 0)
+            {
+                apiKey = null;
+                return false;
+            }
             apiKey = apiKey.TrimEnd('\r', '\n');
             return !string.IsNullOrEmpty(apiKey);
         }
@@ -413,7 +440,7 @@ namespace RTMPE.Editor
                 RedirectStandardError = true, CreateNoWindow = true,
             };
             using var p = Process.Start(psi);
-            p.WaitForExit(5_000);
+            TryWaitForCleanExit(p, 5_000, out _);
         }
 
         private static bool CommandExists(string cmd)
@@ -423,10 +450,35 @@ namespace RTMPE.Editor
                 var psi = new ProcessStartInfo("/bin/sh", $"-c \"command -v {cmd}\"")
                 { UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true };
                 using var p = Process.Start(psi);
-                p.WaitForExit(2_000);
-                return p.ExitCode == 0;
+                return TryWaitForCleanExit(p, 2_000, out int exit) && exit == 0;
             }
             catch { return false; }
+        }
+#endif
+
+#if UNITY_EDITOR_OSX || UNITY_EDITOR_LINUX
+        // Wait for the child to terminate within timeoutMs and report its exit
+        // code.  Process.WaitForExit(int) returns FALSE on timeout WITHOUT
+        // killing the child; reading p.ExitCode in that state throws
+        // InvalidOperationException("Process must exit before requested
+        // information can be determined").  A wedged `security` (macOS) or
+        // `secret-tool` (Linux) child — gnome-keyring locked, libsecret D-Bus
+        // broker hung, mid-update keychain — would otherwise propagate that
+        // exception out of the keystore reader and silently downgrade the
+        // developer to the obfuscated-EditorPrefs fallback path.  Killing on
+        // timeout keeps the keystore semantics observable.
+        private static bool TryWaitForCleanExit(Process p, int timeoutMs, out int exitCode)
+        {
+            if (p == null) { exitCode = -1; return false; }
+            if (!p.WaitForExit(timeoutMs))
+            {
+                try { p.Kill(); } catch { /* already exited or platform refused — best-effort */ }
+                exitCode = -1;
+                return false;
+            }
+            try { exitCode = p.ExitCode; }
+            catch (InvalidOperationException) { exitCode = -1; return false; }
+            return true;
         }
 #endif
 

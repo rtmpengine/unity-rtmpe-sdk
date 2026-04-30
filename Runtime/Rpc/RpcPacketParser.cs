@@ -97,8 +97,14 @@ namespace RTMPE.Rpc
             if (payloadLen > RpcLimits.MaxPayloadBytes)
                 return false;
 
-            // Validate payload length against remaining data
-            if (data.Length < RpcLimits.ResponseHeaderSize + payloadLen)
+            // Subtraction-form bounds: avoids the additive-form overflow
+            // surface and matches the convention adopted across the rest
+            // of the SDK parsers.  Combined with the strict trailing-byte
+            // check below, a well-formed response is exactly
+            // ResponseHeaderSize + payloadLen bytes long.
+            if (payloadLen > data.Length - RpcLimits.ResponseHeaderSize)
+                return false;
+            if (RpcLimits.ResponseHeaderSize + payloadLen != data.Length)
                 return false;
 
             byte[] payload;
@@ -112,9 +118,26 @@ namespace RTMPE.Rpc
                 payload = Array.Empty<byte>();
             }
 
+            // Validate the wire-level errorCode against defined enum members
+            // before the cast.  An out-of-range value (e.g. 999 from a buggy
+            // gateway) was previously cast directly, producing an enum
+            // instance that pattern-matched no case in user code.  Mapping
+            // unknown codes onto <see cref="RpcErrorCode.Unknown"/> gives
+            // application code a single explicit member to handle and
+            // prevents silent misclassification as <see cref="RpcErrorCode.OK"/>.
+            var resolvedError = errorCode switch
+            {
+                (ushort)RpcErrorCode.OK               => RpcErrorCode.OK,
+                (ushort)RpcErrorCode.Unauthorized     => RpcErrorCode.Unauthorized,
+                (ushort)RpcErrorCode.UnknownMethod    => RpcErrorCode.UnknownMethod,
+                (ushort)RpcErrorCode.HandlerError     => RpcErrorCode.HandlerError,
+                (ushort)RpcErrorCode.OversizedPayload => RpcErrorCode.OversizedPayload,
+                _                                     => RpcErrorCode.Unknown,
+            };
+
             response = new RpcResponse(
                 requestId, methodId, senderId,
-                success, (RpcErrorCode)errorCode, payload);
+                success, resolvedError, payload);
             return true;
         }
 
@@ -140,8 +163,13 @@ namespace RTMPE.Rpc
             if (payloadLen > RpcLimits.MaxPayloadBytes)
                 return false;
 
-            // Validate payload length against remaining data
-            if (data.Length < RpcLimits.RequestHeaderSize + payloadLen)
+            // Subtraction-form bounds + strict trailing-byte rejection.  A
+            // well-formed request is exactly RequestHeaderSize + payloadLen
+            // bytes long; surplus bytes beyond that are a protocol-drift
+            // / smuggling signal and must not be silently retained.
+            if (payloadLen > data.Length - RpcLimits.RequestHeaderSize)
+                return false;
+            if (RpcLimits.RequestHeaderSize + payloadLen != data.Length)
                 return false;
 
             byte[] payload;

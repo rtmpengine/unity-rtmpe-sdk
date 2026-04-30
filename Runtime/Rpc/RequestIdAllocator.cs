@@ -171,11 +171,26 @@ namespace RTMPE.Rpc
             }
 
             // Fire callbacks outside the lock to avoid reentrancy hazards.
+            //
+            // Subscriber-isolation discipline: a buggy timeout callback must
+            // not abort the sweep across siblings, but it MUST surface a
+            // diagnostic so operator dashboards observe the regression.  A
+            // bare `catch {}` makes the failure invisible — a callback that
+            // throws every invocation looks identical to one that simply
+            // does nothing.  Symmetric with the M19-CORE-07 / M19-SYNC-01
+            // isolation already adopted across the SDK's hot paths.
             if (callbacks != null)
             {
                 foreach (var cb in callbacks)
                 {
-                    try { cb(); } catch { /* callback policy is caller's */ }
+                    try { cb(); }
+                    catch (Exception ex)
+                    {
+                        UnityEngine.Debug.LogError(
+                            "[RTMPE] RequestIdAllocator: timeout callback threw " +
+                            $"{ex.GetType().Name}: {ex.Message}.  Sweep continues " +
+                            "with remaining timeouts.");
+                    }
                 }
             }
             return purged;
@@ -187,6 +202,52 @@ namespace RTMPE.Rpc
         public static int PendingCount
         {
             get { lock (Lock) return Pending.Count; }
+        }
+
+        /// <summary>
+        /// Drop every pending entry and surface a synthetic timeout to each
+        /// registered callback — call from <c>NetworkManager.Cleanup</c>,
+        /// <c>ClearSessionData</c>, and any other session-boundary hook so a
+        /// previous session's <c>OnTimeout</c> closures do not fire later
+        /// against torn-down NetworkManager state, and a forged-reply window
+        /// on a previously-allocated request_id cannot be correlated into
+        /// the next session.  Callbacks fire OUTSIDE the internal lock to
+        /// match <see cref="PurgeExpired"/>'s reentrancy contract; exception
+        /// isolation is symmetric with that path.
+        /// </summary>
+        public static int DropPending()
+        {
+            List<Action> callbacks = null;
+            int dropped;
+            lock (Lock)
+            {
+                dropped = Pending.Count;
+                if (dropped == 0) return 0;
+                foreach (var kv in Pending)
+                {
+                    if (kv.Value.OnTimeout != null)
+                    {
+                        if (callbacks == null) callbacks = new List<Action>();
+                        callbacks.Add(kv.Value.OnTimeout);
+                    }
+                }
+                Pending.Clear();
+            }
+
+            if (callbacks != null)
+            {
+                foreach (var cb in callbacks)
+                {
+                    try { cb(); }
+                    catch (Exception ex)
+                    {
+                        UnityEngine.Debug.LogError(
+                            "[RTMPE] RequestIdAllocator.DropPending: timeout callback threw " +
+                            $"{ex.GetType().Name}: {ex.Message}.  Drain continues.");
+                    }
+                }
+            }
+            return dropped;
         }
 
         /// <summary>

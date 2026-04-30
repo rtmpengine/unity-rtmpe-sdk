@@ -52,6 +52,16 @@ namespace RTMPE.Rpc
 
         /// <summary>Payload exceeds <see cref="RpcLimits.MaxPayloadBytes"/>.</summary>
         OversizedPayload = 4,
+
+        /// <summary>
+        /// Wire-level value that did not match any defined enum member.
+        /// Returned by <c>RpcPacketParser.TryParseResponse</c> when the
+        /// gateway emits a code outside the contract; surfaced as an
+        /// explicit member rather than a silent
+        /// <c>(RpcErrorCode)999</c> cast so application code can pattern-
+        /// match on it without first probing for known values.
+        /// </summary>
+        Unknown          = 0xFFFF,
     }
 
     /// <summary>

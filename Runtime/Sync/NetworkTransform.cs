@@ -274,7 +274,32 @@ namespace RTMPE.Sync
             uint           confirmedInputTick,
             bool           hasConfirmedTick)
         {
-            if (!_enablePrediction) return;
+            // Full-state finiteness gate — covers Position, Rotation
+            // (including the .w component, which PhysX may surface as NaN
+            // after divide-by-zero recovery), and Scale.  The legacy
+            // position-only check left rotation and scale unguarded; an
+            // internal caller (test harness, custom dispatcher, future
+            // server-broadcast path) could persist a NaN quaternion into
+            // transform.rotation, after which every Slerp / Quaternion.Angle
+            // returns NaN for the lifetime of the GameObject.
+            if (!IsFiniteState(serverState)) return;
+
+            if (!_enablePrediction)
+            {
+                // Passive-reconciliation path.  Non-predicting owners still
+                // honour server-authoritative deltas — without this snap an
+                // owner that disabled prediction would silently desync from
+                // every other peer until the next state-resync, masquerading
+                // as authoritative while the rest of the room observed the
+                // server's truth.  Snap directly without the replay loop
+                // (no input buffer to walk) and without the lerp blend
+                // (the owner did not predict, so there is nothing to blend
+                // *from*).
+                if (_syncPosition) transform.position    = serverState.Position;
+                if (_syncRotation) transform.rotation    = serverState.Rotation;
+                MarkClean();
+                return;
+            }
 
             var nm = NetworkManager.Instance;
 
@@ -374,17 +399,45 @@ namespace RTMPE.Sync
 
             // Medium error — smooth linear lerp over ReconcileDuration seconds.
             //
-           // Capture the CURRENT pose as the lerp start so the per-frame blend
-            // computes a true linear interpolation (Lerp(start, target, t)) with
-            // t = elapsed / duration, instead of a recursive Lerp from the
-            // moving transform.position which produces an exponential ease-out.
-            // Rotation is captured here so the per-frame slerp in Update() can
-            // align toward the server-authoritative orientation alongside position.
-            _reconciledTarget         = serverState.Position;
-            _reconciledRotationTarget = serverState.Rotation;
-            _reconcileStart           = transform.position;
-            _reconcileStartRotation   = transform.rotation;
-            _reconcileTimeLeft        = ReconcileDuration;
+            // Replay the in-flight input log on top of the server-confirmed
+            // pose BEFORE capturing the lerp target.  Without this step, the
+            // lerp settles on the server's stale snapshot at confirmedInputTick
+            // and silently discards every keystroke the player issued between
+            // that tick and "now" — producing recurring rubber-band / micro-
+            // stutter on every server beat under any non-zero RTT.  The snap
+            // branch above already calls ReplayUnackedInputs; the medium-error
+            // branch must apply the same canonical CSP flow so the visible
+            // pose incorporates current-frame input.
+            //
+            // Sequence:
+            //   1. Capture current transform.position as the lerp start.
+            //   2. Temporarily fast-forward transform.position from
+            //      serverState.Position through the unacked input log.
+            //   3. Read the post-replay pose as the lerp target.
+            //   4. Restore the transform to the lerp start so the per-frame
+            //      Update() blend produces a true linear interpolation
+            //      from the player's pre-correction visual pose to the
+            //      replay-adjusted target.
+            _reconcileStart         = transform.position;
+            _reconcileStartRotation = transform.rotation;
+
+            if (_syncPosition) transform.position = serverState.Position;
+            if (_syncRotation) transform.rotation = serverState.Rotation;
+            if (hasConfirmedTick)
+                ReplayUnackedInputs(confirmedInputTick);
+
+            _reconciledTarget         = transform.position;
+            _reconciledRotationTarget = transform.rotation;
+
+            // Restore the visible pose so the lerp blends from where the
+            // player saw the object to the replayed target.  Without the
+            // restore, the medium-error branch would degenerate into a
+            // hard snap-then-lerp-back cycle that visually inverts the
+            // intended smoothing.
+            if (_syncPosition) transform.position = _reconcileStart;
+            if (_syncRotation) transform.rotation = _reconcileStartRotation;
+
+            _reconcileTimeLeft = ReconcileDuration;
         }
 
         // ── Unity lifecycle ────────────────────────────────────────────────────
@@ -606,6 +659,18 @@ namespace RTMPE.Sync
             var state    = GetState();
             var settings = manager.Settings;
 
+            // ── Sender finiteness gate ───────────────────────────────────
+            // Reject a broadcast whose own components carry NaN/Inf BEFORE
+            // they leave this client.  The peer-side parser already rejects
+            // the same on receive, but a partially-corrupted local state
+            // (e.g. physics-engine glitch on the owner) should not cost
+            // bandwidth or surface as a peer-side anomaly when it can be
+            // localised to the originator.  Skipping the send keeps the
+            // last-known-good position broadcast as the peer baseline until
+            // the owner's local state recovers.
+            if (!IsFiniteState(state))
+                return;
+
             // ── Owner velocity cap ────────────────────────────────────────
             // Clamp the broadcast position when the apparent per-second
             // velocity exceeds the project-wide cap.  This is a client-side
@@ -722,5 +787,27 @@ namespace RTMPE.Sync
             var payload = InputPacketBuilder.BuildBatchPayload(_inputSendScratch, count);
             manager.SendInput(payload);
         }
+
+        // Componentwise IsFinite over the position, rotation, and scale of a
+        // TransformState.  Used by SendTransformUpdate to quench broadcasts
+        // produced from a corrupt local pose before they leave the
+        // originator.  Quaternion.w is included because PhysX-derived
+        // rotations may carry a non-unit quaternion that has a finite x/y/z
+        // and a non-finite w after a divide-by-zero recovery.
+        // .NET Standard 2.1 has float.IsFinite, but the SDK targets older
+        // Unity runtimes where it is not always available.  Spelled out as
+        // !IsNaN && !IsInfinity to match the same pattern used elsewhere
+        // in this file (see ApplyReconciliation:280-283).
+        private static bool IsFiniteState(TransformState s)
+        {
+            var p = s.Position;
+            var r = s.Rotation;
+            var c = s.Scale;
+            return Finite(p.x) && Finite(p.y) && Finite(p.z)
+                && Finite(r.x) && Finite(r.y) && Finite(r.z) && Finite(r.w)
+                && Finite(c.x) && Finite(c.y) && Finite(c.z);
+        }
+
+        private static bool Finite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
     }
 }

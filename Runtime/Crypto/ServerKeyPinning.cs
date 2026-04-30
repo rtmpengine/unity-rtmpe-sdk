@@ -77,7 +77,28 @@ namespace RTMPE.Crypto
         public static string CanonicalEndpoint(string host, int port)
         {
             if (string.IsNullOrEmpty(host)) host = "";
-            return host.Trim().ToLowerInvariant() + ":" + port.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            // Reject embedded NUL bytes in the host string.  PlayerPrefs and
+            // platform-specific keystores (iOS Keychain, Android
+            // SharedPreferences) routinely round-trip strings through
+            // C-style APIs that truncate at the first NUL — a host of the
+            // shape "good.example\0evil" would persist under "good.example"
+            // on those backends, breaking pin-retrieval on the next
+            // connection and silently demoting a previously-pinned
+            // endpoint back into TOFU capture.
+            if (host.IndexOf('\0') >= 0)
+                throw new System.ArgumentException(
+                    "host must not contain embedded NUL bytes.", nameof(host));
+            // Unicode-normalise the host before the lowercase fold.  Two
+            // visually-equivalent forms — e.g. U+212B (Å) versus the
+            // canonically-equivalent U+00C5 (Å), or any combining-mark
+            // composition versus its precomposed counterpart — would
+            // otherwise hash into distinct pin slots, splitting a single
+            // logical endpoint across multiple PlayerPrefs entries and
+            // silently demoting a previously-pinned endpoint to a fresh
+            // TOFU capture whenever the host is re-typed in a different
+            // Unicode form.  NFC is the standard form for IDN compatibility.
+            string normalised = host.Normalize(System.Text.NormalizationForm.FormC);
+            return normalised.Trim().ToLowerInvariant() + ":" + port.ToString(System.Globalization.CultureInfo.InvariantCulture);
         }
 
         /// <summary>

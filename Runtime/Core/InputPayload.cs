@@ -46,10 +46,32 @@ namespace RTMPE.Core
         /// <summary>
         /// Write this payload into <paramref name="buf"/> at <paramref name="offset"/>.
         /// Caller must ensure <c>buf.Length - offset &gt;= <see cref="WireSize"/></c>.
+        /// Throws <see cref="InvalidOperationException"/> when
+        /// <see cref="MoveX"/> or <see cref="MoveY"/> is NaN or ±Infinity —
+        /// the receive-side parser already rejects such values, so the
+        /// sender contract must reject too in order to keep the local
+        /// CSP buffer (which never round-trips through <c>ReadFrom</c>)
+        /// from carrying non-finite inputs into <c>ApplyInput</c> on
+        /// reconciliation replay.
         /// </summary>
         public void WriteTo(byte[] buf, int offset)
         {
             if (buf == null) throw new ArgumentNullException(nameof(buf));
+            // Sender-side finiteness gate.  A custom controller that
+            // produces NaN MoveX (e.g. division by zero in a deadzone
+            // computation) would otherwise be enqueued into the local
+            // InputBuffer un-validated.  On the next reconciliation,
+            // ReplayUnackedInputs hands the payload to user
+            // ApplyInput which propagates NaN into transform.position;
+            // the same payload is also sent to the gateway, where the
+            // peer parser throws and tears the channel down.  Surfacing
+            // the misuse at the sender boundary keeps the CSP simulation
+            // domain finite and prevents a single controller bug from
+            // promoting into a session-killing protocol error.
+            if (float.IsNaN(MoveX) || float.IsInfinity(MoveX))
+                throw new InvalidOperationException("InputPayload.MoveX is not finite");
+            if (float.IsNaN(MoveY) || float.IsInfinity(MoveY))
+                throw new InvalidOperationException("InputPayload.MoveY is not finite");
             WriteU32LE(buf, offset,      Tick);
             WriteF32LE(buf, offset + 4,  MoveX);
             WriteF32LE(buf, offset + 8,  MoveY);

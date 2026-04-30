@@ -64,12 +64,18 @@ namespace RTMPE.Core
             ulong objectId = ReadU64LE(payload, ref o);
             ushort ownerLen = ReadU16LE(payload, ref o);
 
-            // Bounds check: owner + 7 floats (28 bytes) must fit
-            if (o + ownerLen + 28 > payload.Length)
+            // Cap owner length (defense-in-depth) BEFORE the bounds
+            // arithmetic so a ushort.MaxValue-shaped attacker value cannot
+            // overflow `o + ownerLen + 28` into a negative int that
+            // bypasses the additive-form check.
+            if (ownerLen > 256)
                 return false;
 
-            // Cap owner length (defense-in-depth)
-            if (ownerLen > 256)
+            // Subtraction-form bounds: the owner string plus the seven
+            // trailing floats (28 B) must fit inside the remaining
+            // payload.  Computed as `available - constant >= ownerLen`
+            // so neither side of the comparison can wrap.
+            if (ownerLen > payload.Length - o - 28)
                 return false;
 
             // Strict UTF-8 — the default Encoding.UTF8 silently substitutes the
@@ -104,6 +110,34 @@ namespace RTMPE.Core
             float rz = ReadF32LE(payload, ref o);
             float rw = ReadF32LE(payload, ref o);
 
+            // Finiteness gate.  GameObject.Instantiate(...) with a NaN /
+            // Inf transform corrupts PhysX state on the very first
+            // FixedUpdate (the rigidbody is reported as missing from the
+            // simulation; ragdoll children become detached).  Reject the
+            // spawn payload outright rather than persisting the corruption.
+            if (!IsFinite(px) || !IsFinite(py) || !IsFinite(pz)) return false;
+            if (!IsFinite(rx) || !IsFinite(ry) || !IsFinite(rz) || !IsFinite(rw)) return false;
+
+            // Quaternion magnitude gate.  The IsFinite check above admits
+            // finite-but-degenerate rotations: a (0,0,0,0) zero-quaternion
+            // assigned to transform.rotation produces per-frame "Look
+            // rotation viewing vector is zero" warnings (each ~1 KB on the
+            // managed heap) and silently substitutes identity, while
+            // grossly-non-unit quaternions (e.g. 1e10 in each component)
+            // produce NaN once squared during downstream parent-transform
+            // multiplication.  The transform / physics parsers reject any
+            // quaternion whose squared magnitude lies outside [0.9, 1.1]
+            // (≈ unit norm with 5 % tolerance for FP rounding); mirror
+            // the same band here so the spawn-time pose carries the
+            // identical invariant as every other inbound rotation.
+            float qMagSq = rx * rx + ry * ry + rz * rz + rw * rw;
+            if (qMagSq < 0.9f || qMagSq > 1.1f) return false;
+
+            // Reject trailing residue.  A well-formed spawn payload ends
+            // exactly after the 7th float; surplus bytes are a protocol-
+            // drift / smuggling signal.
+            if (o != payload.Length) return false;
+
             data = new SpawnData(
                 prefabId,
                 objectId,
@@ -113,6 +147,11 @@ namespace RTMPE.Core
 
             return true;
         }
+
+        // .NET Standard 2.1 has float.IsFinite, but the SDK targets older
+        // Unity runtimes where it is not always available.  Spelled out
+        // explicitly so the code compiles unchanged.
+        private static bool IsFinite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
 
         /// <summary>
         /// Parse a Despawn payload (received from server).

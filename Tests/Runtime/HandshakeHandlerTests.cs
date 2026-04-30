@@ -404,7 +404,8 @@ namespace RTMPE.Tests
         public void HandshakeHandler_ValidateChallenge_ReturnsFalseForNullPayload()
         {
             var h = new HandshakeHandler();
-            Assert.IsFalse(h.ValidateChallenge(null, handshakeInitCiphertext: null, out _, out _));
+            Assert.IsFalse(h.ValidateChallenge(
+                null, handshakeInitCiphertext: null, HandshakeFlow.Reconnect, out _, out _));
         }
 
         [Test]
@@ -412,9 +413,9 @@ namespace RTMPE.Tests
         public void HandshakeHandler_ValidateChallenge_ReturnsFalseForWrongLength()
         {
             var h = new HandshakeHandler();
-            Assert.IsFalse(h.ValidateChallenge(new byte[127], null, out _, out _), "127 bytes");
-            Assert.IsFalse(h.ValidateChallenge(new byte[129], null, out _, out _), "129 bytes");
-            Assert.IsFalse(h.ValidateChallenge(Array.Empty<byte>(), null, out _, out _), "empty");
+            Assert.IsFalse(h.ValidateChallenge(new byte[127], null, HandshakeFlow.Reconnect, out _, out _), "127 bytes");
+            Assert.IsFalse(h.ValidateChallenge(new byte[129], null, HandshakeFlow.Reconnect, out _, out _), "129 bytes");
+            Assert.IsFalse(h.ValidateChallenge(Array.Empty<byte>(), null, HandshakeFlow.Reconnect, out _, out _), "empty");
         }
 
         [Test]
@@ -423,8 +424,38 @@ namespace RTMPE.Tests
         {
             // All-zero challenge has an invalid Ed25519 signature → must be rejected.
             var h = new HandshakeHandler();
-            Assert.IsFalse(h.ValidateChallenge(new byte[128], null, out _, out _),
+            Assert.IsFalse(h.ValidateChallenge(new byte[128], null, HandshakeFlow.Reconnect, out _, out _),
                 "An all-zero Challenge payload must fail Ed25519 verification.");
+        }
+
+        [Test]
+        [Category("HandshakeHandler")]
+        public void HandshakeHandler_ValidateChallenge_RejectsFlowMismatch()
+        {
+            // Defence-in-depth: the explicit HandshakeFlow argument must agree
+            // with the ciphertext-presence indicator.  A future refactor that
+            // accidentally passes null ciphertext on an Init path (or non-null
+            // ciphertext on a Reconnect path) is rejected before any
+            // cryptographic work is performed.  Closes NEW-CR-2 implicit-
+            // signaling vector.
+            var h = new HandshakeHandler();
+            var payload = new byte[128];
+
+            Assert.IsFalse(
+                h.ValidateChallenge(payload, handshakeInitCiphertext: null,
+                    HandshakeFlow.Init, out _, out _),
+                "Init flow with null ciphertext must be rejected.");
+
+            Assert.IsFalse(
+                h.ValidateChallenge(payload, handshakeInitCiphertext: Array.Empty<byte>(),
+                    HandshakeFlow.Init, out _, out _),
+                "Init flow with empty ciphertext must be rejected.");
+
+            Assert.IsFalse(
+                h.ValidateChallenge(payload,
+                    handshakeInitCiphertext: new byte[] { 1, 2, 3 },
+                    HandshakeFlow.Reconnect, out _, out _),
+                "Reconnect flow with non-null ciphertext must be rejected.");
         }
 
         // ══════════════════════════════════════════════════════════════════════
@@ -500,7 +531,7 @@ namespace RTMPE.Tests
                 var bogus = new byte[128];
                 rng.NextBytes(bogus);
                 Assert.IsFalse(
-                    h.ValidateChallenge(bogus, new byte[] { 1, 2, 3 }, out _, out _),
+                    h.ValidateChallenge(bogus, new byte[] { 1, 2, 3 }, HandshakeFlow.Init, out _, out _),
                     $"random Challenge #{t} must not verify");
             }
         }

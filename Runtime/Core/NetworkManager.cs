@@ -2603,14 +2603,16 @@ namespace RTMPE.Core
 
         private void OnHandshakeAck(byte[] _)
         {
+            // The legacy unauthenticated handshake (0x02) is incompatible with
+            // the current security model, which requires ECDH key derivation via
+            // Challenge/HandshakeResponse/SessionAck before reaching Connected.
+            // Accepting this packet would leave _sessionKeys null and
+            // _sessionEstablished false, causing EncryptAndSend to transmit in
+            // plaintext. Force-disconnect instead of permitting an insecure state.
             if (_state != NetworkState.Connecting) return;
-
-            if (_timeoutCoroutine != null)
-            {
-                StopCoroutine(_timeoutCoroutine);
-                _timeoutCoroutine = null;
-            }
-            TransitionTo(NetworkState.Connected);
+            _networkThread?.Stop();
+            ClearSessionData(preserveReconnectToken: false);
+            TransitionTo(NetworkState.Disconnected, DisconnectReason.ProtocolError);
         }
 
         private void OnHeartbeatAck(byte[] _)
@@ -5435,6 +5437,26 @@ namespace RTMPE.Core
         internal static void ResetJwtIssuerUnconfiguredWarningForTests()
             => System.Threading.Interlocked.Exchange(ref _jwtIssuerUnconfiguredWarned, 0);
 
+        // ── Protocol-error rejection test seam ────────────────────────────────
+
+        /// <summary>
+        /// Drives <see cref="OnHandshakeAck"/> from a test after forcing the
+        /// state machine into <see cref="NetworkState.Connecting"/> via
+        /// <see cref="ForceConnectingStateForTests"/>.
+        /// Do NOT call from production code.
+        /// </summary>
+        internal void SimulateLegacyHandshakeAckForTests()
+            => OnHandshakeAck(null);
+
+        /// <summary>
+        /// Forces the state machine into <see cref="NetworkState.Connecting"/>
+        /// so a unit test can observe how the SDK handles packets received in
+        /// that state without opening a real UDP socket.
+        /// Do NOT call from production code.
+        /// </summary>
+        internal void ForceConnectingStateForTests()
+            => TransitionTo(NetworkState.Connecting);
+
         internal static void ResetJwtAudienceUnconfiguredWarningForTests()
             => System.Threading.Interlocked.Exchange(ref _jwtAudienceUnconfiguredWarned, 0);
 
@@ -5631,6 +5653,12 @@ namespace RTMPE.Core
         /// The outbound nonce counter was exhausted after 2^32 packets.
         /// The session must be re-established with a fresh handshake.
         /// </summary>
-        NonceExhausted
+        NonceExhausted,
+        /// <summary>
+        /// The gateway sent a packet that violates the expected protocol
+        /// sequence (e.g. a legacy handshake type incompatible with the
+        /// current security model). The connection cannot be trusted.
+        /// </summary>
+        ProtocolError
     }
 }

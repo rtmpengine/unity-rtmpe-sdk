@@ -220,5 +220,53 @@ namespace RTMPE.Tests
                 "AddComponentMenu path must live under the \"RTMPE\" submenu so all RTMPE " +
                 "components group together in the Add-Component picker.");
         }
+
+        // ── C-008: Legacy HandshakeAck must not produce a Connected state ──────
+        //
+        // The legacy 0x02 HandshakeAck arrives without ECDH session-key
+        // derivation.  Accepting it would leave _sessionKeys null while the
+        // state machine reports Connected, causing EncryptAndSend to transmit
+        // every subsequent packet in plaintext.  The fix force-disconnects
+        // with ProtocolError instead of transitioning to Connected.
+
+        [Test]
+        [Description("Receiving a legacy HandshakeAck while Connecting must result in " +
+                     "Disconnected, not Connected.")]
+        public void LegacyHandshakeAck_WhileConnecting_TransitionsToDisconnected()
+        {
+            // Arrange: put state machine in Connecting without opening a real socket.
+            _manager.ForceConnectingStateForTests();
+            Assert.AreEqual(NetworkState.Connecting, _manager.State,
+                "Precondition: ForceConnectingStateForTests must transition to Connecting.");
+
+            DisconnectReason? observedReason = null;
+            _manager.OnDisconnected += r => observedReason = r;
+
+            // Act: simulate the legacy HandshakeAck (0x02) arriving.
+            _manager.SimulateLegacyHandshakeAckForTests();
+
+            // Assert: must land in Disconnected, never Connected.
+            Assert.AreEqual(NetworkState.Disconnected, _manager.State,
+                "The legacy HandshakeAck must force a disconnect, not transition to Connected.");
+            Assert.IsFalse(_manager.IsConnected,
+                "IsConnected must be false after a ProtocolError disconnect.");
+            Assert.AreEqual(DisconnectReason.ProtocolError, observedReason,
+                "OnDisconnected must be raised with ProtocolError.");
+        }
+
+        [Test]
+        [Description("Receiving a legacy HandshakeAck while already Disconnected must be a no-op.")]
+        public void LegacyHandshakeAck_WhileDisconnected_IsNoOp()
+        {
+            // State starts as Disconnected; the guard `if (_state != Connecting) return;`
+            // must prevent any transition.
+            Assert.AreEqual(NetworkState.Disconnected, _manager.State,
+                "Precondition: state must start Disconnected.");
+
+            Assert.DoesNotThrow(() => _manager.SimulateLegacyHandshakeAckForTests());
+
+            Assert.AreEqual(NetworkState.Disconnected, _manager.State,
+                "State must remain Disconnected when HandshakeAck arrives out-of-order.");
+        }
     }
 }

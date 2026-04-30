@@ -1266,6 +1266,22 @@ namespace RTMPE.Core
             _handshakeHandler = null;
             _sessionKeys?.Dispose();       // Zero session keys before GC can observe it
             _sessionKeys      = null;
+            // OnDestroy / OnApplicationQuit reach Cleanup directly without
+            // routing through ClearSessionData, so the HKDF-derived auxiliary
+            // keys must be zeroed here too — otherwise mid-session app quit
+            // or scene unload leaves the key bytes on the managed heap until
+            // the next GC cycle.  Match the explicit Array.Clear pattern
+            // used by ClearSessionData.
+            if (_ipMigrationKey != null)
+            {
+                Array.Clear(_ipMigrationKey, 0, _ipMigrationKey.Length);
+                _ipMigrationKey = null;
+            }
+            if (_sessionAckKey != null)
+            {
+                Array.Clear(_sessionAckKey, 0, _sessionAckKey.Length);
+                _sessionAckKey = null;
+            }
             _inboundReplayWindow?.Reset();
             // Detach scene manager BEFORE tearing down the network thread so
             // any in-flight SceneLoaded callbacks don't fire into a disposed manager.
@@ -1412,6 +1428,18 @@ namespace RTMPE.Core
                 var registry  = new NetworkObjectRegistry();
                 var ownership = new OwnershipManager(registry, this);
                 _spawnManager = new SpawnManager(registry, ownership, this);
+
+                // Wire the static EnhancedRpcVerifier hooks to the live
+                // session state.  The default sender verifier accepts only
+                // the local session id (peer impersonation guard); the
+                // default object verifier requires the inbound objectId to
+                // resolve in the spawn registry.  Both hooks are torn down
+                // on Cleanup / ClearSessionData so a stale closure cannot
+                // outlive the manager that captured it.
+                RTMPE.Rpc.EnhancedRpcVerifier.SelfSessionIdProvider =
+                    () => _localPlayerId;
+                RTMPE.Rpc.EnhancedRpcVerifier.ObjectExistsVerifier =
+                    objectId => objectId != 0UL && registry.Get(objectId) != null;
 
                 // Use named-method delegates (not inline lambdas) so the
                 // delegate instances are not re-allocated per call to
@@ -1602,6 +1630,16 @@ namespace RTMPE.Core
             _handshakeHandler?.Dispose();
             _sessionKeys?.Dispose();
             _sessionKeys = null;
+
+            // Drop the previous session's replay-window bitmap.  The new
+            // session derives fresh keys whose nonce stream restarts at zero,
+            // so a stale bitmap from the previous session would block
+            // legitimate low-counter packets after the new SessionAck.
+            // OnChallenge re-allocates the window after key derivation; we
+            // null the field here so the receive path's strict null-reject
+            // remains the only way an AEAD frame can be observed before the
+            // new keys are in place.
+            _inboundReplayWindow = null;
 
             _handshakeHandler = new HandshakeHandler();
 
@@ -2420,6 +2458,14 @@ namespace RTMPE.Core
             // Fresh session keys imply a fresh inbound nonce stream — reuse
             // of an old window would falsely reject the first packet of the
             // new session because its counter starts back at zero.
+            //
+            // The window MUST be live before the first AEAD-decrypted packet
+            // is dispatched, so it is initialised here — immediately after
+            // key derivation, before HandshakeResponse is sent and therefore
+            // before any inbound frame can be sealed under the new keys.  The
+            // receive path treats a null window as a hard reject for any
+            // AEAD-bearing frame, so a missed initialisation cannot silently
+            // degrade into a no-op replay check.
             if (_inboundReplayWindow == null)
                 _inboundReplayWindow = new RTMPE.Crypto.Internal.ReplayWindow();
             else
@@ -3214,7 +3260,16 @@ namespace RTMPE.Core
                 return;
             }
 
-            _spawnManager.Ownership.ApplyOwnershipGrant(objectId, newOwner);
+            // The master-client and initial-assignment branches of
+            // IsOwnershipTransferAuthorized are server-attested by room state
+            // independent of the (peer-supplied) wire senderId, so the grant
+            // is applied directly.  The self-initiated branch must additionally
+            // match a tuple in the OwnershipManager's outstanding-request map
+            // — a peer that crafts a grant stamped with our session id is
+            // therefore rejected at the OwnershipManager boundary.
+            bool serverAttested = IsMasterClient
+                || string.IsNullOrEmpty(_spawnManager.Registry.Get(objectId)?.OwnerPlayerId);
+            _spawnManager.Ownership.ApplyOwnershipGrant(objectId, newOwner, serverAttested);
         }
 
         /// <summary>
@@ -3367,6 +3422,21 @@ namespace RTMPE.Core
 
         private void OnServerDisconnect(byte[] _)
         {
+            // Reject Disconnect packets that arrive before SessionAck has
+            // promoted the session to "established".  During key derivation
+            // the receive path is already accepting AEAD-decrypted frames
+            // (the session keys exist), but the application-visible session
+            // is not yet live; tearing down now would let a forged or
+            // mistimed Disconnect interrupt an in-progress handshake and
+            // strand the client in Disconnecting/Disconnected with no
+            // session to recover.  Leave the in-flight handshake undisturbed.
+            if (!_sessionEstablished)
+            {
+                Debug.LogWarning(
+                    "[RTMPE] Ignoring Disconnect received before session establishment — " +
+                    "handshake is still in progress; will not tear down session keys.");
+                return;
+            }
             _networkThread?.Stop();
             ClearSessionData();
             TransitionTo(NetworkState.Disconnected, DisconnectReason.ServerRequest);
@@ -3780,6 +3850,13 @@ namespace RTMPE.Core
             System.Threading.Interlocked.Exchange(ref _lastInboundAppSequence, -1L);
             _roomManager?.ClearState();
             _spawnManager?.ClearAll();     // Destroy all spawned objects
+
+            // Detach the static EnhancedRpcVerifier hooks installed by
+            // RecreateRoomAndSpawnManagers so they cannot fire against the
+            // torn-down session (and so the captured registry / session-id
+            // closure is eligible for GC).
+            RTMPE.Rpc.EnhancedRpcVerifier.SelfSessionIdProvider = null;
+            RTMPE.Rpc.EnhancedRpcVerifier.ObjectExistsVerifier  = null;
             _handshakeHandler?.Dispose();  // Zero key material before GC can observe it
             _handshakeHandler = null;
             _sessionKeys?.Dispose();       // Zero session keys before GC can observe it
@@ -3920,6 +3997,26 @@ namespace RTMPE.Core
                 | (packet[PacketProtocol.OFFSET_PAYLOAD_LEN + 2] << 16)
                 | (packet[PacketProtocol.OFFSET_PAYLOAD_LEN + 3] << 24));
 
+            // Bound payload_len before any allocation.  The wire field is a
+            // 32-bit LE unsigned integer; a malformed or corrupted producer
+            // path could write a value that, cast to int, becomes negative
+            // (causing OverflowException in `new byte[(int)payloadLen]`) or
+            // demands a multi-gigabyte buffer.  Reject anything beyond the
+            // protocol cap (1 MiB) and anything that does not match the
+            // physical packet length so the cast is provably safe.
+            int maxPayload = RTMPE.Protocol.PacketBuilder.MaxPayloadBytes;
+            if (payloadLen > (uint)maxPayload
+                || payloadLen > (uint)(packet.Length - PacketProtocol.HEADER_SIZE))
+            {
+                Debug.LogError(
+                    $"[RTMPE] EncryptAndSend rejected packet: payload_len {payloadLen} " +
+                    $"exceeds protocol cap ({maxPayload}) or physical packet length " +
+                    $"({packet.Length - PacketProtocol.HEADER_SIZE}). Possible buffer " +
+                    "corruption or malformed builder output.");
+                return;
+            }
+            int payloadLenInt = checked((int)payloadLen);
+
             byte packetType = packet[PacketProtocol.OFFSET_TYPE];
             byte flags      = packet[PacketProtocol.OFFSET_FLAGS];
 
@@ -3929,11 +4026,11 @@ namespace RTMPE.Core
             // prefix (restored after decryption) and the AAD so the gateway
             // can verify it didn't change in transit.
             byte[] rawPayload = null;
-            if (payloadLen > 0)
+            if (payloadLenInt > 0)
             {
-                rawPayload = new byte[(int)payloadLen];
+                rawPayload = new byte[payloadLenInt];
                 Buffer.BlockCopy(packet, PacketProtocol.HEADER_SIZE,
-                                 rawPayload, 0, (int)payloadLen);
+                                 rawPayload, 0, payloadLenInt);
             }
 
             byte[] effectivePayload = rawPayload ?? Array.Empty<byte>();
@@ -4296,8 +4393,23 @@ namespace RTMPE.Core
             // bits with forged ciphertext that would fail Poly1305; doing it
             // after means only authenticated counters can move the window
             // head and only authenticated duplicates are rejected.
+            //
+            // A null window here is a state-machine integrity violation: the
+            // session-key derivation path (OnChallenge) MUST allocate the
+            // window before any AEAD-bearing frame can be observed.  If we
+            // got this far with _sessionKeys != null but _inboundReplayWindow
+            // == null, we have no way to enforce replay protection on this
+            // packet — reject rather than silently accept.
             var window = _inboundReplayWindow;
-            if (window != null && !window.Admit(nonceCounter))
+            if (window == null)
+            {
+                Debug.LogWarning(
+                    "[RTMPE] Dropped AEAD packet: inbound replay window is not initialised. " +
+                    "Session keys exist but the window allocation was missed — refusing the " +
+                    "frame to preserve replay-protection invariants.");
+                return null;
+            }
+            if (!window.Admit(nonceCounter))
             {
                 Debug.LogWarning(
                     "[RTMPE] Dropped packet: replayed or out-of-window inbound counter " +

@@ -362,10 +362,25 @@ namespace RTMPE.Core
                     return null;
                 }
 
+                // Two-phase publish (invariant: an object is never visible
+                // through _registry.Get() while still mid-initialisation).
+                //
+                // Phase 1 — finalise initialisation: wake the NetworkBehaviour
+                // and fire its user OnNetworkSpawn callbacks BEFORE the
+                // registry adopts it.  A re-entrant lookup from within
+                // OnNetworkSpawn (e.g. the user spawns a child object that
+                // calls _registry.Get(parentId)) therefore observes either
+                // "not yet registered" or "fully initialised" — never a
+                // half-initialised state.
+                //
+                // Phase 2 — atomic publish: register so subsequent inbound
+                // packets (variable updates, RPCs) can resolve the object.
+                // _prefabOfObject is updated alongside the registry slot to
+                // keep the lifecycle bookkeeping coupled.
                 nb.Initialize(objectId, ownerPlayerId ?? string.Empty);
+                nb.SetSpawned(true);
                 _registry.Register(nb);
                 _prefabOfObject[objectId] = prefabId;
-                nb.SetSpawned(true);
 
                 committed = true;
                 return nb;

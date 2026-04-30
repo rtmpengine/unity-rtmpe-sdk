@@ -40,6 +40,18 @@ namespace RTMPE.Core
         private readonly HashSet<uint> _outstanding = new HashSet<uint>();
         private readonly Dictionary<uint, long> _outstandingDeadlineMs = new Dictionary<uint, long>(16);
 
+        // Per-request expectation map: the (objectId, newOwnerPlayerId) the
+        // local SDK actually asked the gateway to apply.  ApplyOwnershipGrant
+        // accepts a self-initiated grant only when the inbound (objectId,
+        // newOwnerPlayerId) tuple matches one of these expectations — a peer
+        // that crafts a grant for an object the local SDK never requested
+        // is rejected client-side, not just at IsOwnershipTransferAuthorized
+        // (defence-in-depth).  Wire-format limitation: the gateway's
+        // OwnershipGrant broadcast does not echo the originating request_id,
+        // so correlation is performed by tuple match rather than ID match.
+        private readonly Dictionary<uint, (ulong ObjectId, string NewOwner)> _outstandingExpectations
+            = new Dictionary<uint, (ulong, string)>(16);
+
         // Ten seconds matches the worst-case RTT + server processing budget for
         // an ownership-transfer round trip.  Beyond that the response, if it
         // ever arrives, is too stale to be the original request's reply.
@@ -132,6 +144,7 @@ namespace RTMPE.Core
             // HandleOwnershipTransferResponse drop forged responses whose
             // request_id we never sent.
             uint requestId = AllocateOutstandingRequestId();
+            _outstandingExpectations[requestId] = (objectId, newOwnerPlayerId);
 
             var rpcPayload = RpcPacketBuilder.BuildTransferOwnership(
                 _networkManager.LocalPlayerId,
@@ -156,6 +169,7 @@ namespace RTMPE.Core
             if (_outstanding.Remove(requestId))
             {
                 _outstandingDeadlineMs.Remove(requestId);
+                _outstandingExpectations.Remove(requestId);
                 return true;
             }
             // Redacted: only the action is logged.  The id and remote endpoint
@@ -190,6 +204,7 @@ namespace RTMPE.Core
                 {
                     _outstanding.Remove(id);
                     _outstandingDeadlineMs.Remove(id);
+                    _outstandingExpectations.Remove(id);
                 }
             }
         }
@@ -290,6 +305,38 @@ namespace RTMPE.Core
         {
             _outstanding.Clear();
             _outstandingDeadlineMs.Clear();
+            _outstandingExpectations.Clear();
+        }
+
+        /// <summary>
+        /// Returns true when the local SDK has an outstanding ownership-
+        /// transfer request whose target tuple matches the inbound
+        /// <paramref name="objectId"/> / <paramref name="newOwnerPlayerId"/>
+        /// pair.  When it matches, the matching expectation is consumed so a
+        /// later replay of the same grant cannot pass twice.  Used by the
+        /// NetworkManager handler to authorise self-initiated grants
+        /// independent of the (peer-supplied) wire <c>senderId</c>.
+        /// </summary>
+        internal bool ConsumeMatchingExpectation(ulong objectId, string newOwnerPlayerId)
+        {
+            PruneExpiredOutstanding();
+            uint matchedId = 0;
+            bool found = false;
+            foreach (var kv in _outstandingExpectations)
+            {
+                if (kv.Value.ObjectId == objectId
+                    && string.Equals(kv.Value.NewOwner, newOwnerPlayerId, StringComparison.Ordinal))
+                {
+                    matchedId = kv.Key;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+            _outstanding.Remove(matchedId);
+            _outstandingDeadlineMs.Remove(matchedId);
+            _outstandingExpectations.Remove(matchedId);
+            return true;
         }
 
         /// <summary>
@@ -306,7 +353,22 @@ namespace RTMPE.Core
         /// </summary>
         /// <param name="objectId">Network object whose ownership changed.</param>
         /// <param name="newOwnerPlayerId">Room UUID of the new owner.</param>
-        public void ApplyOwnershipGrant(ulong objectId, string newOwnerPlayerId)
+        /// <param name="serverAttested">
+        /// Pass <see langword="true"/> ONLY when the grant came from a code
+        /// path that has independently verified server origin (e.g. the
+        /// master-client / initial-assignment branches of
+        /// <c>NetworkManager.IsOwnershipTransferAuthorized</c>).  When
+        /// <see langword="false"/>, the grant is admitted only if a
+        /// matching outstanding request was issued from this SDK (tuple
+        /// correlation).
+        ///
+       /// <para>Wire-format limitation: the gateway's broadcast does not
+        /// echo the originating <c>request_id</c>, so correlation is
+        /// performed by <c>(objectId, newOwnerPlayerId)</c> tuple match
+        /// rather than ID match.  Changing the wire format would require
+        /// a coordinated gateway-side parser update.</para>
+        /// </summary>
+        public void ApplyOwnershipGrant(ulong objectId, string newOwnerPlayerId, bool serverAttested)
         {
             var obj = _registry.Get(objectId);
             if (obj == null)
@@ -316,7 +378,31 @@ namespace RTMPE.Core
                 return;
             }
 
+            if (!serverAttested)
+            {
+                if (!ConsumeMatchingExpectation(objectId, newOwnerPlayerId))
+                {
+                    // Redacted: the offending objectId / newOwner are intentionally
+                    // not logged so a probe attacker cannot tune their forgery
+                    // attempts against the response stream.
+                    RtmpeLog.Warning(
+                        "[OwnershipManager] ApplyOwnershipGrant rejected: no matching outstanding request and grant is not server-attested.");
+                    return;
+                }
+            }
+
             obj.SetOwner(newOwnerPlayerId);
         }
+
+        /// <summary>
+        /// Backwards-compatible overload that defers to
+        /// <see cref="ApplyOwnershipGrant(ulong, string, bool)"/> with
+        /// <c>serverAttested = false</c>.  Existing call sites that relied
+        /// on the prior unconditional behaviour MUST migrate to the
+        /// explicit overload — passing <c>true</c> only when the caller
+        /// has independently verified the grant's provenance.
+        /// </summary>
+        public void ApplyOwnershipGrant(ulong objectId, string newOwnerPlayerId)
+            => ApplyOwnershipGrant(objectId, newOwnerPlayerId, serverAttested: false);
     }
 }

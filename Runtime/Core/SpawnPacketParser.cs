@@ -62,13 +62,16 @@ namespace RTMPE.Core
             int o = 0;
             uint prefabId = ReadU32LE(payload, ref o);
             ulong objectId = ReadU64LE(payload, ref o);
+            // Zero is never a valid network object ID.
+            if (objectId == 0) return false;
             ushort ownerLen = ReadU16LE(payload, ref o);
 
-            // Cap owner length (defense-in-depth) BEFORE the bounds
-            // arithmetic so a ushort.MaxValue-shaped attacker value cannot
-            // overflow `o + ownerLen + 28` into a negative int that
-            // bypasses the additive-form check.
-            if (ownerLen > 256)
+            // Cap owner length before the bounds arithmetic so a ushort.MaxValue-
+            // shaped attacker value cannot overflow `o + ownerLen + 28` into a
+            // negative int that bypasses the additive-form check.
+            // 128 bytes is generous for any UUID (max 36 chars) plus margin;
+            // values above this are a protocol violation, not just a large owner.
+            if (ownerLen > 128)
                 return false;
 
             // Subtraction-form bounds: the owner string plus the seven
@@ -162,12 +165,16 @@ namespace RTMPE.Core
         public static bool TryParseDespawn(byte[] payload, out ulong objectId)
         {
             objectId = 0;
-            if (payload == null || payload.Length < 8)
+            // Exactly 8 bytes: the u64 object ID and nothing else.
+            // Trailing bytes are a protocol-drift / smuggling signal (same
+            // principle as TryParseSpawn's trailing-residue check).
+            if (payload == null || payload.Length != 8)
                 return false;
 
             int o = 0;
             objectId = ReadU64LE(payload, ref o);
-            return true;
+            // Zero is never a valid network object ID.
+            return objectId != 0;
         }
 
         // ── LE readers ─────────────────────────────────────────────────────────

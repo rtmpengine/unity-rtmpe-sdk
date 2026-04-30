@@ -43,7 +43,14 @@ namespace RTMPE.Core
         // capacity-bounded set ordered by gameplay sequence so the head can
         // be peeled in O(log n) and adversarial worst-case insertion remains
         // bounded by the cap.
-        private readonly SortedDictionary<uint, byte[]> _pending = new SortedDictionary<uint, byte[]>();
+        //
+        // The dictionary must use RFC 1982 modular order, not numeric order.
+        // Numeric order places 0x00000001 before 0xFFFFFFFE, so at wraparound
+        // DrainContiguous reads the wrong head and permanently blocks the
+        // sequences that crossed zero.  The signed cast of (a - b) resolves
+        // wraparound correctly and matches the arithmetic in DrainContiguous.
+        private readonly SortedDictionary<uint, byte[]> _pending =
+            new SortedDictionary<uint, byte[]>(SequenceComparer.Instance);
 
         private readonly int _capacity;
 
@@ -179,6 +186,19 @@ namespace RTMPE.Core
             _lastDelivered         = 0u;
             _hasDelivered          = false;
             _duplicatePendingCount = 0;
+        }
+
+        // ── Sequence ordering ────────────────────────────────────────────
+
+        // Imposes RFC 1982 serial-number order on 32-bit gameplay sequences.
+        // Casting the unsigned difference to int makes the sign encode which
+        // operand is ahead in the modular sequence space, handling wraparound
+        // through 0 without any special-case branches.
+        private sealed class SequenceComparer : IComparer<uint>
+        {
+            public static readonly SequenceComparer Instance = new SequenceComparer();
+            private SequenceComparer() { }
+            public int Compare(uint a, uint b) => unchecked((int)(a - b));
         }
 
         // ── Internals ────────────────────────────────────────────────────

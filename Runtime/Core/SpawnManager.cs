@@ -265,6 +265,10 @@ namespace RTMPE.Core
             Vector3 position,
             Quaternion rotation)
         {
+            // Zero is never a valid network object ID (defense-in-depth;
+            // the wire parser already rejects it before reaching this path).
+            if (objectId == 0) return null;
+
             // Out-of-order Despawn-before-Spawn: if a despawn for this id
             // landed first (still inside its TTL), the object is logically
             // dead — creating it now would produce a ghost.  Consume the

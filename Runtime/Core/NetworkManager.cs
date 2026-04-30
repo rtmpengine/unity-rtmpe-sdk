@@ -2118,9 +2118,11 @@ namespace RTMPE.Core
             //
             // Pre-handshake packets (Challenge, HandshakeAck) arrive plaintext by
             // protocol — the SDK has no key material yet.  Post-handshake packets
-            // — including SessionAck, which carries session-binding identifiers
-            // (crypto_id, JWT, reconnect token) — MUST arrive encrypted; the
-            // RequiresEncryption check below enforces that.
+            // carry session-bound semantics and must be AEAD-protected; the
+            // `requiresEnc` gate below enforces that.  SessionAck is the one
+            // exception: its bootstrap encryption is opt-in via
+            // `NetworkSettings.ExpectEncryptedSessionAck`, so the gate consults
+            // that setting before deciding whether plaintext is acceptable.
             bool wasEncrypted = (data[PacketProtocol.OFFSET_FLAGS]
                                  & (byte)PacketFlags.Encrypted) != 0;
             int packetLength = length;
@@ -2186,7 +2188,16 @@ namespace RTMPE.Core
 
             var packetType = (PacketType)data[PacketProtocol.OFFSET_TYPE];
 
-            if (!wasEncrypted && RequiresEncryption(packetType))
+            // SessionAck is the bootstrap envelope and its encryption is
+            // opt-in: gateways that have not enabled `RTMPE_ENCRYPT_SESSION_ACK`
+            // ship it in the clear, and the SDK customer signs up for the
+            // encrypted variant by setting `ExpectEncryptedSessionAck=true`.
+            // The static `RequiresEncryption` table cannot see settings, so
+            // we override SessionAck's verdict here based on the live config.
+            bool requiresEnc = packetType == PacketType.SessionAck
+                ? (_settings != null && _settings.ExpectEncryptedSessionAck)
+                : RequiresEncryption(packetType);
+            if (!wasEncrypted && requiresEnc)
             {
                 if (ShouldWarn(ref _lastMissingEncryptionWarnTicks))
                     Debug.LogWarning(

@@ -121,6 +121,44 @@ namespace RTMPE.Crypto
             string host,
             int port)
         {
+            // Backwards-compatible default: first-use capture is permitted.
+            // Callers that want to refuse first-flight TOFU MUST opt in via
+            // the overload below.
+            return PreparePin(mode, configuredPin, store, host, port,
+                requireFirstUseProvisioned: false);
+        }
+
+        /// <summary>
+        /// Decide which pin (if any) to enforce for the upcoming Challenge,
+        /// with explicit control over first-flight TOFU capture.
+        /// </summary>
+        /// <param name="mode">Configured pinning mode.</param>
+        /// <param name="configuredPin">Operator-embedded pin (32 bytes), or null.</param>
+        /// <param name="store">Pin storage (used only for TOFU mode).</param>
+        /// <param name="host">Server host (raw, as configured).</param>
+        /// <param name="port">Server port.</param>
+        /// <param name="requireFirstUseProvisioned">
+        /// When <see langword="true"/>, refuse to perform first-flight TOFU
+        /// capture against an unseen endpoint.  TOFU's accepted-risk gap is
+        /// the very first connect to a new <c>host:port</c>: a network-
+        /// positioned attacker on that single flight can substitute their
+        /// Ed25519 key and have it persisted as the durable pin, defeating
+        /// every subsequent connect's pinning check.  Setting this flag
+        /// closes that gap by mandating that the pin be present BEFORE the
+        /// SDK ever opens a socket to the endpoint — the pin must arrive via
+        /// a trusted side-channel (signed bootstrap config, MDM push, staged
+        /// install, etc.) and be written into the <see cref="IServerKeyPinStore"/>
+        /// out-of-band.  An operator-supplied <paramref name="configuredPin"/>
+        /// is still honoured because it is itself a pre-provisioned pin.
+        /// </param>
+        public static PinResolution PreparePin(
+            ServerPinningMode mode,
+            byte[] configuredPin,
+            IServerKeyPinStore store,
+            string host,
+            int port,
+            bool requireFirstUseProvisioned)
+        {
             var endpoint = CanonicalEndpoint(host, port);
 
             switch (mode)
@@ -142,6 +180,15 @@ namespace RTMPE.Crypto
                     var persisted = store?.Load(endpoint);
                     if (persisted != null && persisted.Length == 32)
                         return new PinResolution(PinDecision.ProceedWithPin, persisted, endpoint);
+
+                    // No pin known for this endpoint.  Under the hardened
+                    // contract, refuse rather than capturing whatever the
+                    // network delivers on this first flight — the pin MUST
+                    // arrive via a trusted out-of-band channel.  The refuse
+                    // verdict reuses RefuseStrictNoPin because the operator-
+                    // visible remediation is identical: provision a pin.
+                    if (requireFirstUseProvisioned)
+                        return new PinResolution(PinDecision.RefuseStrictNoPin, null, endpoint);
 
                     return new PinResolution(PinDecision.ProceedCaptureFirstUse, null, endpoint);
 

@@ -515,12 +515,16 @@ namespace RTMPE.Tests
             ch.TryRegisterOutbound(new byte[]{1}, 0f, out uint seq);
 
             var dropped = new List<uint>();
-            // Drive the clock forward in big steps so the RTO timer expires
-            // every Tick.  Register established attempts=1 (initial send by
-            // caller); each subsequent Tick either retransmits or drops.
-            ch.Tick(0.10f, (_, __) => { }, dropped.Add);  // attempts: 1 → 2 (retransmit)
-            ch.Tick(0.20f, (_, __) => { }, dropped.Add);  // attempts: 2 → 3 (retransmit)
-            ch.Tick(0.30f, (_, __) => { }, dropped.Add);  // 3 >= MaxAttempts → drop
+            // Drop semantics (strict `>` cap in ReliableChannel.Tick):
+            // TryRegisterOutbound seeds Attempts=1 (initial transmit) and
+            // each Tick that resends post-increments.  The drop branch
+            // fires when Attempts > MaxAttempts on entry, so MaxAttempts=N
+            // yields exactly N retransmits and the drop fires on the
+            // (N+1)-th eligible tick.  MaxAttempts=3 → 3 resends, then drop.
+            ch.Tick(0.10f, (_, __) => { }, dropped.Add);  // resend, Attempts: 1 → 2
+            ch.Tick(0.20f, (_, __) => { }, dropped.Add);  // resend, Attempts: 2 → 3
+            ch.Tick(0.30f, (_, __) => { }, dropped.Add);  // resend, Attempts: 3 → 4
+            ch.Tick(0.40f, (_, __) => { }, dropped.Add);  // 4 > MaxAttempts(3) → drop
 
             Assert.AreEqual(1, dropped.Count);
             Assert.AreEqual(seq, dropped[0]);

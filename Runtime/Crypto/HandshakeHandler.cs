@@ -320,7 +320,7 @@ namespace RTMPE.Crypto
         /// Complete the X25519 ECDH and derive directional session keys + IP migration key
         /// via HKDF-SHA256.
         ///
-       /// Must be called after <see cref="ValidateChallenge"/> succeeds.
+        /// Must be called after <see cref="ValidateChallenge"/> succeeds.
         /// Returns <see langword="null"/> if the ECDH shared secret is degenerate (all-zero).
         /// </summary>
         /// <param name="ipMigrationKey">
@@ -331,7 +331,27 @@ namespace RTMPE.Crypto
         /// </param>
         public SessionKeys DeriveSessionKeys(out byte[] ipMigrationKey)
         {
+            return DeriveSessionKeys(out ipMigrationKey, out _);
+        }
+
+        /// <summary>
+        /// Variant of <see cref="DeriveSessionKeys(out byte[])"/> that additionally
+        /// returns a 32-byte bootstrap AEAD key derived with HKDF info suffix
+        /// <c>\x03</c>.  This key is used exclusively to decrypt the
+        /// <c>SessionAck</c> payload when the gateway is configured with
+        /// <c>RTMPE_ENCRYPT_SESSION_ACK=true</c> and the SDK opts in via
+        /// <see cref="Core.NetworkSettings.ExpectEncryptedSessionAck"/>.  The
+        /// SessionAck nonce is twelve zero bytes and the AAD is exactly
+        /// <c>[0x08, 0x02]</c> (<see cref="Core.PacketType.SessionAck"/>,
+        /// <see cref="Core.PacketFlags.Encrypted"/>) — see the gateway's
+        /// <c>encrypt_session_ack()</c>.
+        /// </summary>
+        /// <param name="ipMigrationKey">Receives the 32-byte IP-migration HMAC key (info suffix <c>\x02</c>).</param>
+        /// <param name="sessionAckKey">Receives the 32-byte SessionAck bootstrap AEAD key (info suffix <c>\x03</c>).</param>
+        public SessionKeys DeriveSessionKeys(out byte[] ipMigrationKey, out byte[] sessionAckKey)
+        {
             ipMigrationKey = null;
+            sessionAckKey  = null;
 
             if (_serverEphemeralPub == null)
                 throw new InvalidOperationException(
@@ -349,6 +369,7 @@ namespace RTMPE.Crypto
             byte[] infoInit      = null;
             byte[] infoResp      = null;
             byte[] infoMig       = null;
+            byte[] infoAck       = null;
             bool   committed     = false;
             try
             {
@@ -387,6 +408,16 @@ namespace RTMPE.Crypto
                 infoMig[info.Length] = 0x02;
                 ipMigrationKey = HkdfSha256.Expand(prk, infoMig, 32);
 
+                // info+\x03 → SessionAck bootstrap AEAD key.  Used exclusively
+                // to decrypt the SessionAck payload when the gateway is
+                // configured with RTMPE_ENCRYPT_SESSION_ACK=true; never used
+                // for normal session traffic, so it is independent of the
+                // directional encrypt/decrypt assignment above.
+                infoAck = new byte[info.Length + 1];
+                Buffer.BlockCopy(info, 0, infoAck, 0, info.Length);
+                infoAck[info.Length] = 0x03;
+                sessionAckKey = HkdfSha256.Expand(prk, infoAck, 32);
+
                 // Assign encrypt/decrypt based on initiator role (mirrors the Rust gateway logic).
                 // SessionKeys takes ownership of the two 32-byte arrays at this
                 // point — set `committed` so the failure-path in `finally`
@@ -407,6 +438,7 @@ namespace RTMPE.Crypto
                 if (infoInit != null) Array.Clear(infoInit, 0, infoInit.Length);
                 if (infoResp != null) Array.Clear(infoResp, 0, infoResp.Length);
                 if (infoMig  != null) Array.Clear(infoMig,  0, infoMig.Length);
+                if (infoAck  != null) Array.Clear(infoAck,  0, infoAck.Length);
                 // If an exception interrupted derivation after one or more
                 // directional keys were expanded, the caller never received
                 // them and they must be wiped from memory.  Once `committed`
@@ -420,6 +452,11 @@ namespace RTMPE.Crypto
                     {
                         Array.Clear(ipMigrationKey, 0, ipMigrationKey.Length);
                         ipMigrationKey = null;
+                    }
+                    if (sessionAckKey != null)
+                    {
+                        Array.Clear(sessionAckKey, 0, sessionAckKey.Length);
+                        sessionAckKey = null;
                     }
                 }
             }

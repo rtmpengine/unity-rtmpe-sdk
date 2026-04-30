@@ -173,6 +173,16 @@ namespace RTMPE.Core
         public int InFlightCount => _outboundCount;
 
         /// <summary>
+        /// Allocate the next outbound ARQ sequence number without registering
+        /// a retransmit entry.  Used by the wire-emission path to stamp the
+        /// 4-byte sub-header that appears under <see cref="PacketFlags.Reliable"/>
+        /// when <see cref="Core.NetworkSettings.EmitArqSequence"/> is enabled.
+        /// Call <see cref="TryRegisterOutbound"/> instead when the caller also
+        /// needs the retransmit timer wired.
+        /// </summary>
+        public uint AllocateOutboundSequence() => _nextOutboundSeq++;
+
+        /// <summary>
         /// Allocate the next outbound sequence number and register
         /// <paramref name="payload"/> in the retransmit table.  The caller
         /// transmits the frame immediately and supplies the current monotonic

@@ -327,6 +327,66 @@ namespace RTMPE.Core
                  "session roster (e.g. server-of-record relays).")]
         public bool requireLegacyRpcSender = true;
 
+        // ── Forward-compat protocol toggles ────────────────────────────────────
+        //
+        // The three toggles below gate features whose gateway counterpart is
+        // either in flight or behind an environment variable.  Each toggle is
+        // OFF by default so existing deployments are unaffected; enabling any
+        // of them on the SDK without the matching gateway support causes
+        // handshake failure or AEAD authentication failure (a hostile or
+        // mismatched gateway cannot abuse a customer who has not opted in).
+        //
+        // Customers MUST flip these in lock-step with the gateway operator —
+        // there is no negotiation handshake; the wire format diverges silently
+        // when only one side opts in.
+
+        [Header("Forward-compat Protocol")]
+        [SerializeField]
+        [Tooltip("If true, the SDK expects the gateway to encrypt SessionAck under " +
+                 "the ECDH-derived key. Must match the gateway's RTMPE_ENCRYPT_SESSION_ACK " +
+                 "setting; mismatched configurations cause handshake failure.")]
+        private bool _expectEncryptedSessionAck;
+
+        /// <summary>
+        /// When true, the SDK decrypts the inbound SessionAck payload under the
+        /// ECDH-derived bootstrap key (HKDF info suffix <c>\x03</c>).  Must be
+        /// flipped together with the gateway's <c>RTMPE_ENCRYPT_SESSION_ACK</c>
+        /// environment variable; otherwise the handshake terminates with an
+        /// AEAD-authentication failure.
+        /// </summary>
+        public bool ExpectEncryptedSessionAck => _expectEncryptedSessionAck;
+
+        [SerializeField]
+        [Tooltip("If true, the SDK emits the 4-byte ARQ sequence sub-header when " +
+                 "FLAG_RELIABLE is set. Requires gateway support; activate together.")]
+        private bool _emitArqSequence;
+
+        /// <summary>
+        /// When true, every outbound packet that carries
+        /// <see cref="PacketFlags.Reliable"/> has its 4-byte ARQ sequence
+        /// inserted between the 13-byte fixed header and the encrypted
+        /// payload, in little-endian.  The gateway must consume the sub-header
+        /// from the same offset; if only one side opts in, AEAD AAD will not
+        /// match and packets will be dropped at the receiver.
+        /// </summary>
+        public bool EmitArqSequence => _emitArqSequence;
+
+        [SerializeField]
+        [Tooltip("If true, the SDK emits the 4-byte gameplay_seq sub-header when " +
+                 "FLAG_GAMEPLAY_ORDERED is set on an outbound packet. Requires gateway " +
+                 "support; activate together.")]
+        private bool _emitGameplaySequencePrefix;
+
+        /// <summary>
+        /// When true, every outbound packet carrying
+        /// <see cref="PacketFlags.GameplayOrdered"/> has the 4-byte gameplay
+        /// sequence (LE u32) emitted on the wire by
+        /// <see cref="GameplaySequencePrefix"/> before the encrypted payload.
+        /// The gateway side skips the same sub-header when the flag bit is
+        /// observed.
+        /// </summary>
+        public bool EmitGameplaySequencePrefix => _emitGameplaySequencePrefix;
+
         // ── Crypto ─────────────────────────────────────────────────────────────
 
         [Header("Crypto")]

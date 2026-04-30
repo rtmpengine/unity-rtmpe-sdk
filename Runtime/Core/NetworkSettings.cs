@@ -474,6 +474,19 @@ namespace RTMPE.Core
             "outer transport (e.g. mTLS) authenticates the server independently.")]
         public ServerPinningMode serverPinningMode = ServerPinningMode.Strict;
 
+        [Tooltip(
+            "Hardens TrustOnFirstUse against the documented first-flight MITM gap.\n\n" +
+            "TOFU's threat model accepts that the very first connect to a new endpoint " +
+            "trusts whatever Ed25519 key the network delivers — a network-positioned " +
+            "attacker on that flight can substitute their own key and have it persisted " +
+            "as the durable pin.  When this setting is TRUE, the SDK refuses to capture " +
+            "an unseen endpoint: the pin MUST already exist in the pin store " +
+            "(pre-provisioned via the IServerKeyPinStore API at first launch from a " +
+            "trusted side-channel — staged install, MDM push, signed bootstrap config, " +
+            "etc.) or the handshake is rejected.  Default is FALSE to preserve the " +
+            "compatibility contract for projects already relying on first-flight TOFU.")]
+        public bool requireFirstUseProvisioned = false;
+
         // ── Derived ──────────────────────────────────────────────────────────────
 
         /// <summary>Tick interval in seconds (<c>1 / tickRate</c>).</summary>

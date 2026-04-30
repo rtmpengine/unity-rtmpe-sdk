@@ -2503,15 +2503,19 @@ namespace RTMPE.Core
                 configuredPin,
                 PinStore,
                 _settings != null ? _settings.serverHost : "",
-                _settings != null ? _settings.serverPort : 0);
+                _settings != null ? _settings.serverPort : 0,
+                requireFirstUseProvisioned:
+                    _settings != null && _settings.requireFirstUseProvisioned);
 
             switch (resolution.Decision)
             {
                 case PinDecision.RefuseStrictNoPin:
                     Debug.LogError(
-                        "[RTMPE] Server not pinned and TOFU disabled — set " +
-                        "NetworkSettings.pinnedServerPublicKeyHex or change " +
-                        "serverPinningMode to TrustOnFirstUse. Refusing handshake.");
+                        "[RTMPE] Server not pinned — refusing handshake.  Either set " +
+                        "NetworkSettings.pinnedServerPublicKeyHex (Strict), pre-provision a " +
+                        "pin via IServerKeyPinStore (TrustOnFirstUse + " +
+                        "requireFirstUseProvisioned), or relax requireFirstUseProvisioned " +
+                        "if first-flight TOFU capture is acceptable for this deployment.");
                     return;
 
                 case PinDecision.ProceedUnpinned:
@@ -4511,23 +4515,59 @@ namespace RTMPE.Core
                 (byte)PacketFlags.Encrypted,
             };
             byte[] nonce = new byte[12]; // all zeros — fixed bootstrap nonce
+            // The all-zero bootstrap nonce is safe ONLY because the AEAD key is
+            // unique per session: it is HKDF-derived from a fresh ECDH shared
+            // secret negotiated during the current handshake, and the key is
+            // single-use (scrubbed below after a definitive verdict).  Re-using
+            // a (key, nonce) pair under ChaCha20-Poly1305 is catastrophic, so a
+            // DEBUG-time guard verifies the key is not the all-zero sentinel —
+            // an all-zero key would indicate that derivation never ran or
+            // produced no output, rather than a fresh ECDH product.  The guard
+            // compiles out of release builds so the production hot path is
+            // unaffected.
+#if DEBUG || UNITY_EDITOR
+            {
+                bool keyAllZero = true;
+                for (int i = 0; i < _sessionAckKey.Length; i++)
+                {
+                    if (_sessionAckKey[i] != 0) { keyAllZero = false; break; }
+                }
+                System.Diagnostics.Debug.Assert(
+                    !keyAllZero,
+                    "[RTMPE] SessionAck bootstrap key is all-zero; ECDH key " +
+                    "derivation is broken. The all-zero nonce is only safe " +
+                    "when the per-session key is unique.");
+            }
+#endif
 
             byte[] plaintext;
+            bool openThrew = false;
             try
             {
                 plaintext = ChaCha20Poly1305Impl.Open(_sessionAckKey, nonce, ciphertext, aad);
             }
             catch
             {
-                return null;
+                plaintext = null;
+                openThrew = true;
             }
-            if (plaintext == null) return null;
 
-            // Single-use bootstrap key: scrub immediately after a successful open
-            // so the secret does not linger in memory for the rest of the session.
-            // A memory-dump attacker mid-game must find nothing here to recover.
+            // Bootstrap key lifetime invariant: the SessionAck AEAD key is a
+            // one-shot secret derived during the handshake.  It MUST be wiped
+            // as soon as we have a definitive verdict on the bootstrap frame —
+            // success OR authentication failure.  An attacker who can flood
+            // forged ciphertext at the SDK socket would otherwise hold the key
+            // resident in managed memory indefinitely (each forged packet only
+            // returns null on auth-fail without scrubbing), broadening the
+            // window for a memory-dump attacker on the same host to recover
+            // it.  Failing closed here costs at most a single legitimate
+            // SessionAck retransmit (the gateway-driven handshake timeout
+            // already tears the connection down on bootstrap failure), and is
+            // the documented bootstrap-once contract.
             Array.Clear(_sessionAckKey, 0, _sessionAckKey.Length);
             _sessionAckKey = null;
+
+            if (openThrew || plaintext == null) return null;
 
             // Reassemble: header (with FLAG_ENCRYPTED stripped, payload_len
             // adjusted) followed by the decrypted plaintext.  Downstream

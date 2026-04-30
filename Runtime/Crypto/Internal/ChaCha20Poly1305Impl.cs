@@ -53,6 +53,23 @@ namespace RTMPE.Crypto.Internal
     /// <summary>
     /// ChaCha20-Poly1305 AEAD (RFC 8439) encapsulated in a static class.
     /// </summary>
+    /// <remarks>
+    /// <para><b>Side-channel disclosure.</b>  The Poly1305 inner loop uses
+    /// <see cref="System.Numerics.BigInteger"/> for 130-bit modular arithmetic.
+    /// The .NET runtime does NOT guarantee constant-time behaviour for
+    /// <see cref="System.Numerics.BigInteger"/> operations or array indexing,
+    /// so an attacker who can run code on the same host as the SDK and measure
+    /// timing/cache effects with sufficient precision could in principle
+    /// recover key material from observed Poly1305 evaluations.</para>
+    /// <para>This is an <b>accepted risk</b> for the game-networking threat
+    /// model — side-channel attacks require local code execution on the
+    /// player's own machine, which the player already controls; the only
+    /// secret recoverable that way is the player's own session key.  Network-
+    /// path attackers (the in-scope adversary) cannot exploit this.  Migrating
+    /// to a hardware AEAD (e.g. <c>System.Security.Cryptography.AesGcm</c>) is
+    /// blocked by the IL2CPP / .NET Standard 2.1 floor that Unity targets
+    /// require.  See the file-header threat model for the full rationale.</para>
+    /// </remarks>
     internal static class ChaCha20Poly1305Impl
     {
         // ── ChaCha20 constants ("expand 32-byte k") ──────────────────────────

@@ -389,10 +389,11 @@ namespace RTMPE.Crypto
                 // HKDF-Extract — single PRK for all three expansions.
                 prk = HkdfSha256.Extract(HkdfSalt, sharedSecret);
 
-                // HKDF-Expand × 3:
+                // HKDF-Expand × 4:
                 //  info+\x00 → initiator AEAD key
                 //  info+\x01 → responder AEAD key
                 //  info+\x02 → IP migration HMAC key (N-8)
+                //  info+\x03 → SessionAck bootstrap AEAD key (derived below)
                 infoInit = new byte[info.Length + 1];
                 Buffer.BlockCopy(info, 0, infoInit, 0, info.Length);
                 infoInit[info.Length] = 0x00;

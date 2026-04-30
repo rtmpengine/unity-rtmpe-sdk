@@ -4087,7 +4087,7 @@ namespace RTMPE.Core
         /// <summary>
         /// Decrypts an inbound packet that has <c>FLAG_ENCRYPTED</c> set.
         ///
-       /// <para>Reverses the transformations applied by the gateway's
+        /// <para>Reverses the transformations applied by the gateway's
         /// <c>encrypt_outbound()</c>:</para>
         /// <list type="number">
         ///  <item>Reconstructs the 12-byte nonce from <c>header.sequence</c> (the nonce
@@ -4102,7 +4102,7 @@ namespace RTMPE.Core
         ///        <c>FLAG_ENCRYPTED</c>, corrected <c>payload_len</c>.</item>
         /// </list>
         ///
-       /// <returns>
+        /// <returns>
         ///  The decrypted packet, or <see langword="null"/> on MAC failure, missing
         ///  session keys, or a malformed input — the caller must drop the packet silently.
         /// </returns>
@@ -4206,27 +4206,36 @@ namespace RTMPE.Core
             byte packetType = data[PacketProtocol.OFFSET_TYPE];
             byte flags      = data[PacketProtocol.OFFSET_FLAGS];
 
-            // ── 2. Detect optional 4-byte application-sequence prefix ────────────
-            // FLAG_APP_SEQUENCE is set when the sender layered an application
-            // sequence into the AAD.  The 4-byte sequence sits between the
-            // header and the ciphertext on the wire.  When the flag is absent
-            // the packet uses the legacy AAD shape and the prefix is skipped —
-            // a peer that disabled the toggle (or a gateway that strips the
-            // bit) is still decoded correctly.
-            bool hasAppSeq = (flags & (byte)PacketFlags.AppSequence) != 0;
+            // ── 2. Detect optional plaintext sub-header prefixes ─────────────────
+            // The wire layout post-header (matching the gateway's encrypt_outbound):
+            //   [arq_seq:4 LE]      iff FLAG_RELIABLE        (0x04)
+            //   [app_seq:4 LE]      iff FLAG_APP_SEQUENCE    (0x20)
+            //   [gameplay_seq:4 LE] iff FLAG_GAMEPLAY_ORDERED (0x10)
+            //   [AEAD ciphertext + Poly1305 tag]
+            //
+            // Only app_seq is bound into the AAD (matching the gateway's
+            // build_aad).  arq_seq and gameplay_seq are plaintext metadata
+            // ahead of the ciphertext — read for offset, ignored for value.
+            bool hasArq      = (flags & (byte)PacketFlags.Reliable)        != 0;
+            bool hasAppSeq   = (flags & (byte)PacketFlags.AppSequence)     != 0;
+            bool hasGameplay = (flags & (byte)PacketFlags.GameplayOrdered) != 0;
+
+            int subHeaderBytes = (hasArq      ? 4 : 0)
+                               + (hasAppSeq   ? 4 : 0)
+                               + (hasGameplay ? 4 : 0);
+
+            if (length < PacketProtocol.HEADER_SIZE + subHeaderBytes + 4 + 16)
+                return null; // truncated: sub-headers + SEQ prefix + tag minimum
+
             uint inboundAppSeq = 0u;
-            int  appSeqPrefixBytes = 0;
             if (hasAppSeq)
             {
-                if (length < PacketProtocol.HEADER_SIZE + 4 + 4 + 16)
-                    return null; // truncated: app-seq prefix + SEQ prefix + tag minimum
-                int o = PacketProtocol.HEADER_SIZE;
+                int o = PacketProtocol.HEADER_SIZE + (hasArq ? 4 : 0);
                 inboundAppSeq = (uint)(
                       data[o]
                     | (data[o + 1] << 8)
                     | (data[o + 2] << 16)
                     | (data[o + 3] << 24));
-                appSeqPrefixBytes = 4;
             }
 
             // ── 3. Build AAD = [packet_type, flags & ~FLAG_ENCRYPTED] (+app_seq) ─
@@ -4251,14 +4260,14 @@ namespace RTMPE.Core
             // ── 4. Build 12-byte nonce ───────────────────────────────────────────
             var nonce = BuildAeadNonce(nonceCounter, _cryptoId);
 
-            // ── 5. Extract ciphertext (skip header + optional app-seq prefix) ────
+            // ── 5. Extract ciphertext (skip header + every sub-header prefix) ────
             // Use the explicit <c>length</c> argument — the rented buffer's
             // physical .Length may be larger than the meaningful packet.
-            int ctLen = length - PacketProtocol.HEADER_SIZE - appSeqPrefixBytes;
+            int ctLen = length - PacketProtocol.HEADER_SIZE - subHeaderBytes;
             if (ctLen < 16) return null; // ciphertext must at least carry the Poly1305 tag
             var ciphertext = new byte[ctLen];
             Buffer.BlockCopy(data,
-                             PacketProtocol.HEADER_SIZE + appSeqPrefixBytes,
+                             PacketProtocol.HEADER_SIZE + subHeaderBytes,
                              ciphertext, 0, ctLen);
 
             // ── 6. Open: decrypt + verify Poly1305 tag ───────────────────────────

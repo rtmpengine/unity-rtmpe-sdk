@@ -822,6 +822,55 @@ namespace RTMPE.Tests
         }
 
         // ══════════════════════════════════════════════════════════════════════
+        // ── H-031 — registry publication ordering ─────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+        //
+        // Re-entrant access from OnNetworkSpawn must NOT observe a half-
+        // initialised object via _registry.Get(); SetSpawned(true) finalises
+        // initialisation and only then is the object atomically published
+        // through Register.
+
+        private sealed class RegistryProbeNB : NetworkBehaviour
+        {
+            public NetworkObjectRegistry ProbeRegistry;
+            public NetworkBehaviour       ObservedFromGet;
+
+            protected override void OnNetworkSpawn()
+            {
+                if (ProbeRegistry != null)
+                    ObservedFromGet = ProbeRegistry.Get(NetworkObjectId);
+            }
+        }
+
+        [Test]
+        [Description("Re-entrant Registry.Get from OnNetworkSpawn must not observe the spawning object until publication completes.")]
+        public void Spawn_ReEntrantRegistryGet_DoesNotObserveHalfInitialisedObject()
+        {
+            var probePrefab = new GameObject("ProbePrefab");
+            probePrefab.AddComponent<RegistryProbeNB>().ProbeRegistry = _registry;
+            _created.Add(probePrefab);
+
+            const uint probePrefabId = 99;
+            _spawnManager.RegisterPrefab(probePrefabId, probePrefab);
+
+            var nb = (RegistryProbeNB)_spawnManager.Spawn(
+                probePrefabId, Vector3.zero, Quaternion.identity, "owner-1");
+            _created.Add(nb.gameObject);
+
+            // The OnNetworkSpawn callback ran during SetSpawned(true), BEFORE
+            // _registry.Register completed.  The probe therefore observed null
+            // — proving that user callbacks cannot reach a half-initialised
+            // object via the registry.
+            Assert.IsNull(nb.ObservedFromGet,
+                "Registry.Get must return null while OnNetworkSpawn is still running.");
+
+            // After Spawn returns, the object IS published — a subsequent
+            // lookup resolves it.
+            Assert.AreSame(nb, _registry.Get(nb.NetworkObjectId));
+            Assert.IsTrue(nb.IsSpawned);
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
         // ── Test doubles ───────────────────────────────────────────────────────
         // ══════════════════════════════════════════════════════════════════════
 

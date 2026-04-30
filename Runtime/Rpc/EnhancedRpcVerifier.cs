@@ -74,44 +74,93 @@ namespace RTMPE.Rpc
         /// (gateway session ID) is currently a recognised peer of the
         /// local session.
         ///
-       /// <para>Default: <see langword="null"/> (no integrator hook
-        /// configured).  When null the parser still drops zero
-        /// senderIds but otherwise accepts the value — strict roster
-        /// enforcement requires the integrator to install this delegate.
-        /// Document deployment guidance: in untrusted-peer environments,
-        /// configuring this hook is mandatory.</para>
+       /// <para>Default: <see cref="DefaultSenderVerifier"/>, which
+        /// accepts ONLY the local session ID — peers cannot be admitted
+        /// until the integrator either wires a roster-aware delegate
+        /// here, switches to <see cref="RoomAnchoredSenderVerifier"/>,
+        /// or opts in to a server-attested verifier via
+        /// <see cref="SetServerAttestedSenderVerifier"/>.  AEAD only
+        /// authenticates the gateway as relay, NOT the originating peer,
+        /// so a permissive default would let any room member impersonate
+        /// any other.</para>
         /// </summary>
         public static Func<ulong, bool> SenderVerifier { get; set; } = DefaultSenderVerifier;
 
-        // One-time advisory so production deployments that never wire a
-        // roster-aware verifier surface the gap exactly once at the first
-        // non-self RPC.  Spammy per-packet warnings are unacceptable on the
-        // hot path; a single warning is enough to be actionable in CI logs
-        // without drowning the console.
-        private static int _defaultVerifierWarned;
+        /// <summary>
+        /// Optional callback returning the local session ID used by the
+        /// self-only default verifier.  Wired by NetworkManager so the
+        /// SDK can recognise its own outbound RPCs that the gateway
+        /// echoes back to it.  When this is null or returns zero the
+        /// default verifier rejects every sender.
+        /// </summary>
+        public static Func<ulong> SelfSessionIdProvider { get; set; }
 
         /// <summary>
-        /// Conservative default: rejects the SDK's "uninitialised session"
-        /// sentinel (zero) and accepts every other gateway session ID, but
-        /// emits a one-time warning so integrators discover the gap before
-        /// shipping.  Replace with a roster-aware delegate during bootstrap
-        /// in any production build that hosts untrusted peers.
+        /// Conservative default sender policy.
+        ///
+       /// <para>Accepts ONLY the local session ID (as reported by
+        /// <see cref="SelfSessionIdProvider"/>); every other senderId is
+        /// rejected.  This is the only safe default: AEAD authenticates
+        /// the gateway as relay but does not bind a packet to its
+        /// originating peer, so a peer in the room can otherwise stamp
+        /// any senderId it likes onto an RPC and impersonate any other
+        /// room member.</para>
+        ///
+       /// <para>Integrators that need peer RPCs MUST opt in explicitly
+        /// by either:</para>
+        /// <list type="bullet">
+        /// <item><description>installing a roster-aware delegate on
+        ///   <see cref="SenderVerifier"/>;</description></item>
+        /// <item><description>switching to
+        ///   <see cref="RoomAnchoredSenderVerifier"/> with the room
+        ///   hooks wired; or</description></item>
+        /// <item><description>calling
+        ///   <see cref="SetServerAttestedSenderVerifier"/> if (and only
+        ///   if) the gateway is known to attest senderIds out-of-band.</description></item>
+        /// </list>
         /// </summary>
         internal static bool DefaultSenderVerifier(ulong senderId)
         {
             if (senderId == 0UL) return false;
-            if (System.Threading.Interlocked.CompareExchange(
-                    ref _defaultVerifierWarned, 1, 0) == 0)
+            var provider = SelfSessionIdProvider;
+            if (provider == null) return false;
+            ulong self;
+            try { self = provider(); }
+            catch (Exception)
             {
-                UnityEngine.Debug.LogWarning(
-                    "[RTMPE] EnhancedRpcVerifier.SenderVerifier is using the " +
-                    "permissive default policy (accept any non-zero sender). " +
-                    "Production deployments with untrusted peers MUST install " +
-                    "a roster-aware verifier so spoofed senderIds are rejected. " +
-                    "Set EnhancedRpcVerifier.SenderVerifier during application " +
-                    "bootstrap.");
+                return false;
             }
-            return true;
+            return self != 0UL && senderId == self;
+        }
+
+        /// <summary>
+        /// Opt in to a server-attested sender policy.  Use ONLY when the
+        /// gateway is known to bind <c>senderId</c> into the AEAD additional
+        /// data (so the SDK can trust the value as server-stamped rather
+        /// than peer-supplied).  The supplied <paramref name="verifier"/>
+        /// receives every non-zero senderId; return <see langword="true"/>
+        /// to admit, <see langword="false"/> to drop.
+        ///
+       /// <para>This is an explicit opt-out from the default self-only
+        /// policy; pass <see langword="null"/> to revert to the default.
+        /// The name is intentionally verbose so call sites cannot be
+        /// mistaken for an innocuous "accept anything" toggle during
+        /// review.</para>
+        /// </summary>
+        /// <param name="verifier">Delegate that gates non-zero senderIds,
+        /// or <see langword="null"/> to revert to <see cref="DefaultSenderVerifier"/>.</param>
+        public static void SetServerAttestedSenderVerifier(Func<ulong, bool> verifier)
+        {
+            if (verifier == null)
+            {
+                SenderVerifier = DefaultSenderVerifier;
+                return;
+            }
+            SenderVerifier = senderId =>
+            {
+                if (senderId == 0UL) return false;
+                return verifier(senderId);
+            };
         }
 
         /// <summary>
@@ -123,6 +172,34 @@ namespace RTMPE.Rpc
         /// interest set".
         /// </summary>
         public static Func<ulong, bool> ObjectExistsVerifier { get; set; }
+
+        // One-time advisory used by the lobby / single-player fallback inside
+        // RoomAnchoredSenderVerifier to surface the gap that no roster anchor
+        // is in effect.  Spammy per-packet warnings are unacceptable on the
+        // hot path.
+        private static int _permissiveLegacyWarned;
+
+        // Lobby / single-player fallback.  Accepts any non-zero senderId and
+        // emits a one-time advisory.  Used ONLY by RoomAnchoredSenderVerifier
+        // when the local SDK is outside a room — pre-room flows have no peer
+        // roster to anchor against and the gateway is the only legitimate
+        // counterparty.  Not exposed as a default policy because in-room
+        // peer environments require explicit roster anchoring or self-only
+        // rejection (see DefaultSenderVerifier).
+        private static bool PermissiveLegacySenderVerifier(ulong senderId)
+        {
+            if (senderId == 0UL) return false;
+            if (System.Threading.Interlocked.CompareExchange(
+                    ref _permissiveLegacyWarned, 1, 0) == 0)
+            {
+                UnityEngine.Debug.LogWarning(
+                    "[RTMPE] EnhancedRpcVerifier accepting RPC outside any room " +
+                    "without a roster anchor.  This is the lobby / single-player " +
+                    "fallback only; in-room peer traffic must use a roster-aware " +
+                    "or server-attested verifier.");
+            }
+            return true;
+        }
 
         // ── Roster-anchored sender verification ────────────────────────────
         //
@@ -185,9 +262,11 @@ namespace RTMPE.Rpc
             if (inRoom == null || !inRoom())
             {
                 // Outside a room (lobby / browse / single-player) we cannot
-                // anchor against a roster — defer to the permissive default
-                // so SDK consumers do not break in pre-room flows.
-                return DefaultSenderVerifier(senderId);
+                // anchor against a roster — accept any non-zero sender so
+                // SDK consumers do not break in pre-room flows.  Within
+                // such flows the gateway is the only legitimate counter-
+                // party and there is no peer roster to anchor against.
+                return PermissiveLegacySenderVerifier(senderId);
             }
 
             var localProvider = LocalSessionIdProvider;
@@ -228,7 +307,8 @@ namespace RTMPE.Rpc
             IsRoomJoined           = null;
             LocalSessionIdProvider = null;
             IsRosterMemberSession  = null;
-            System.Threading.Interlocked.Exchange(ref _defaultVerifierWarned,    0);
+            SelfSessionIdProvider  = null;
+            System.Threading.Interlocked.Exchange(ref _permissiveLegacyWarned,     0);
             System.Threading.Interlocked.Exchange(ref _rosterAnchorSelfOnlyWarned, 0);
         }
 

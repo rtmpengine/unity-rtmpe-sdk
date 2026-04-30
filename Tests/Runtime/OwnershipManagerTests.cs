@@ -85,7 +85,7 @@ namespace RTMPE.Tests
         {
             var nb = RegisterObject(10UL, "old-owner");
 
-            _ownership.ApplyOwnershipGrant(10UL, "new-owner");
+            _ownership.ApplyOwnershipGrant(10UL, "new-owner", serverAttested: true);
 
             Assert.AreEqual("new-owner", nb.OwnerPlayerId);
         }
@@ -96,7 +96,7 @@ namespace RTMPE.Tests
         {
             var nb = RegisterObject(10UL, "old-owner");
 
-            _ownership.ApplyOwnershipGrant(10UL, "new-owner");
+            _ownership.ApplyOwnershipGrant(10UL, "new-owner", serverAttested: true);
 
             Assert.IsTrue(nb.OwnerChangeCallbackFired,         "OnOwnershipChanged should have been called.");
             Assert.AreEqual("old-owner", nb.PreviousOwnerOnChange);
@@ -108,7 +108,7 @@ namespace RTMPE.Tests
         public void ApplyOwnershipGrant_UnknownObject_IsNoOp()
         {
             // No object registered with ID 999.
-            Assert.DoesNotThrow(() => _ownership.ApplyOwnershipGrant(999UL, "new-owner"));
+            Assert.DoesNotThrow(() => _ownership.ApplyOwnershipGrant(999UL, "new-owner", serverAttested: true));
         }
 
         // ── RequestOwnershipTransfer (stub) ─────────────────────────────────────
@@ -225,7 +225,7 @@ namespace RTMPE.Tests
         {
             var nb = RegisterObject(30UL, "alice");
 
-            _ownership.ApplyOwnershipGrant(30UL, "alice");  // same owner — no-change
+            _ownership.ApplyOwnershipGrant(30UL, "alice", serverAttested: true);  // same owner — no-change
 
             Assert.IsFalse(nb.OwnerChangeCallbackFired,
                 "OnOwnershipChanged must NOT fire when the owner is already 'alice'.");
@@ -239,7 +239,7 @@ namespace RTMPE.Tests
             RegisterObject(40UL, "alice");
             RegisterObject(41UL, "bob");
 
-            _ownership.ApplyOwnershipGrant(40UL, "bob");   // transfer 40 from alice → bob
+            _ownership.ApplyOwnershipGrant(40UL, "bob", serverAttested: true);   // transfer 40 from alice → bob
 
             var bobObjects = _ownership.GetObjectsOwnedBy("bob");
             Assert.AreEqual(2, bobObjects.Count, "Bob should now own 2 objects.");
@@ -326,6 +326,106 @@ namespace RTMPE.Tests
 
             Assert.IsTrue(_ownership.TryAcknowledgeResponse(id));
             Assert.IsFalse(_ownership.TryAcknowledgeResponse(id));
+        }
+
+        // ── H-011 — correlation gating on ApplyOwnershipGrant ──────────────────
+        //
+        // The default (non-server-attested) overload must reject grants for
+        // which there is no outstanding self-issued request whose target
+        // tuple (objectId, newOwnerPlayerId) matches.  The expectation map
+        // is populated by RequestOwnershipTransfer; we drive it directly
+        // via reflection here to avoid coupling the test to the RPC send
+        // pipeline.
+
+        private void InjectOutstandingExpectation(uint requestId, ulong objectId, string newOwner)
+        {
+            var fSet = typeof(OwnershipManager).GetField(
+                "_outstanding",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var fDeadline = typeof(OwnershipManager).GetField(
+                "_outstandingDeadlineMs",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var fExp = typeof(OwnershipManager).GetField(
+                "_outstandingExpectations",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            ((HashSet<uint>)fSet.GetValue(_ownership)).Add(requestId);
+            ((Dictionary<uint, long>)fDeadline.GetValue(_ownership))[requestId] =
+                long.MaxValue;
+            ((Dictionary<uint, (ulong ObjectId, string NewOwner)>)fExp.GetValue(_ownership))[requestId] =
+                (objectId, newOwner);
+        }
+
+        [Test]
+        [Description("Default (non-server-attested) ApplyOwnershipGrant rejects when no outstanding request matches.")]
+        public void ApplyOwnershipGrant_NoOutstanding_Rejected()
+        {
+            var nb = RegisterObject(70UL, "old-owner");
+
+            _ownership.ApplyOwnershipGrant(70UL, "new-owner", serverAttested: false);
+
+            Assert.AreEqual("old-owner", nb.OwnerPlayerId,
+                "Owner must be unchanged: no outstanding request matched the inbound grant.");
+        }
+
+        [Test]
+        [Description("Default ApplyOwnershipGrant accepts when a matching outstanding request exists; replay rejected.")]
+        public void ApplyOwnershipGrant_MatchingOutstanding_AcceptedOnceThenRejected()
+        {
+            var nb = RegisterObject(71UL, "old-owner");
+            _ownership.ResetOutstandingForTest();
+            InjectOutstandingExpectation(0xCAFEBABE, 71UL, "new-owner");
+
+            _ownership.ApplyOwnershipGrant(71UL, "new-owner", serverAttested: false);
+            Assert.AreEqual("new-owner", nb.OwnerPlayerId);
+
+            // Replay: the matching expectation has been consumed, so a
+            // re-emitted grant for the same tuple is rejected.  We restore
+            // the owner to a known value first to verify rejection cleanly.
+            nb.SetOwner("old-owner");
+            _ownership.ApplyOwnershipGrant(71UL, "new-owner", serverAttested: false);
+            Assert.AreEqual("old-owner", nb.OwnerPlayerId);
+        }
+
+        [Test]
+        [Description("Default ApplyOwnershipGrant rejects mismatched newOwner even when an outstanding request exists.")]
+        public void ApplyOwnershipGrant_MismatchedOwner_Rejected()
+        {
+            var nb = RegisterObject(72UL, "old-owner");
+            _ownership.ResetOutstandingForTest();
+            // Local SDK asked for "alice"; an attacker forges a grant to "mallory".
+            InjectOutstandingExpectation(7u, 72UL, "alice");
+
+            _ownership.ApplyOwnershipGrant(72UL, "mallory", serverAttested: false);
+
+            Assert.AreEqual("old-owner", nb.OwnerPlayerId);
+        }
+
+        [Test]
+        [Description("Server-attested ApplyOwnershipGrant bypasses the correlation gate (master-client / initial-assignment paths).")]
+        public void ApplyOwnershipGrant_ServerAttested_BypassesCorrelation()
+        {
+            var nb = RegisterObject(73UL, "old-owner");
+            _ownership.ResetOutstandingForTest();
+
+            _ownership.ApplyOwnershipGrant(73UL, "new-owner", serverAttested: true);
+
+            Assert.AreEqual("new-owner", nb.OwnerPlayerId);
+        }
+
+        [Test]
+        [Description("ConsumeMatchingExpectation removes the matched entry and refuses subsequent matches.")]
+        public void ConsumeMatchingExpectation_OneShot()
+        {
+            _ownership.ResetOutstandingForTest();
+            InjectOutstandingExpectation(99u, 80UL, "alice");
+
+            var mi = typeof(OwnershipManager).GetMethod(
+                "ConsumeMatchingExpectation",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+            Assert.IsTrue((bool)mi.Invoke(_ownership, new object[] { 80UL, "alice" }));
+            Assert.IsFalse((bool)mi.Invoke(_ownership, new object[] { 80UL, "alice" }));
+            Assert.AreEqual(0, _ownership.OutstandingCount);
         }
 
         // ── Test double ────────────────────────────────────────────────────────

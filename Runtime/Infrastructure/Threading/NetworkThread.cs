@@ -19,6 +19,7 @@
 
 using System;
 using System.Buffers;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Threading;
 using RTMPE.Transport;
@@ -187,6 +188,16 @@ namespace RTMPE.Threading
         /// <summary>
         /// Signal the thread to stop and wait up to 2 seconds for a clean exit.
         /// Safe to call multiple times. Blocks the calling thread.
+        ///
+        /// Asymmetry — when invoked from the network thread itself (typically
+        /// from inside an <see cref="OnError"/> handler that triggers a
+        /// disconnect/reconnect), this method does NOT join.  Calling
+        /// <see cref="Thread.Join(int)"/> on the current thread would deadlock
+        /// for the full timeout (a self-join can never satisfy itself).
+        /// Instead the running flag is cleared and the run loop exits naturally
+        /// on its next iteration; cleanup that the caller normally relies on
+        /// (transport disconnect, send-queue drain) runs in the loop's
+        /// finally block and after RunLoop returns the thread terminates.
         /// </summary>
         public void Stop()
         {
@@ -196,9 +207,27 @@ namespace RTMPE.Threading
             // Reset the atomic flag so Start() can be called again after Stop().
             System.Threading.Interlocked.Exchange(ref _startFlag, 0);
 
-            if (_thread != null && _thread.IsAlive)
+            // Self-join guard.  A consumer that wires OnError → Stop() (the
+            // canonical disconnect-on-fatal-error pattern) executes this method
+            // on the network thread — Thread.Join on Thread.CurrentThread blocks
+            // for the full timeout and never completes.  Detect that case and
+            // return early; the run loop observes _running=false on its next
+            // poll and exits cleanly through the normal finally path.
+            var t = _thread;
+            if (t != null && Thread.CurrentThread == t)
             {
-                if (!_thread.Join(2_000))
+                // Do NOT null _thread here — the thread is still alive and
+                // running; clearing the field would race a concurrent
+                // foreign-thread Stop() that legitimately needs the reference
+                // to call Join.  The thread self-references will be released
+                // when RunLoop unwinds and a subsequent foreign Stop() (or
+                // Dispose) completes the cleanup.
+                return;
+            }
+
+            if (t != null && t.IsAlive)
+            {
+                if (!t.Join(2_000))
                 {
                     // Thread.Interrupt() only works when the thread
                     // is in a managed blocking state (WaitSleepJoin). When blocked
@@ -206,7 +235,7 @@ namespace RTMPE.Threading
                     // forces ReceiveFrom to throw a SocketException, which the
                     // RunLoop catch clause handles gracefully.
                     _transport.Disconnect();
-                    _thread.Join(500);
+                    t.Join(500);
                 }
             }
 
@@ -337,6 +366,23 @@ namespace RTMPE.Threading
             }
         }
 
+        // Backoff state for ENOBUFS handling.  When the kernel's send buffer
+        // is exhausted we cannot make progress until it drains; spinning at
+        // ~1 kHz and firing OnError on every iteration would create an error
+        // storm visible to the SDK consumer.  Instead we sleep for an
+        // exponentially-increasing interval (1 ms → cap) and keep the
+        // pending item at the head of the queue by re-enqueuing it.
+        private const int EnobufsBackoffStartMs = 1;
+        private const int EnobufsBackoffCapMs   = 4;
+        private int  _enobufsBackoffMs = EnobufsBackoffStartMs;
+        private long _enobufsCount;
+
+        /// <summary>
+        /// Total number of ENOBUFS events the send loop has absorbed.
+        /// Exposed for telemetry; never resets across the thread's lifetime.
+        /// </summary>
+        public long EnobufsCount => Interlocked.Read(ref _enobufsCount);
+
         private void DrainSendQueue()
         {
             for (int i = 0;
@@ -369,6 +415,31 @@ namespace RTMPE.Threading
                             _transport.Send(exact);
                         }
                     }
+                    // Successful send — reset the ENOBUFS backoff so the next
+                    // exhaustion event starts at the minimum sleep again.
+                    _enobufsBackoffMs = EnobufsBackoffStartMs;
+                }
+                catch (SocketException sx)
+                    when (sx.SocketErrorCode == SocketError.NoBufferSpaceAvailable)
+                {
+                    // Kernel send buffer full.  This is transient: stop the
+                    // current drain pass, sleep with exponential backoff,
+                    // and re-enqueue the unsent item so it is retried on
+                    // the next iteration.  Re-enqueue is to the tail (the
+                    // backing ConcurrentQueue exposes no head-insertion
+                    // primitive); under saturation any subsequent items
+                    // already enqueued ahead are equally blocked, so the
+                    // tail-reorder is bounded by MaxSendPerIteration and
+                    // not observable in practice.  Crucially, do NOT raise
+                    // OnError — at 1 kHz poll cadence that would generate
+                    // up to a thousand error callbacks per second under
+                    // sustained uplink saturation.
+                    Interlocked.Increment(ref _enobufsCount);
+                    _sendQueue.Enqueue(item);
+                    int sleep = _enobufsBackoffMs;
+                    _enobufsBackoffMs = Math.Min(_enobufsBackoffMs * 2, EnobufsBackoffCapMs);
+                    Thread.Sleep(sleep);
+                    return;
                 }
                 catch (Exception ex)
                 {
@@ -419,10 +490,28 @@ namespace RTMPE.Threading
                         throw;
                     }
 
-                    if (n <= 0)
+                    if (n == 0)
                     {
+                        // Would-block / socket disposed mid-syscall.  Stop
+                        // the drain pass; RunLoop polls again on the next
+                        // iteration after a 1 ms sleep.
                         ArrayPool<byte>.Shared.Return(rented, clearArray: true);
                         break;
+                    }
+
+                    if (n < 0)
+                    {
+                        // UdpTransport.ReceiveSourceRejected: a datagram was
+                        // consumed and dropped because the source endpoint
+                        // failed pinning.  More datagrams may be queued —
+                        // continue draining in this iteration so an
+                        // off-path flood does not add per-burst latency to
+                        // legitimate responses.  The inner loop is bounded
+                        // by MaxReceivePerIteration, so a kernel that ever
+                        // (incorrectly) reports readiness without data
+                        // cannot pin the CPU.
+                        ArrayPool<byte>.Shared.Return(rented, clearArray: true);
+                        continue;
                     }
 
                     DispatchReceived(rented, n);

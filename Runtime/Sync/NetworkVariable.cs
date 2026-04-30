@@ -39,6 +39,7 @@ using System;
 using System.IO;
 using System.Text;
 using UnityEngine;
+using RTMPE.Core;
 
 namespace RTMPE.Sync
 {
@@ -413,6 +414,13 @@ namespace RTMPE.Sync
                 // IEquatable<T>.Equals — no boxing, no allocation.
                 if (_value.Equals(value)) return;
 
+                // Reject writes after OnNetworkDespawn so user code that
+                // mutates Value from a torn-down object cannot mark a
+                // dead variable dirty (the next flush would re-publish
+                // post-despawn state) or fire callbacks against
+                // already-cleared subscribers on a destroying object.
+                if (Owner != null && !Owner.IsSpawned) return;
+
                 T oldValue = _value;
                 _value     = value;
                 IsDirty    = true;
@@ -473,6 +481,14 @@ namespace RTMPE.Sync
         /// </summary>
         public void SetValueWithoutNotify(T value)
         {
+            // Drop late inbound updates that arrive after OnNetworkDespawn:
+            // the owning NetworkBehaviour may have already cleared subscribers
+            // and torn down its game-side state, and the GameObject itself
+            // may be mid-Destroy.  Mutating _value here would let user code
+            // observe the post-despawn value through whatever callbacks
+            // remain in flight, and re-anchor the variable's last-applied
+            // tick gate against a packet whose target object is gone.
+            if (Owner == null || !Owner.IsSpawned) return;
             _value = value;
             // Intentionally does NOT set IsDirty or fire OnValueChanged.
         }
@@ -532,6 +548,11 @@ namespace RTMPE.Sync
                 string normalized = value ?? string.Empty;
                 if (_value == normalized) return;
 
+                // Symmetric guard with NetworkVariable<T>.Value: reject writes
+                // after OnNetworkDespawn so a torn-down object cannot re-emit
+                // post-despawn state or fire callbacks at cleared subscribers.
+                if (Owner != null && !Owner.IsSpawned) return;
+
                 string oldValue = _value;
                 _value          = normalized;
                 IsDirty         = true;
@@ -575,6 +596,8 @@ namespace RTMPE.Sync
         /// </summary>
         public void SetValueWithoutNotify(string value)
         {
+            // See NetworkVariable<T>.SetValueWithoutNotify for the rationale.
+            if (Owner == null || !Owner.IsSpawned) return;
             _value = value ?? string.Empty;
         }
 

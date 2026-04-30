@@ -75,13 +75,22 @@ namespace RTMPE.Core
         // ── Buffers ─────────────────────────────────────────────────────────────
 
         [Header("Buffers")]
-        [Tooltip("UDP socket SO_SNDBUF size in bytes.")]
-        [Range(1_024, 65_536)]
-        public int sendBufferBytes = 4_096;
+        // Defaults sized for a typical 30 Hz, 16-player burst
+        // (~480 datagrams/second).  The previous 4 KiB cap held only ~3
+        // datagrams worth of kernel buffer and produced silent receive-side
+        // drops on every tick boundary; 256 KiB absorbs the worst burst
+        // with headroom while staying inside the per-socket rmem_max on
+        // unmodified Linux and Windows hosts.
+        [Tooltip("UDP socket SO_SNDBUF size in bytes. Default 256 KiB sized " +
+                 "for 30 Hz 16-player sessions (~480 datagrams/second).")]
+        [Range(4_096, 4_194_304)]
+        public int sendBufferBytes = 262_144;
 
-        [Tooltip("UDP socket SO_RCVBUF size in bytes.")]
-        [Range(1_024, 65_536)]
-        public int receiveBufferBytes = 4_096;
+        [Tooltip("UDP socket SO_RCVBUF size in bytes. Default 256 KiB sized " +
+                 "for 30 Hz 16-player sessions (~480 datagrams/second). " +
+                 "Smaller values cause silent kernel-side datagram drops.")]
+        [Range(4_096, 4_194_304)]
+        public int receiveBufferBytes = 262_144;
 
         [Tooltip("Size of the scratch buffer used by the network thread for reading incoming datagrams.")]
         [Range(1_024, 65_536)]

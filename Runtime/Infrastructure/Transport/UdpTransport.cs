@@ -130,19 +130,29 @@ namespace RTMPE.Transport
 
         /// <param name="host">Remote hostname or IP address (e.g. "127.0.0.1").</param>
         /// <param name="port">Remote UDP port (1–65535).</param>
-        /// <param name="sendBufferBytes">SO_SNDBUF size in bytes (default 4 KiB).</param>
-        /// <param name="receiveBufferBytes">SO_RCVBUF size in bytes (default 4 KiB).</param>
+        /// <param name="sendBufferBytes">SO_SNDBUF size in bytes (default 256 KiB).</param>
+        /// <param name="receiveBufferBytes">SO_RCVBUF size in bytes (default 256 KiB).</param>
         /// <param name="dnsTimeout">
         /// Maximum time to wait for DNS resolution. <see langword="null"/> uses
         /// <see cref="DefaultDnsTimeout"/> (3 seconds).  When the timeout
         /// elapses, <see cref="Connect"/> throws <see cref="TimeoutException"/>
         /// rather than blocking the caller indefinitely.
         /// </param>
+        // Default kernel socket buffer.  4 KiB (the previous default) holds
+        // only ~3 MTU-sized datagrams — at a 30 Hz tick with 16 players the
+        // session bursts ~480 datagrams/second and routinely overflows
+        // SO_RCVBUF, producing silent kernel-side drops.  256 KiB
+        // accommodates >200 datagrams in flight, comfortably absorbing the
+        // worst tick-aligned burst that real games produce while staying
+        // well under the per-socket rmem_max default on modern Linux/Windows.
+        // Tunable via NetworkSettings.sendBufferBytes / receiveBufferBytes.
+        public const int DefaultSocketBufferBytes = 262_144;
+
         public UdpTransport(
             string host,
             int    port,
-            int    sendBufferBytes    = 4_096,
-            int    receiveBufferBytes = 4_096,
+            int    sendBufferBytes    = DefaultSocketBufferBytes,
+            int    receiveBufferBytes = DefaultSocketBufferBytes,
             TimeSpan? dnsTimeout      = null,
             int    maxDatagramSize    = DefaultMaxDatagramSize)
         {
@@ -413,6 +423,28 @@ namespace RTMPE.Transport
             Interlocked.Read(ref _sendBufferExhaustedCount);
 
         /// <summary>
+        /// Sentinel return value from <see cref="Receive"/> meaning
+        /// "a datagram was read and dropped due to source-IP pinning;
+        /// the kernel queue may contain more, please try again immediately."
+        /// Distinct from 0 (which is reserved for the would-block /
+        /// disposed-during-syscall case where the receive loop SHOULD pause).
+        /// Negative so the existing <c>n &lt;= 0</c> shutdown idiom is unaffected.
+        /// </summary>
+        public const int ReceiveSourceRejected = -1;
+
+        // Cumulative count of inbound datagrams dropped because the source
+        // endpoint did not match the registered remote.  A non-zero value
+        // signals an off-path attacker or routing oddity; non-resetting so
+        // operators can correlate with session lifetime.
+        private long _droppedSourceMismatchCount;
+
+        /// <summary>
+        /// Number of inbound datagrams rejected by the source-IP pin.
+        /// </summary>
+        public long DroppedSourceMismatchCount =>
+            Interlocked.Read(ref _droppedSourceMismatchCount);
+
+        /// <summary>
         /// Send a slice of a buffer without forcing the caller to allocate a
         /// fresh array.  Preferred in hot paths that build packets into
         /// <see cref="System.Buffers.ArrayPool{T}"/>-rented buffers — the
@@ -460,6 +492,17 @@ namespace RTMPE.Transport
                     throw new SocketException((int)SocketError.MessageSize);
                 }
             }
+            catch (SocketException sx)
+                when (sx.SocketErrorCode == SocketError.NoBufferSpaceAvailable)
+            {
+                // Mirror the un-sliced overload's accounting so the same
+                // counter measures uplink saturation regardless of which
+                // overload the caller picked.  Rethrow so the caller can
+                // distinguish ENOBUFS from other SocketExceptions and apply
+                // backoff (DrainSendQueue does so).
+                Interlocked.Increment(ref _sendBufferExhaustedCount);
+                throw;
+            }
             catch (ObjectDisposedException)
             {
                 throw new InvalidOperationException("Transport was disconnected during Send.");
@@ -498,10 +541,17 @@ namespace RTMPE.Transport
                 if (expected != null && ep is IPEndPoint actual
                     && !EndpointMatches(expected, actual))
                 {
-                    // Drop and tell the caller "no data" — the receive loop
-                    // checks _running on the next iteration so a hostile
-                    // flood does not starve graceful shutdown.
-                    return 0;
+                    // Off-path spoof: a datagram arrived from an endpoint
+                    // that is not the registered remote.  Return the
+                    // dedicated "rejected, more may follow" sentinel so the
+                    // caller drains the rest of the kernel queue in the
+                    // same iteration.  Returning 0 (would-block) here
+                    // previously short-circuited the drain loop, letting a
+                    // sustained off-path flood add ~1 ms of latency to
+                    // every legitimate response by deferring it to the next
+                    // poll cycle.
+                    Interlocked.Increment(ref _droppedSourceMismatchCount);
+                    return ReceiveSourceRejected;
                 }
 
                 return count;

@@ -210,5 +210,136 @@ namespace RTMPE.Tests.Editor
             Assert.IsFalse(EditorPrefs.HasKey(EncPrefKey),
                 "Unreadable blob should be cleared so the wizard prompts for a fresh key.");
         }
+
+        // ── M-044: macOS Keychain write must not place the API key in argv ──
+
+        [Test]
+        [Description(
+            "Static check: the macOS keychain write path constructs the " +
+            "`security` ProcessStartInfo with NO secret material in its " +
+            "Arguments string.  The secret is fed through stdin via the " +
+            "`security -i` interactive-command channel — which is not " +
+            "visible to other users via `ps -ef`.")]
+        public void MacKeychainWrite_DoesNotPlaceApiKeyInArgv()
+        {
+            // The Editor scripts are platform-gated (#if UNITY_EDITOR_OSX),
+            // so the only universally-runnable assertion is a textual
+            // contract: ApiKeyStore.cs must NOT contain the previous
+            // pattern that interpolated the secret into `-w "..."` argv.
+            string sourcePath = System.IO.Path.Combine(
+                UnityEngine.Application.dataPath, "..",
+                "Packages", "com.rtmpe.sdk", "Editor", "ApiKeyStore.cs");
+
+            // Resolve via package layout if not under Assets/.
+            if (!System.IO.File.Exists(sourcePath))
+            {
+                // Search the package by GUID-less convention.
+                var candidates = System.IO.Directory.GetFiles(
+                    UnityEngine.Application.dataPath + "/..",
+                    "ApiKeyStore.cs",
+                    System.IO.SearchOption.AllDirectories);
+                if (candidates.Length > 0) sourcePath = candidates[0];
+            }
+
+            Assume.That(System.IO.File.Exists(sourcePath),
+                "ApiKeyStore.cs must be locatable for the source-pattern check.");
+
+            string src = System.IO.File.ReadAllText(sourcePath);
+
+            // The OS X branch must use `security -i` (stdin command channel)
+            // and must NOT pass the API key as an argv `-w "..."` value to
+            // `add-generic-password`.
+            int osxStart = src.IndexOf("UNITY_EDITOR_OSX", StringComparison.Ordinal);
+            int osxEnd   = src.IndexOf("#endif", osxStart, StringComparison.Ordinal);
+            Assert.Greater(osxEnd, osxStart, "Failed to locate the OSX block.");
+            string osxBlock = src.Substring(osxStart, osxEnd - osxStart);
+
+            StringAssert.Contains("\"security\", \"-i\"", osxBlock,
+                "OSX write path must spawn `security -i` (stdin command mode).");
+            StringAssert.Contains("StandardInput.WriteLine", osxBlock,
+                "OSX write path must write the add-generic-password command to stdin.");
+            StringAssert.DoesNotContain("add-generic-password -U -a \\\"{AccountName}\\\" -s \\\"{ServiceName}\\\" -w \\\"{",
+                osxBlock,
+                "OSX write path must not pass the API key as an argv `-w \"...\"` value.");
+        }
+
+        // ── M-046: per-Editor random fallback IKM (no constant string) ───
+
+        private const string FallbackIkmPrefKey = "RTMPE_EditorApiKeyStore_FallbackIkm_v1";
+
+        [Test]
+        [Description(
+            "When the device id is missing, the IKM fallback is a CSPRNG-generated " +
+            "32-byte value persisted in EditorPrefs — never the constant " +
+            "\"rtmpe-unknown-device\" the prior implementation used.")]
+        public void FallbackIkm_IsRandom_NotConstant()
+        {
+            // Snapshot any prior value so we can restore it.
+            bool   hadPrior   = EditorPrefs.HasKey(FallbackIkmPrefKey);
+            string priorValue = hadPrior ? EditorPrefs.GetString(FallbackIkmPrefKey) : null;
+
+            try
+            {
+                EditorPrefs.DeleteKey(FallbackIkmPrefKey);
+
+                // First call should populate the slot with 32 random bytes.
+                var first = EditorApiKeyStore.LoadOrCreateFallbackIkm();
+                Assert.AreEqual(32, first.Length);
+
+                string stored = EditorPrefs.GetString(FallbackIkmPrefKey, "");
+                Assert.IsNotEmpty(stored,
+                    "Fallback IKM must be persisted so the KEK is stable across Editor restarts.");
+                Assert.AreEqual(64, stored.Length,
+                    "32 bytes encoded as base16 = 64 hex chars.");
+
+                // Subsequent call must return the SAME bytes (otherwise the
+                // KEK changes between runs and previously-saved API keys
+                // become unreadable on restart).
+                var second = EditorApiKeyStore.LoadOrCreateFallbackIkm();
+                Assert.AreEqual(first, second);
+
+                // The constant the prior implementation used must NOT equal
+                // the random bytes (statistically impossible at 32 random
+                // bytes, but assert it explicitly).
+                var constantBytes = Encoding.UTF8.GetBytes("rtmpe-unknown-device");
+                Assert.AreNotEqual(constantBytes, first,
+                    "Fallback must not equal the legacy constant IKM under any circumstances.");
+            }
+            finally
+            {
+                EditorPrefs.DeleteKey(FallbackIkmPrefKey);
+                if (hadPrior) EditorPrefs.SetString(FallbackIkmPrefKey, priorValue);
+            }
+        }
+
+        [Test]
+        [Description(
+            "Two independent invocations of the fallback IKM generator on a " +
+            "machine where the slot is wiped between runs must produce DIFFERENT " +
+            "bytes — proving the source is a CSPRNG, not a deterministic constant.")]
+        public void FallbackIkm_DifferentRunsProduceDifferentBytes()
+        {
+            bool   hadPrior   = EditorPrefs.HasKey(FallbackIkmPrefKey);
+            string priorValue = hadPrior ? EditorPrefs.GetString(FallbackIkmPrefKey) : null;
+
+            try
+            {
+                EditorPrefs.DeleteKey(FallbackIkmPrefKey);
+                var run1 = EditorApiKeyStore.LoadOrCreateFallbackIkm();
+
+                EditorPrefs.DeleteKey(FallbackIkmPrefKey);
+                var run2 = EditorApiKeyStore.LoadOrCreateFallbackIkm();
+
+                Assert.AreEqual(32, run1.Length);
+                Assert.AreEqual(32, run2.Length);
+                Assert.AreNotEqual(run1, run2,
+                    "Two CSPRNG draws must differ; identical output indicates a constant fallback.");
+            }
+            finally
+            {
+                EditorPrefs.DeleteKey(FallbackIkmPrefKey);
+                if (hadPrior) EditorPrefs.SetString(FallbackIkmPrefKey, priorValue);
+            }
+        }
     }
 }

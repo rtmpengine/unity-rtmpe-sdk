@@ -248,15 +248,19 @@ namespace RTMPE.Rpc
                 // Check against reserved manual IDs.
                 if (ReservedIds.Contains(id))
                 {
-                    Debug.LogError(
+                    // Hard-throw: a reserved-id collision means the SDK
+                    // cannot dispatch this method without overlapping a
+                    // built-in.  Silently dropping the entry would let the
+                    // caller invoke the method and never see it fire.  The
+                    // SDK refuses to start until the developer renames it.
+                    throw new InvalidOperationException(
                         $"[RTMPE] RpcRegistry: method '{type.Name}.{mi.Name}' produces FNV-1a " +
                         $"hash 0x{id:X8} which collides with a reserved RpcMethodId. " +
                         "Rename the method to resolve the collision.");
-                    continue;
                 }
 
                 // Check for intra-type collision (same type, two methods hash to same ID).
-                if (map.ContainsKey(id))
+                if (map.TryGetValue(id, out var existing))
                 {
                     // Object's `Equals` / `GetHashCode` / `ToString` /
                     // `MemberwiseClone` etc. are inherited by every type —
@@ -264,12 +268,14 @@ namespace RTMPE.Rpc
                     // here.  Any duplicate at this point is therefore a
                     // genuine same-name [RtmpeRpc] definition (e.g. an
                     // overload) which is unsupported by the FNV-keyed
-                    // dispatch table.
-                    Debug.LogError(
+                    // dispatch table.  Hard-throw so the developer cannot
+                    // ship a binary in which one of the two collided
+                    // methods would silently never dispatch.
+                    throw new InvalidOperationException(
                         $"[RTMPE] RpcRegistry: method '{type.Name}.{mi.Name}' has FNV-1a " +
-                        $"hash 0x{id:X8} that collides with another [RtmpeRpc] method on the " +
-                        "same type. Rename one of the methods to resolve the collision.");
-                    continue;
+                        $"hash 0x{id:X8} that collides with [RtmpeRpc] method " +
+                        $"'{type.Name}.{existing.Method.Name}' on the same type. " +
+                        "Rename one of the methods to resolve the collision.");
                 }
 
                 map[id] = (mi, attr);

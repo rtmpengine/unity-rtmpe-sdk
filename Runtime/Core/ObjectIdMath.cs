@@ -36,6 +36,19 @@ namespace RTMPE.Core
         }
 
         /// <summary>
+        /// True when <paramref name="counter"/> has exhausted the 32-bit
+        /// space reserved for the low half of the composed id.  Callers
+        /// (e.g. SpawnManager.GenerateObjectId) consult this before each
+        /// allocation and refuse to produce further ids on a positive
+        /// result — wrapping the counter would re-issue an id whose
+        /// previous owner is still alive on the wire.
+        /// </summary>
+        public static bool IsCounterExhausted(ulong counter)
+        {
+            return counter == 0UL || counter > uint.MaxValue;
+        }
+
+        /// <summary>
         /// Avalanche-mix a 64-bit session id down to a 32-bit digest using a
         /// fold-then-SplitMix64 finalizer.  Pure, allocation-free, deterministic.
         /// </summary>

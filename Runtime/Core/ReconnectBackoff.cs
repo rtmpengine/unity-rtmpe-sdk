@@ -141,6 +141,16 @@ namespace RTMPE.Core
             // remains uniform over [0, int.MaxValue).
             int upperExclusive = cap == int.MaxValue ? int.MaxValue : cap + 1;
             var ms = _rng.Next(upperExclusive);
+
+            // Enforce a small lower bound so a draw of zero never produces an
+            // immediate retry.  A truly zero delay would let a client whose
+            // RNG happens to draw the low end of [0, cap] reconnect inside the
+            // same frame as its disconnect, contributing to the reconnect-storm
+            // pattern Full Jitter is designed to break.  10% of baseDelayMs
+            // (default 100 ms) is short enough to feel responsive and long
+            // enough to keep the transport's connect path off the hot frame.
+            int floorMs = Math.Max(1, _baseDelayMs / 10);
+            if (ms < floorMs) ms = floorMs;
             // Saturating increment — once the backoff has saturated at
             // maxDelayMs the exact attempt number is irrelevant, so we clamp
             // at MaxAttemptForBackoff instead of allowing the counter to

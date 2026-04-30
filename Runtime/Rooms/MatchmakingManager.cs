@@ -26,6 +26,7 @@ using System;
 using System.Text;
 using RTMPE.Core;
 using RTMPE.Protocol;
+using UnityEngine;
 
 namespace RTMPE.Rooms
 {
@@ -305,36 +306,67 @@ namespace RTMPE.Rooms
                 return;
             }
 
-            bool   ok      = ExtractBool(json, "ok");
-            string errorMsg = ExtractString(json, "error");
-
-            if (!ok)
+            // JsonUtility is the parser used elsewhere in this SDK
+            // (NetworkManager.JwtClaimsDto / JwtHeaderDto).  Switching off
+            // the prior hand-rolled needle-search helpers eliminates the
+            // "true_extra → true" / unescaped-backslash misclassifications
+            // that the regex-style scan accepted.  Unknown fields are
+            // ignored by JsonUtility, which matches our existing forward-
+            // compatibility contract for gateway responses.
+            MatchmakingResponseDto dto;
+            try
             {
-                OnMatchmakingFailed?.Invoke(string.IsNullOrEmpty(errorMsg) ? "matchmaking failed" : errorMsg);
+                dto = JsonUtility.FromJson<MatchmakingResponseDto>(json);
+            }
+            catch (Exception)
+            {
+                OnMatchmakingFailed?.Invoke("malformed response");
                 return;
             }
 
-            // Parse data object: { "room_id": "...", "room_code": "...", "created": bool }
-            int dataStart = json.IndexOf("\"data\"", StringComparison.Ordinal);
+            if (dto == null)
+            {
+                OnMatchmakingFailed?.Invoke("malformed response");
+                return;
+            }
+
+            if (!dto.ok)
+            {
+                OnMatchmakingFailed?.Invoke(string.IsNullOrEmpty(dto.error) ? "matchmaking failed" : dto.error);
+                return;
+            }
+
             string roomId   = string.Empty;
             string roomCode = string.Empty;
             bool   created  = false;
-
-            if (dataStart >= 0)
+            if (dto.data != null)
             {
-                int objStart = json.IndexOf('{', dataStart);
-                int objEnd   = objStart >= 0 ? json.IndexOf('}', objStart) : -1;
-
-                if (objStart >= 0 && objEnd > objStart)
-                {
-                    var data = json.Substring(objStart, objEnd - objStart + 1);
-                    roomId   = ExtractString(data, "room_id");
-                    roomCode = ExtractString(data, "room_code");
-                    created  = ExtractBool(data, "created");
-                }
+                roomId   = dto.data.room_id   ?? string.Empty;
+                roomCode = dto.data.room_code ?? string.Empty;
+                created  = dto.data.created;
             }
 
             OnMatchmakingComplete?.Invoke(new MatchmakingResult(roomId, roomCode, created));
+        }
+
+        // ── Response DTOs (consumed by JsonUtility.FromJson) ───────────────────
+
+        // Public fields are required by JsonUtility's reflection-based binder.
+        // Names mirror the gateway's snake_case wire schema verbatim.
+        [Serializable]
+        private sealed class MatchmakingResponseDto
+        {
+            public bool   ok;
+            public string error;
+            public MatchmakingDataDto data;
+        }
+
+        [Serializable]
+        private sealed class MatchmakingDataDto
+        {
+            public string room_id;
+            public string room_code;
+            public bool   created;
         }
 
         // ── Latch ──────────────────────────────────────────────────────────────
@@ -398,46 +430,5 @@ namespace RTMPE.Rooms
             return "\"" + (s ?? string.Empty).Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
         }
 
-        private static string ExtractString(string json, string key)
-        {
-            var needle = $"\"{key}\"";
-            int idx = json.IndexOf(needle, StringComparison.Ordinal);
-            if (idx < 0) return string.Empty;
-
-            int colon = json.IndexOf(':', idx + needle.Length);
-            if (colon < 0) return string.Empty;
-
-            int quote1 = json.IndexOf('"', colon + 1);
-            if (quote1 < 0) return string.Empty;
-
-            int quote2 = quote1 + 1;
-            while (quote2 < json.Length)
-            {
-                if (json[quote2] == '"' && json[quote2 - 1] != '\\') break;
-                quote2++;
-            }
-            if (quote2 >= json.Length) return string.Empty;
-
-            return json.Substring(quote1 + 1, quote2 - quote1 - 1);
-        }
-
-        private static bool ExtractBool(string json, string key)
-        {
-            var needle = $"\"{key}\"";
-            int idx = json.IndexOf(needle, StringComparison.Ordinal);
-            if (idx < 0) return false;
-
-            int colon = json.IndexOf(':', idx + needle.Length);
-            if (colon < 0) return false;
-
-            int start = colon + 1;
-            while (start < json.Length && json[start] == ' ') start++;
-
-            return start + 3 < json.Length &&
-                   json[start] == 't' &&
-                   json[start + 1] == 'r' &&
-                   json[start + 2] == 'u' &&
-                   json[start + 3] == 'e';
-        }
     }
 }

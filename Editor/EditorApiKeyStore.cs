@@ -73,6 +73,25 @@ namespace RTMPE.Editor
         private const int    NonceLen        = 12;
         private const int    TagLen          = 16;
 
+        // EditorPrefs slot used to persist the per-Editor random IKM
+        // fallback when SystemInfo.deviceUniqueIdentifier is unavailable
+        // (WebGL stub, headless / "n/a" platforms).  Stored as base16 so
+        // the value survives the EditorPrefs string round-trip on every
+        // platform.  Never used when a real device id is present.
+        //
+        // Threat model (Editor-local):
+        //   • In-scope:  cross-machine equality of the derived KEK.  Two
+        //     Editors that both fall back to the previous constant string
+        //     IKM produced identical KEKs and could decrypt each other's
+        //     stored ciphertexts on backup/restore mishaps.  Replacing
+        //     the constant with a per-Editor random closes that class.
+        //   • Out-of-scope: malware running as the Editor's user account.
+        //     Any process at that privilege can read the same EditorPrefs
+        //     slot and reproduce the KEK.  Defending against that requires
+        //     an OS-level keychain — see ApiKeyStore.cs.
+        private const string FallbackIkmPrefKey = "RTMPE_EditorApiKeyStore_FallbackIkm_v1";
+        private const int    FallbackIkmBytes   = 32;
+
         // A fixed application salt.  This is NOT a secret — its only role is
         // to domain-separate the HKDF output from any other tool that might
         // hash the same device identifier.
@@ -302,9 +321,23 @@ namespace RTMPE.Editor
             // every documented case observed in Unity-Editor support
             // bundles.
             var deviceId = SystemInfo.deviceUniqueIdentifier;
+            byte[] ikm;
             if (string.IsNullOrEmpty(deviceId) || deviceId == "n/a")
-                deviceId = "rtmpe-unknown-device";
-            var ikm      = Encoding.UTF8.GetBytes(deviceId);
+            {
+                // Fallback: per-Editor random IKM persisted in EditorPrefs.
+                // The previous constant ("rtmpe-unknown-device") produced
+                // identical KEKs across every Editor that hit this branch,
+                // letting one machine's ciphertext decrypt on any other.
+                // A 32-byte random generated on first use, then reused, is
+                // unique per Editor install and stable across sessions —
+                // so saved API keys remain readable while cross-machine
+                // equality is broken.
+                ikm = LoadOrCreateFallbackIkm();
+            }
+            else
+            {
+                ikm = Encoding.UTF8.GetBytes(deviceId);
+            }
 
             // RFC 5869 HKDF-SHA256, single-block (L = 32 ≤ HashLen).
             byte[] prk;
@@ -322,6 +355,64 @@ namespace RTMPE.Editor
             Array.Clear(prk, 0, prk.Length);
             Array.Clear(ikm, 0, ikm.Length);
             return okm; // 32 bytes
+        }
+
+        /// <summary>
+        /// Load (or generate-and-store) the per-Editor random fallback IKM
+        /// used when <see cref="SystemInfo.deviceUniqueIdentifier"/> is
+        /// missing or returns the literal "n/a".  Always returns a 32-byte
+        /// buffer.  First call on a fresh Editor seeds the slot from a
+        /// CSPRNG; subsequent calls return the same bytes so persisted
+        /// ciphertexts remain decryptable across Editor restarts.
+        /// </summary>
+        internal static byte[] LoadOrCreateFallbackIkm()
+        {
+            string hex = EditorPrefs.GetString(FallbackIkmPrefKey, string.Empty);
+            byte[] ikm = TryParseHex(hex);
+            if (ikm != null && ikm.Length == FallbackIkmBytes)
+                return ikm;
+
+            // First use on this Editor — generate fresh random bytes from
+            // a CSPRNG.  RandomNumberCryptoServiceProvider / RandomNumberGenerator
+            // is the only acceptable source: System.Random is seeded from
+            // the system clock and would produce predictable IKMs across
+            // installs that started within the same second.
+            var fresh = new byte[FallbackIkmBytes];
+            using (var rng = RandomNumberGenerator.Create())
+                rng.GetBytes(fresh);
+            EditorPrefs.SetString(FallbackIkmPrefKey, ToHex(fresh));
+            return fresh;
+        }
+
+        private static string ToHex(byte[] bytes)
+        {
+            var sb = new StringBuilder(bytes.Length * 2);
+            for (int i = 0; i < bytes.Length; i++)
+                sb.AppendFormat("{0:x2}", bytes[i]);
+            return sb.ToString();
+        }
+
+        private static byte[] TryParseHex(string hex)
+        {
+            if (string.IsNullOrEmpty(hex)) return null;
+            if ((hex.Length & 1) != 0) return null;
+            var buf = new byte[hex.Length / 2];
+            for (int i = 0; i < buf.Length; i++)
+            {
+                int hi = HexNibble(hex[2 * i]);
+                int lo = HexNibble(hex[2 * i + 1]);
+                if (hi < 0 || lo < 0) return null;
+                buf[i] = (byte)((hi << 4) | lo);
+            }
+            return buf;
+        }
+
+        private static int HexNibble(char c)
+        {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+            if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+            return -1;
         }
     }
 }

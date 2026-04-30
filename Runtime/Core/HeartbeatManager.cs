@@ -246,6 +246,14 @@ namespace RTMPE.Core
             // invariant: RTT is only computed when an ack arrives within a
             // small multiple of the interval after the most-recent send.
             long nowMs = _clock.ElapsedMilliseconds;
+            // Invariant: _awaitingAck implies _pendingSendTick > 0, because
+            // Tick sets both atomically.  Reaching this point with a zero or
+            // negative tick is therefore an internal book-keeping bug.  In
+            // release builds we still bail out defensively so a corrupted
+            // tick cannot poison RTT, but the assert surfaces the regression
+            // in development builds.
+            UnityEngine.Debug.Assert(_pendingSendTick > 0,
+                "HeartbeatManager: _awaitingAck was true but _pendingSendTick is non-positive — Tick must set both before clearing _awaitingAck.");
             if (_pendingSendTick <= 0) return;
             long ageMs = nowMs - _pendingSendTick;
             if (ageMs < 0)

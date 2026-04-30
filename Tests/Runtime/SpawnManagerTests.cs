@@ -349,6 +349,120 @@ namespace RTMPE.Tests
             Assert.DoesNotThrow(() => _spawnManager.Despawn(99999UL));
         }
 
+        // ── M-040: counter-exhaustion wrap detection ──────────────────────
+
+        [Test]
+        [Description(
+            "Spawn refuses to allocate a new id once the per-session counter " +
+            "has reached uint.MaxValue; the latch persists across calls until " +
+            "ClearAll resets the session.")]
+        public void Spawn_AtCounterCeiling_RefusesAllocationAndLatches()
+        {
+            RegisterDefaultPrefab();
+
+            // Drive the counter to uint.MaxValue so the very next Increment
+            // would cross into the u33+ space.  GenerateObjectId observes
+            // raw > uint.MaxValue and refuses the allocation.
+            _spawnManager.DangerousSetNextLocalIdForTest(uint.MaxValue);
+
+            LogAssert.Expect(LogType.Error, new System.Text.RegularExpressions.Regex("32-bit ceiling"));
+            var nb = SpawnDefault();
+            Assert.IsNull(nb,
+                "Spawn must return null when the local id space is exhausted.");
+            Assert.IsTrue(_spawnManager.LocalIdSpaceExhausted,
+                "Exhaustion latch must remain set across calls.");
+
+            // A subsequent attempt is also rejected — no further error is
+            // logged because the latch is already set.
+            var nb2 = SpawnDefault();
+            Assert.IsNull(nb2);
+        }
+
+        [Test]
+        [Description("ClearAll clears the exhaustion latch so a fresh session can allocate again.")]
+        public void ClearAll_ResetsCounterExhaustionLatch()
+        {
+            RegisterDefaultPrefab();
+            _spawnManager.DangerousSetNextLocalIdForTest(uint.MaxValue);
+            LogAssert.Expect(LogType.Error, new System.Text.RegularExpressions.Regex("32-bit ceiling"));
+            SpawnDefault(); // tripping the latch
+            Assert.IsTrue(_spawnManager.LocalIdSpaceExhausted);
+
+            _spawnManager.ClearAll();
+
+            Assert.IsFalse(_spawnManager.LocalIdSpaceExhausted);
+            var nb = SpawnDefault();
+            Assert.IsNotNull(nb,
+                "After ClearAll the counter is reset and Spawn can succeed again.");
+        }
+
+        // ── M-039: re-entry / idempotency on Despawn ──────────────────────
+
+        [Test]
+        [Description(
+            "Despawn must be idempotent: a user OnNetworkDespawn callback that " +
+            "synchronously re-invokes Despawn for the same id observes a no-op " +
+            "rather than recording a stale pending-despawn entry.")]
+        public void Despawn_ReentrantCallback_IsNoOpAndDoesNotLeakPendingEntry()
+        {
+            // Custom prefab whose NetworkBehaviour is the ReentrantDespawnerNB
+            // probe.  Distinct prefab id from the default so the standard
+            // SpawnableNB registration is not disturbed.
+            const uint REENTRANT_PREFAB_ID = 99;
+            var prefab = new GameObject("ReentrantPrefab");
+            prefab.AddComponent<ReentrantDespawnerNB>();
+            _created.Add(prefab);
+            _spawnManager.RegisterPrefab(REENTRANT_PREFAB_ID, prefab);
+
+            var nb = (ReentrantDespawnerNB)_spawnManager.CreateLocal(
+                REENTRANT_PREFAB_ID, 4242UL, "alice", Vector3.zero, Quaternion.identity);
+            Assert.IsNotNull(nb);
+            _created.Add(nb.gameObject);
+
+            // Wire the callback to call Despawn(self) once more before
+            // returning.  Without the in-flight guard, the second call
+            // would walk the "Despawn before Spawn" branch and record a
+            // pending-despawn entry under a TTL — observable via the
+            // tracker count seam.
+            ReentrantDespawnerNB.Reset(_spawnManager, 4242UL);
+
+            _spawnManager.Despawn(4242UL);
+
+            Assert.AreEqual(1, nb.DespawnInvocations,
+                "OnNetworkDespawn must fire exactly once even with re-entrant Despawn calls.");
+            Assert.AreEqual(0, _spawnManager.PendingDespawnCount,
+                "Re-entrant Despawn must not record a stale pending-despawn entry.");
+            Assert.IsNull(_registry.Get(4242UL),
+                "Object must be removed from the registry exactly once.");
+        }
+
+        [Test]
+        [Description(
+            "Despawn() tears the local instance down BEFORE relaying the wire " +
+            "send so that a server-echoed despawn arriving inside the same " +
+            "call stack sees a clean registry and short-circuits.")]
+        public void Despawn_OrderingTearsDownBeforeServerEcho()
+        {
+            RegisterDefaultPrefab();
+            var nb = SpawnDefault(owner: "alice");
+            ulong id = nb.NetworkObjectId;
+
+            _spawnManager.Despawn(id);
+
+            // Simulate a server-echoed Despawn arriving immediately after.
+            // It should be a clean no-op (registry already empty) and must
+            // not record a pending-despawn TTL entry that would falsely
+            // suppress a legitimate future Spawn for the same id.
+            int beforeEcho = _spawnManager.PendingDespawnCount;
+            _spawnManager.DestroyLocal(id);
+            int afterEcho  = _spawnManager.PendingDespawnCount;
+
+            Assert.AreEqual(beforeEcho + 1, afterEcho,
+                "Echo arriving AFTER teardown is treated as out-of-order Despawn-before-Spawn — " +
+                "tracker records exactly one entry under TTL.  This is the documented behavior; " +
+                "the in-flight guard only suppresses re-entry inside the same teardown stack.");
+        }
+
         // ══════════════════════════════════════════════════════════════════════
         // ── CreateLocal / DestroyLocal (internal) ──────────────────────────────
         // ══════════════════════════════════════════════════════════════════════
@@ -926,6 +1040,33 @@ namespace RTMPE.Tests
             {
                 if (this != null && this.gameObject != null)
                     Object.DestroyImmediate(this.gameObject);
+            }
+        }
+
+        // M-039 probe: re-enters SpawnManager.Despawn for the same object id
+        // from inside its own OnNetworkDespawn callback.  Without the
+        // in-flight guard the inner call walks the "Despawn before Spawn"
+        // branch and records a stale pending-despawn entry whose matching
+        // Spawn never arrives.
+        private sealed class ReentrantDespawnerNB : NetworkBehaviour
+        {
+            private static SpawnManager s_target;
+            private static ulong        s_id;
+            public int DespawnInvocations { get; private set; }
+
+            public static void Reset(SpawnManager target, ulong id)
+            {
+                s_target = target;
+                s_id     = id;
+            }
+
+            protected override void OnNetworkDespawn()
+            {
+                DespawnInvocations++;
+                // Re-enter once.  A bug here would either double-fire this
+                // callback or leave a pending-despawn entry behind.
+                if (s_target != null && DespawnInvocations == 1)
+                    s_target.Despawn(s_id);
             }
         }
 

@@ -25,6 +25,17 @@ namespace RTMPE.Crypto.Internal
     /// AEAD nonce counters.  Admit returns <see langword="false"/> when the
     /// counter is a duplicate or falls outside the trailing window.
     /// </summary>
+    /// <remarks>
+    /// THREAD SAFETY: This type is NOT thread-safe.  All callers must invoke
+    /// Admit/Reset from the same thread (the SDK's main-thread packet
+    /// dispatcher).  Calling Admit concurrently would produce torn reads of
+    /// the bitmap and corrupt the highest-seen counter, opening a replay
+    /// window large enough to admit duplicates.  Adding a lock here would
+    /// hide a threading-model violation in the caller; the documented
+    /// invariant is enforced by the dispatcher's main-thread contract, not
+    /// by this type.  Callers that introduce a non-main-thread admission
+    /// path (e.g. a worker pool) MUST add their own external synchronisation.
+    /// </remarks>
     internal sealed class ReplayWindow
     {
         /// <summary>Number of entries the window covers — see RFC 4303 §3.4.3 for sizing rationale.</summary>

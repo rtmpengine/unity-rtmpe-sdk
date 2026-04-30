@@ -121,6 +121,26 @@ namespace RTMPE.Core
         // use-time; values cast back to ulong are always in [1, uint.MaxValue].
         private long _nextLocalId;
 
+        // Sticky flag latched once GenerateObjectId observes the counter at
+        // the u32 ceiling.  Subsequent Spawn calls fail loudly until the
+        // session is reset via ClearAll — preventing a silent wrap that
+        // would re-issue an id whose previous owner is still alive on the
+        // wire and blow up registry uniqueness.  The ceiling is well past
+        // any plausible session lifetime (≈49 days at 1k spawns/sec) so
+        // hitting it in production almost certainly indicates a leak or
+        // hostile flooding rather than legitimate throughput.
+        private bool _localIdSpaceExhausted;
+
+        // Tracks objects whose DestroyLocal teardown has begun but not yet
+        // completed.  A re-entrant Despawn (server-relayed echo arriving
+        // inside the same call stack, an OnNetworkDespawn callback that
+        // synchronously calls back into Despawn, or Unity's own OnDestroy
+        // dispatched mid-teardown) checks this set and short-circuits, so
+        // the registry-presence-based idempotency cannot misclassify the
+        // re-entry as "Despawn arrived before Spawn" and record a stray
+        // pending-despawn TTL entry.
+        private readonly HashSet<ulong> _despawnInFlight = new HashSet<ulong>();
+
         // ── Properties ─────────────────────────────────────────────────────────
 
         /// <summary>The shared object registry for all spawned objects.</summary>
@@ -245,10 +265,24 @@ namespace RTMPE.Core
         /// <param name="objectId">The network object ID to despawn.</param>
         public void Despawn(ulong objectId)
         {
-            // Send DespawnRequest to server for relay to other clients.
-            SendDespawnPacket(objectId);
+            // Re-entrant suppression: if a callback fired from inside an
+            // outer DestroyLocal calls back into Despawn for the same id,
+            // observe a no-op for both the local teardown AND the wire
+            // send.  Without this gate the inner call would emit a second
+            // DespawnRequest packet for the same object, which is wasted
+            // bandwidth and surfaces as a duplicate-despawn at peers.
+            if (_despawnInFlight.Contains(objectId)) return;
 
+            // Tear down the local instance BEFORE the wire send so that any
+            // re-entrant Despawn arriving inside the same call stack
+            // observes an empty registry slot and short-circuits.
+            // DestroyLocal is idempotent: the in-flight set + the
+            // registry-presence check together guarantee a second call
+            // does not double-decrement counters, fire callbacks twice,
+            // or record a stale pending-despawn entry.
             DestroyLocal(objectId);
+
+            SendDespawnPacket(objectId);
         }
 
         // ── Internal: Server-Driven Operations ─────────────────────────────────
@@ -425,6 +459,18 @@ namespace RTMPE.Core
         /// </summary>
         internal void DestroyLocal(ulong objectId)
         {
+            // Re-entrant teardown short-circuit: a callback fired from
+            // within DestroyLocal that calls back here for the SAME id
+            // (server-echoed despawn arriving mid-teardown, user code
+            // re-invoking Despawn from OnNetworkDespawn, Unity's own
+            // OnDestroy dispatched as a side effect of the impending
+            // Object.Destroy below) must observe a no-op.  Without this
+            // guard the second call would see an already-Unregister'd
+            // registry slot, fall through to the "Despawn before Spawn"
+            // branch, and record a stale pending-despawn entry whose
+            // matching Spawn will never arrive.
+            if (_despawnInFlight.Contains(objectId)) return;
+
             var nb = _registry.Get(objectId);
             if (nb == null)
             {
@@ -451,44 +497,57 @@ namespace RTMPE.Core
             // entry so the order list cannot retain a ghost.
             _pendingDespawns.Consume(objectId);
 
-            // Flag the NetworkBehaviour first so its later OnDestroy (which
-            // Unity dispatches during the Destroy() call below) observes the
-            // teardown is already in progress and skips OnExternallyDestroyed.
-            // Without this the counters double-decrement under any pool-less
-            // path that completes synchronously inside the same frame.
-            nb.MarkExternallyEvicted();
+            // Mark teardown in flight so any re-entrant DestroyLocal for the
+            // same id (callback path / server-echoed despawn) short-circuits
+            // at the top of the method.  Cleared in the finally below once
+            // the destroy / pool-release has completed.
+            _despawnInFlight.Add(objectId);
 
-            nb.SetSpawned(false);
-            _registry.Unregister(objectId);
-
-            // Live-count decrement mirrors the increment in CreateLocal.
-            // Clamp at zero so an external destroy that bypasses CreateLocal
-            // can never drive the counter negative and silently extend the cap.
-            if (_currentSpawnCount > 0) _currentSpawnCount--;
-
-            _prefabOfObject.TryGetValue(objectId, out uint prefabId);
-            _prefabOfObject.Remove(objectId);
-
-            // Unity null check: the GO may have been destroyed externally.
-            if (nb == null) return;
-
-            // When a pool is installed, return the instance for reuse instead
-            // of destroying it.  The pool is responsible for deactivating the
-            // GameObject — but we do a final IsOwner-safe NetworkBehaviour
-            // reset so the pooled instance is in a known state next spawn.
-            if (_pool != null)
+            try
             {
-                try { _pool.Release(prefabId, nb.gameObject); }
-                catch (Exception ex)
+                // Flag the NetworkBehaviour first so its later OnDestroy (which
+                // Unity dispatches during the Destroy() call below) observes the
+                // teardown is already in progress and skips OnExternallyDestroyed.
+                // Without this the counters double-decrement under any pool-less
+                // path that completes synchronously inside the same frame.
+                nb.MarkExternallyEvicted();
+
+                nb.SetSpawned(false);
+                _registry.Unregister(objectId);
+
+                // Live-count decrement mirrors the increment in CreateLocal.
+                // Clamp at zero so an external destroy that bypasses CreateLocal
+                // can never drive the counter negative and silently extend the cap.
+                if (_currentSpawnCount > 0) _currentSpawnCount--;
+
+                _prefabOfObject.TryGetValue(objectId, out uint prefabId);
+                _prefabOfObject.Remove(objectId);
+
+                // Unity null check: the GO may have been destroyed externally.
+                if (nb == null) return;
+
+                // When a pool is installed, return the instance for reuse instead
+                // of destroying it.  The pool is responsible for deactivating the
+                // GameObject — but we do a final IsOwner-safe NetworkBehaviour
+                // reset so the pooled instance is in a known state next spawn.
+                if (_pool != null)
                 {
-                    Debug.LogException(ex);
-                    // If the pool throws, fall back to destroy to avoid a leak.
+                    try { _pool.Release(prefabId, nb.gameObject); }
+                    catch (Exception ex)
+                    {
+                        Debug.LogException(ex);
+                        // If the pool throws, fall back to destroy to avoid a leak.
+                        UnityEngine.Object.Destroy(nb.gameObject);
+                    }
+                }
+                else
+                {
                     UnityEngine.Object.Destroy(nb.gameObject);
                 }
             }
-            else
+            finally
             {
-                UnityEngine.Object.Destroy(nb.gameObject);
+                _despawnInFlight.Remove(objectId);
             }
         }
 
@@ -711,6 +770,8 @@ namespace RTMPE.Core
 
             _prefabOfObject.Clear();
             _pendingDespawns.Clear();
+            _despawnInFlight.Clear();
+            _localIdSpaceExhausted = false;
 
             // Reset spawn admission counters: a fresh room must start with a
             // clean rate bucket and a zero live count.
@@ -733,6 +794,34 @@ namespace RTMPE.Core
         // structures inside PendingDespawnTracker in lockstep.  Surfacing
         // each axis lets the adversarial coverage prove that normal
         // consumption never leaves ghost entries in the order list.
+        /// <summary>
+        /// Driver hook for the NetworkManager.Update loop: prune expired
+        /// pending-despawn entries on a regular cadence so a stream of UDP-
+        /// reordered Despawns whose matching Spawns never arrive cannot
+        /// linger past their TTL.  Without periodic invocation the tracker
+        /// is only swept inside CreateLocal / DestroyLocal — which are not
+        /// guaranteed to fire after the last out-of-order Despawn of a
+        /// session, leaving the tracker holding entries until next room.
+        /// </summary>
+        internal void PruneIfStale(long nowMs)
+        {
+            _pendingDespawns.Prune(nowMs);
+        }
+
+        // Exposed for the NetworkManager driver so the periodic prune can
+        // share the SpawnManager's monotonic clock without duplicating it.
+        internal long PendingDespawnNowMillis() => NowMillis();
+
+        // Test seam: lets the SpawnManagerTests force the counter to a
+        // value just below the u32 ceiling so the wrap-detection branch
+        // in GenerateObjectId can be exercised without 4 billion spawns.
+        internal void DangerousSetNextLocalIdForTest(long value)
+        {
+            Interlocked.Exchange(ref _nextLocalId, value);
+        }
+
+        internal bool LocalIdSpaceExhausted => _localIdSpaceExhausted;
+
         internal int PendingDespawnCount      => _pendingDespawns.Count;
         internal int PendingDespawnOrderCount => _pendingDespawns.OrderCount;
         internal int PendingDespawnNodeCount  => _pendingDespawns.NodeCount;
@@ -827,11 +916,35 @@ namespace RTMPE.Core
         /// </remarks>
         private ulong GenerateObjectId()
         {
+            // Refuse new allocations once the u32 ceiling has been hit.
+            // Crossing it silently would wrap the low half of the object id
+            // and re-issue an id whose previous owner is potentially still
+            // alive on the wire — registry-uniqueness invariants would break
+            // and the second SetSpawned would clobber the first object's
+            // bookkeeping.  Surfacing this condition is the only correct
+            // response; ClearAll on disconnect resets the latch.
+            if (_localIdSpaceExhausted) return 0UL;
+
             // Interlocked.Increment returns the post-increment value, so first
-            // call yields 1.  The mask is defence-in-depth — Interlocked on a
-            // long can never produce a negative on the first 2^31 increments,
-            // and ClearAll resets long before that horizon.
-            ulong counter = (ulong)Interlocked.Increment(ref _nextLocalId);
+            // call yields 1.  Allocations beyond uint.MaxValue would wrap the
+            // low 32 bits used as the counter component of the object id; we
+            // detect this by checking whether the post-increment value masked
+            // to u32 is zero (a fresh wrap) OR whether the underlying long has
+            // exceeded uint.MaxValue.
+            long raw = Interlocked.Increment(ref _nextLocalId);
+            if (raw <= 0 || raw > uint.MaxValue)
+            {
+                _localIdSpaceExhausted = true;
+                Debug.LogError(
+                    "[SpawnManager] Local object-id counter has reached the 32-bit ceiling " +
+                    $"(uint.MaxValue = {uint.MaxValue}).  Further Spawn calls will be rejected " +
+                    "until the session is reset (NetworkManager disconnect / ClearAll).  " +
+                    "This indicates either an extreme spawn-leak or a flooding attacker — " +
+                    "investigate before reconnecting.");
+                return 0UL;
+            }
+
+            ulong counter = (ulong)raw;
             return ObjectIdMath.Compose(_networkManager.LocalPlayerId, counter);
         }
 

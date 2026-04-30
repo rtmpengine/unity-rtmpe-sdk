@@ -130,6 +130,16 @@ namespace RTMPE.Rooms
         /// <summary>Fired when the local player successfully leaves a room.</summary>
         public event Action OnRoomLeft;
 
+        /// <summary>
+        /// Snapshot of the most recently-departed room.  Populated immediately
+        /// before <see cref="OnRoomLeft"/> fires, so subscribers can read the
+        /// prior room's id, code, host, etc. without having to cache a copy
+        /// of <see cref="CurrentRoom"/> on the join path.  Cleared when the
+        /// next room is successfully joined.  <see langword="null"/> until
+        /// the first leave occurs.
+        /// </summary>
+        public RoomInfo LastLeftRoom { get; private set; }
+
         /// <summary>Fired when another player joins the current room.</summary>
         public event Action<PlayerInfo> OnPlayerJoined;
 
@@ -685,10 +695,12 @@ namespace RTMPE.Rooms
                     // frame; without this assignment, user OnNetworkDespawn
                     // callbacks would observe (state==Connected, room==A)
                     // — an impossible-in-steady-state combination.
+                    LastLeftRoom = _currentRoom;
                     _currentRoom = null;
                     SafeRaise(OnRoomLeft);
                 }
 
+                LastLeftRoom = null;
                 _currentRoom = room;
 
                 // Populate LocalPlayerStringId so IsOwner checks work.
@@ -742,6 +754,7 @@ namespace RTMPE.Rooms
 
             if (ok)
             {
+                LastLeftRoom   = _currentRoom;
                 _currentRoom   = null;
                 _localPlayerId = string.Empty;
                 SafeRaise(OnRoomLeft);

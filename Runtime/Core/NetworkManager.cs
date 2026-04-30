@@ -369,6 +369,17 @@ namespace RTMPE.Core
         private const long OutboundNonceNearExhaustionMargin   = 1_048_576L;               // ~9.7 h @ 30 Hz
         private long _outboundNonceCounter = -1L;
 
+        // Per-NetworkManager outbound gameplay-sequence counter.  Two
+        // concurrent NetworkManager instances (e.g. a host + a spectator
+        // co-resident in a single process) used to share a static counter
+        // in GameplaySequencePrefix — their sequence streams interleaved
+        // and the receiver's RFC-1982 ordering buffer rejected the alien
+        // values as out-of-window.  The counter is now per-instance;
+        // Interlocked.Increment keeps producer-thread safety inside a
+        // single manager, and the unchecked cast preserves the original
+        // RFC-1982 wraparound semantics.
+        private int _outboundGameplaySequenceCounter;
+
         // Application-level monotonic sequence layered on top of the AEAD nonce
         // counter when NetworkSettings.preserveApplicationSequence is on.  The
         // wire header's Sequence field is overwritten by the nonce counter at
@@ -491,6 +502,14 @@ namespace RTMPE.Core
         // 5-second accumulator for the periodic RPC callback purge sweep.
         private float _rpcPurgeAccum;
         private const float RpcPurgeInterval = 5f;
+
+        // Accumulator for the periodic prune of SpawnManager's pending-
+        // despawn tracker.  Cadence is at the same order as the tracker's
+        // TTL (5 s) so a stale entry is never more than one period past
+        // its expiry — bounding the worst-case occupancy without scheduling
+        // overhead.
+        private float _pendingDespawnPruneAccum;
+        private const float PendingDespawnPruneInterval = 5f;
 
         // ── Telemetry counters (Feature: Network Debugger window) ──────────────
         //
@@ -958,6 +977,21 @@ namespace RTMPE.Core
             {
                 _rpcPurgeAccum = 0f;
                 RequestIdAllocator.PurgeExpired();
+            }
+
+            // Drive a periodic prune of the SpawnManager's pending-despawn
+            // tracker.  CreateLocal / DestroyLocal are the only other prune
+            // paths and they are not guaranteed to fire after the last
+            // out-of-order Despawn of a session — so without this driver
+            // any leftover entries linger until the next room or process
+            // restart.  Cadence matches the tracker TTL window so an entry
+            // is never more than one period late on its expiry.
+            _pendingDespawnPruneAccum += Time.deltaTime;
+            if (_pendingDespawnPruneAccum >= PendingDespawnPruneInterval)
+            {
+                _pendingDespawnPruneAccum = 0f;
+                if (_spawnManager != null)
+                    _spawnManager.PruneIfStale(_spawnManager.PendingDespawnNowMillis());
             }
         }
 
@@ -2043,6 +2077,7 @@ namespace RTMPE.Core
         private long _lastMissingEncryptionWarnTicks;
         private long _lastInboundFloodWarnTicks;
         private long _lastPreSessionGameDataWarnTicks;
+        private long _lastMasterClientTransferWarnTicks;
 
         // Inbound packet rate limiter (token bucket).  The SDK has exactly
         // one peer (the gateway), so this is effectively a hostile-gateway
@@ -2137,6 +2172,7 @@ namespace RTMPE.Core
                 case PacketType.Spawn:
                 case PacketType.Despawn:
                 case PacketType.VariableUpdate:
+                case PacketType.VariableBatchUpdate:
                 case PacketType.Rpc:
                 case PacketType.RpcResponse:
                 case PacketType.RpcBufferReplay:
@@ -2378,6 +2414,22 @@ namespace RTMPE.Core
                     OnRoomPacket(packetType, data);
                     break;
 
+                // MasterClientTransfer (0x2D) is a client→server request packet
+                // (see MasterClientPacketBuilder).  The gateway communicates a
+                // successful transfer to all peers via MasterClientChanged
+                // (0x2C); a server-broadcast 0x2D would either be a relay echo
+                // or a forged packet from an off-path attacker.  Drop it
+                // explicitly with a rate-limited warning so a future protocol
+                // change that legitimately delivers 0x2D server→client surfaces
+                // here rather than silently falling through to the default arm.
+                case PacketType.MasterClientTransfer:
+                    if (ShouldWarn(ref _lastMasterClientTransferWarnTicks))
+                        Debug.LogWarning(
+                            "[RTMPE] Ignoring server-broadcast MasterClientTransfer " +
+                            "(0x2D); this packet is client→server only. The authoritative " +
+                            "master-client change is delivered via MasterClientChanged (0x2C).");
+                    break;
+
                 case PacketType.Disconnect:      OnServerDisconnect(data); break;
                 case PacketType.Data:
                 case PacketType.StateSync:        SafeRaise(OnDataReceived, data, nameof(OnDataReceived)); break;
@@ -2471,20 +2523,32 @@ namespace RTMPE.Core
                     break;
             }
 
-            // Pass the previously emitted HandshakeInit ciphertext
-            // (or null in the reconnect flow) so ValidateChallenge can
-            // reconstruct the same transcript the gateway signed.  A reconnect
-            // path leaves _lastHandshakeInitCiphertext == null, which the
-            // handler maps to the agreed absent-sentinel (32 × 0x00) — replay
-            // defence in that flow is provided by the single-use reconnect
-            // token instead.  The flow argument is derived from the in-flight
-            // reconnect token so the handler can reject any future state where
-            // the two indicators disagree (defence-in-depth against refactor
-            // mistakes that accidentally engage the absent-sentinel path).
-            var handshakeFlow = !string.IsNullOrEmpty(_reconnectToken)
-                              && _lastHandshakeInitCiphertext == null
-                ? HandshakeFlow.Reconnect
-                : HandshakeFlow.Init;
+            // Pass the previously emitted HandshakeInit ciphertext (or null
+            // in the reconnect flow) so ValidateChallenge can reconstruct the
+            // same transcript the gateway signed.  A reconnect path leaves
+            // _lastHandshakeInitCiphertext == null, which the handler maps to
+            // the agreed absent-sentinel (32 × 0x00); replay defence in that
+            // flow is provided by the single-use reconnect token instead.
+            //
+            // Classify the in-flight handshake from the state machine rather
+            // than from ciphertext-presence.  Anchoring on
+            // NetworkState.Reconnecting (set only by StartReconnectAttempt)
+            // and additionally requiring a non-empty reconnect token means a
+            // fresh Connect() that races with a stale _reconnectToken left
+            // over from a prior session cannot silently mis-engage the
+            // reconnect transcript path during the brief window where the
+            // ciphertext is also null.  Any future disagreement between
+            // ciphertext-presence and the state-derived flow is caught by
+            // ValidateChallenge's own defence-in-depth checks.
+            HandshakeFlow handshakeFlow;
+            if (_state == NetworkState.Reconnecting && !string.IsNullOrEmpty(_reconnectToken))
+            {
+                handshakeFlow = HandshakeFlow.Reconnect;
+            }
+            else
+            {
+                handshakeFlow = HandshakeFlow.Init;
+            }
 
             if (!_handshakeHandler.ValidateChallenge(
                     payload,
@@ -3012,14 +3076,46 @@ namespace RTMPE.Core
             {
                 if (_pendingLiveRpcs == null)
                     _pendingLiveRpcs = new System.Collections.Generic.Queue<byte[]>();
+
+                // Per-payload size cap.  An attacker that controls inbound
+                // RPC framing can otherwise enqueue arbitrarily large payloads
+                // (the wire format permits up to the AEAD packet ceiling) and
+                // force the queue to consume memory in O(payload) per slot
+                // rather than O(slot-count).  64 KiB is well above any
+                // legitimate Enhanced RPC; the dispatch path itself does not
+                // produce payloads near this size in normal play.
+                if (payload != null && payload.Length > MaxPendingLiveRpcPayloadBytes)
+                {
+                    System.Threading.Interlocked.Increment(ref _pendingRpcsDroppedCount);
+                    LogDebug(
+                        $"Enhanced RPC: pending payload {payload.Length} B exceeds " +
+                        $"per-payload cap {MaxPendingLiveRpcPayloadBytes} B; dropped.");
+                    return;
+                }
+
+                // Cumulative-bytes cap.  Bounds the worst-case memory growth
+                // independently of the slot count: 4096 small payloads + one
+                // 64 KiB payload + ... is bounded here, not by the slot cap.
+                int payloadLen = payload != null ? payload.Length : 0;
+                if (_pendingLiveRpcsBytes + payloadLen > MaxPendingLiveRpcCumulativeBytes)
+                {
+                    System.Threading.Interlocked.Increment(ref _pendingRpcsDroppedCount);
+                    LogDebug(
+                        $"Enhanced RPC: cumulative pending bytes would exceed " +
+                        $"{MaxPendingLiveRpcCumulativeBytes} B; dropped.");
+                    return;
+                }
+
                 if (_pendingLiveRpcs.Count >= MaxPendingLiveRpcsDuringReplay)
                 {
+                    System.Threading.Interlocked.Increment(ref _pendingRpcsDroppedCount);
                     LogDebug(
                         "Enhanced RPC: pending-during-replay queue full " +
                         $"({MaxPendingLiveRpcsDuringReplay}); dropping to bound memory.");
                     return;
                 }
                 _pendingLiveRpcs.Enqueue(payload);
+                _pendingLiveRpcsBytes += payloadLen;
                 return;
             }
 
@@ -3086,6 +3182,24 @@ namespace RTMPE.Core
         /// replay window's worth.
         /// </summary>
         internal const int MaxPendingLiveRpcsDuringReplay = 4096;
+
+        // Per-payload size cap for queued live RPCs.  Bounds memory consumed
+        // by a single slot independently of the slot count.
+        internal const int MaxPendingLiveRpcPayloadBytes = 64 * 1024;
+
+        // Cumulative-bytes cap across the entire pending queue.  An attacker
+        // cannot multiply payload-count × payload-size beyond this ceiling.
+        internal const int MaxPendingLiveRpcCumulativeBytes = 4 * 1024 * 1024;
+
+        // Running byte total of payloads currently enqueued in
+        // _pendingLiveRpcs.  Maintained on every enqueue / dequeue so the cap
+        // check is O(1).
+        private int _pendingLiveRpcsBytes;
+
+        // Monotonic counter of live RPC payloads dropped at enqueue time
+        // because of one of the size / count caps.  Exposed for diagnostics
+        // and observability.
+        internal long _pendingRpcsDroppedCount;
 
         /// <summary>
         /// Handle an <c>RpcBufferReplay</c> (0x52) packet delivered immediately after joining a room.
@@ -3198,11 +3312,33 @@ namespace RTMPE.Core
                 // items, breaking FIFO.
                 try
                 {
-                    if (_pendingLiveRpcs != null && _pendingLiveRpcs.Count > 0)
+                    // Bounded outer loop.  A drained payload's [RtmpeRpc]
+                    // handler may synchronously dispatch more inbound packets
+                    // through OnEnhancedRpcRequest, which (with
+                    // _replayInProgress still set) re-enqueues onto
+                    // _pendingLiveRpcs.  We re-check the queue after the inner
+                    // drain finishes so those late arrivals are not stranded
+                    // until the next replay.  The outer iteration count is
+                    // capped at 4 to prevent a pathological handler from
+                    // turning the drain into an infinite loop.
+                    const int MaxDrainIterations = 4;
+                    for (int iter = 0; iter < MaxDrainIterations; iter++)
                     {
-                        while (_pendingLiveRpcs.Count > 0)
+                        if (_pendingLiveRpcs == null || _pendingLiveRpcs.Count == 0)
+                            break;
+
+                        // Snapshot the count for the inner loop so a handler
+                        // that synchronously re-enqueues during dispatch
+                        // cannot turn this loop into an infinite drain.  Late
+                        // arrivals are picked up on the next outer iteration
+                        // (and the outer iteration cap is the final ceiling).
+                        int innerBudget = _pendingLiveRpcs.Count;
+                        for (int j = 0; j < innerBudget; j++)
                         {
+                            if (_pendingLiveRpcs.Count == 0) break;
                             var pending = _pendingLiveRpcs.Dequeue();
+                            _pendingLiveRpcsBytes -= pending != null ? pending.Length : 0;
+                            if (_pendingLiveRpcsBytes < 0) _pendingLiveRpcsBytes = 0;
                             try
                             {
                                 DispatchEnhancedRpcPayload(pending);
@@ -3214,6 +3350,14 @@ namespace RTMPE.Core
                                     $"{ex.GetType().Name}: {ex.Message}");
                             }
                         }
+                    }
+
+                    if (_pendingLiveRpcs != null && _pendingLiveRpcs.Count > 0)
+                    {
+                        LogDebug(
+                            "RpcBufferReplay: drain iteration cap reached with " +
+                            $"{_pendingLiveRpcs.Count} payload(s) still queued; " +
+                            "remaining items will be dispatched on the next live RPC.");
                     }
                 }
                 finally
@@ -3431,9 +3575,24 @@ namespace RTMPE.Core
         private void OnRoomManagerJoined(RoomInfo room)
         {
             RememberRoom(room);
+
+            // Drive the state machine when we are arriving at InRoom from a
+            // not-yet-in-a-room state (Connected on first join; Reconnecting
+            // → Connected → InRoom on a fresh connect).  When auto-rejoin
+            // fires after a quick disconnect/reconnect the state may already
+            // be InRoom by the time RoomManager.OnRoomJoined is raised; the
+            // transition itself is a no-op in that case, but the public
+            // OnJoinedRoom event MUST still fire so application code that
+            // gates spawn / UI work on it observes the rejoin.  Firing the
+            // event unconditionally on InRoom arrival makes the contract
+            // independent of how the state machine got us here.
             if (_state == NetworkState.Connected)
             {
                 TransitionTo(NetworkState.InRoom);
+            }
+
+            if (_state == NetworkState.InRoom)
+            {
 #pragma warning disable CS0618
                 SafeRaise(OnJoinedRoom, 0UL, nameof(OnJoinedRoom));
 #pragma warning restore CS0618
@@ -3903,6 +4062,12 @@ namespace RTMPE.Core
             System.Threading.Interlocked.Exchange(ref _outboundNonceCounter, -1L);
             System.Threading.Interlocked.Exchange(ref _outboundAppSequenceCounter, -1L);
             System.Threading.Interlocked.Exchange(ref _lastInboundAppSequence, -1L);
+            // Per-instance gameplay sequence is also session-scoped: the
+            // gateway-side ordering buffer is allocated fresh per session so
+            // a non-zero starting value would only delay the receiver's
+            // window-warmup without any benefit.
+            System.Threading.Interlocked.Exchange(
+                ref _outboundGameplaySequenceCounter, 0);
             _roomManager?.ClearState();
             _spawnManager?.ClearAll();     // Destroy all spawned objects
 
@@ -3937,6 +4102,7 @@ namespace RTMPE.Core
             // or violate the gateway's monotonic sequence/nonce contract.
             _pendingLiveRpcs?.Clear();
             _pendingLiveRpcs = null;
+            _pendingLiveRpcsBytes = 0;
 
             // Drain the static RequestIdAllocator pending map at session
             // boundary.  Without this, OnTimeout closures captured during the
@@ -3998,9 +4164,15 @@ namespace RTMPE.Core
         ///        as a 4-byte LE prefix to the plaintext before sealing.</item>
         ///  <item>AAD = <c>[packet_type, flags]</c> where <c>flags</c> does <b>not</b>
         ///        yet include <c>FLAG_ENCRYPTED</c>.</item>
-        ///  <item>A 12-byte nonce is built: <c>[counter:8 LE u64][_cryptoId:4 LE u32]</c>.
-        ///        The outbound counter is atomically incremented from
-        ///        <c>_outboundNonceCounter</c>.</item>
+        ///  <item>A 12-byte nonce is built by <see cref="BuildAeadNonce"/>:
+        ///        <c>[counter:4 LE u32][zeros:4][_cryptoId:4 LE u32]</c>.  This
+        ///        is the wire encoding of the gateway's
+        ///        <c>[counter:8 LE u64][_cryptoId:4 LE u32]</c> layout — the
+        ///        SDK's outbound counter is a <see cref="uint"/>, so the high
+        ///        four bytes of the LE-u64 representation are always zero
+        ///        (and never written) but the byte positions remain
+        ///        identical.  The outbound counter is atomically incremented
+        ///        from <c>_outboundNonceCounter</c>.</item>
         ///  <item><c>header.sequence</c> is overwritten with the nonce counter (lower
         ///        32 bits), <c>FLAG_ENCRYPTED</c> is set, and <c>payload_len</c> is
         ///        updated to reflect the enlarged ciphertext.</item>
@@ -4152,7 +4324,17 @@ namespace RTMPE.Core
                 : new byte[] { packetType, flags };
 
             // ── 6. Build 12-byte nonce = [counter:8 LE][crypto_id:4 LE] ─────────
+            // The SDK's outbound counter is a uint; the high four bytes of
+            // the LE-u64 counter region are therefore always zero on the
+            // wire.  See BuildAeadNonce for the byte-level layout.
             var nonce = BuildAeadNonce(nonceCounter, _cryptoId);
+            // Wire-format invariant: every AEAD frame is sealed with a
+            // 12-byte nonce.  A regression in BuildAeadNonce would produce
+            // a Poly1305 mismatch on the gateway and a hard-to-trace drop
+            // storm; assert here so the bug surfaces at the offending call.
+            if (nonce == null || nonce.Length != 12)
+                throw new InvalidOperationException(
+                    "BuildAeadNonce returned a non-12-byte nonce — wire format invariant violated.");
 
             // ── 7. Seal (ChaCha20-Poly1305) ──────────────────────────────────────
             var ciphertext = ChaCha20Poly1305Impl.Seal(
@@ -4204,7 +4386,12 @@ namespace RTMPE.Core
             uint gameplaySeqForWire = 0u;
             if (emitGameplay)
             {
-                gameplaySeqForWire = GameplaySequencePrefix.NextSequence();
+                // Per-instance counter avoids the cross-manager interleave
+                // that the previous static GameplaySequencePrefix._counter
+                // exhibited when a process hosted more than one NetworkManager.
+                gameplaySeqForWire = unchecked(
+                    (uint)System.Threading.Interlocked.Increment(
+                        ref _outboundGameplaySequenceCounter));
             }
             var result = new byte[PacketProtocol.HEADER_SIZE + subHeaderBytes + ciphertext.Length];
             // Copy header as-is first, then patch the three affected fields.
@@ -4433,6 +4620,10 @@ namespace RTMPE.Core
 
             // ── 4. Build 12-byte nonce ───────────────────────────────────────────
             var nonce = BuildAeadNonce(nonceCounter, _cryptoId);
+            // Same wire-format invariant as the outbound side; see EncryptAndSend.
+            if (nonce == null || nonce.Length != 12)
+                throw new InvalidOperationException(
+                    "BuildAeadNonce returned a non-12-byte nonce — wire format invariant violated.");
 
             // ── 5. Extract ciphertext (skip header + every sub-header prefix) ────
             // Use the explicit <c>length</c> argument — the rented buffer's
@@ -4905,6 +5096,16 @@ namespace RTMPE.Core
                 using var ms     = new System.IO.MemoryStream(payload, 13, payload.Length - 13);
                 using var reader = new System.IO.BinaryReader(ms);
 
+                // Per-packet upper bound on cumulative deserialized variable
+                // bytes.  The wire format permits varCount=255 × valueLen=65535
+                // (16 MiB of main-thread work per datagram); this cap ensures a
+                // single hostile datagram cannot stall the dispatcher.  The cap
+                // is generous relative to legitimate payloads (a typical
+                // batch flushes well under 4 KiB) and matches the safe-message
+                // ceiling used by the gateway.
+                const int MaxVariableUpdateCumulativeBytes = 64 * 1024;
+                int cumulativeBytes = 0;
+
                 for (int i = 0; i < varCount; i++)
                 {
                     // Wire format: [var_id:2 LE][value_len:2 LE][value_bytes:N]
@@ -4916,6 +5117,17 @@ namespace RTMPE.Core
                     ushort valueLen = reader.ReadUInt16();
 
                     if (ms.Length - ms.Position < valueLen) break; // truncated packet
+
+                    cumulativeBytes += 4 + valueLen;
+                    if (cumulativeBytes > MaxVariableUpdateCumulativeBytes)
+                    {
+                        if (ShouldWarn(ref _lastVariableUpdateTrailingWarnTicks))
+                            Debug.LogWarning(
+                                "[RTMPE] VariableUpdate: cumulative deserialized " +
+                                $"bytes exceeded {MaxVariableUpdateCumulativeBytes} for objectId " +
+                                $"{objectId}; rejecting packet to bound main-thread work.");
+                        return;
+                    }
 
                     long valueStart = ms.Position;
                     nb.ApplyVariableUpdate(varId, reader, valueLen, packetTick, hasPacketTick: true);
@@ -5312,6 +5524,105 @@ namespace RTMPE.Core
 #pragma warning restore IDE1006
         }
 
+        // Holds the array-form aud values, populated by NormaliseJwtAudClaim
+        // and consumed by the audience membership check.  Cleared after each
+        // ValidateJwt call to avoid leaking state across invocations.
+        private string[] _audValuesParsed;
+
+        /// <summary>
+        /// RFC 7519 §4.1.3 permits the JWT <c>aud</c> claim to be either a
+        /// single string or an array of strings.  Unity's <c>JsonUtility</c>
+        /// reflector cannot bind a heterogeneous shape onto a single field;
+        /// detect the array form, capture its values into
+        /// <see cref="_audValuesParsed"/>, and rewrite the JSON so the
+        /// downstream <c>JsonUtility.FromJson&lt;JwtClaimsDto&gt;</c> call
+        /// sees a single string-typed <c>aud</c> field (an empty string when
+        /// the array was empty).  When the input <c>aud</c> is already a
+        /// string the JSON is returned unchanged.
+        /// </summary>
+        private static string NormaliseJwtAudClaim(string json, out string[] audValues)
+        {
+            audValues = null;
+            if (string.IsNullOrEmpty(json)) return json;
+
+            // Locate the aud key — only the first occurrence at top level
+            // matters; nested objects are not relevant to the JWT envelope.
+            int keyIdx = json.IndexOf("\"aud\"", StringComparison.Ordinal);
+            if (keyIdx < 0) return json;
+
+            int colonIdx = json.IndexOf(':', keyIdx);
+            if (colonIdx < 0) return json;
+
+            int valueStart = colonIdx + 1;
+            while (valueStart < json.Length && char.IsWhiteSpace(json[valueStart]))
+                valueStart++;
+            if (valueStart >= json.Length || json[valueStart] != '[')
+                return json; // already a string (or null) — leave unchanged.
+
+            // Find the matching ']' — JWT aud arrays are flat string arrays,
+            // but a defensive bracket counter handles any nested literal that
+            // a malformed token might present.
+            int depth = 0;
+            int closeIdx = -1;
+            bool inString = false;
+            bool escape = false;
+            for (int i = valueStart; i < json.Length; i++)
+            {
+                char c = json[i];
+                if (escape)            { escape = false; continue; }
+                if (c == '\\')         { escape = true;  continue; }
+                if (c == '"')          { inString = !inString; continue; }
+                if (inString)          continue;
+                if (c == '[')          depth++;
+                else if (c == ']')
+                {
+                    depth--;
+                    if (depth == 0) { closeIdx = i; break; }
+                }
+            }
+            if (closeIdx < 0) return json;
+
+            string arraySegment = json.Substring(valueStart, closeIdx - valueStart + 1);
+
+            // Extract every quoted string literal inside the array; ignore
+            // non-string elements (token would be rejected downstream
+            // because none would match the configured audience).
+            var values = new System.Collections.Generic.List<string>();
+            inString = false;
+            escape = false;
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < arraySegment.Length; i++)
+            {
+                char c = arraySegment[i];
+                if (escape)
+                {
+                    if (c == 'n') sb.Append('\n');
+                    else if (c == 't') sb.Append('\t');
+                    else if (c == 'r') sb.Append('\r');
+                    else sb.Append(c);
+                    escape = false;
+                    continue;
+                }
+                if (c == '\\' && inString) { escape = true; continue; }
+                if (c == '"')
+                {
+                    if (inString) { values.Add(sb.ToString()); sb.Clear(); inString = false; }
+                    else          { inString = true; }
+                    continue;
+                }
+                if (inString) sb.Append(c);
+            }
+
+            audValues = values.ToArray();
+
+            // Replace the array with a single string ("" when empty) so
+            // JsonUtility binds the legacy `aud` field cleanly.
+            string replacement = values.Count > 0
+                ? "\"" + values[0].Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""
+                : "\"\"";
+            return json.Substring(0, valueStart) + replacement + json.Substring(closeIdx + 1);
+        }
+
         [Serializable]
         private sealed class JwtClaimsDto
         {
@@ -5402,9 +5713,14 @@ namespace RTMPE.Core
             }
 
             // ── Signature verification (runs before any claim parsing) ──────
+            // Secure-by-default fallback: when no NetworkSettings asset is
+            // attached we still demand a signed token.  Ed25519 mirrors the
+            // serialised default on NetworkSettings so a missing settings
+            // asset cannot silently downgrade verification to "None" the way
+            // the previous code path did.
             var algMode = _settings != null
                 ? _settings.jwtSignatureAlgorithm
-                : NetworkSettings.JwtSignatureAlgorithm.None;
+                : NetworkSettings.JwtSignatureAlgorithm.Ed25519;
 
             // RFC 8725 §3.1: reject `alg=none` (and missing alg) unconditionally,
             // regardless of pin configuration, so a misconfigured verifier cannot
@@ -5481,6 +5797,14 @@ namespace RTMPE.Core
             JwtClaimsDto dto;
             try
             {
+                // RFC 7519 §4.1.3 permits `aud` to be either a JSON string OR
+                // a JSON array of strings.  Unity's JsonUtility cannot reflect
+                // both shapes onto the same field; rewrite an array-shaped
+                // `aud` into a delimited string first so the existing string
+                // field receives a single deterministic value.  The original
+                // array values are preserved in `_audValuesParsed` for the
+                // membership check below.
+                json = NormaliseJwtAudClaim(json, out _audValuesParsed);
                 dto = JsonUtility.FromJson<JwtClaimsDto>(json);
             }
             catch (Exception ex)
@@ -5522,7 +5846,7 @@ namespace RTMPE.Core
             }
             else if (!string.Equals(dto.iss, expectedIssuer, StringComparison.Ordinal))
             {
-                error = $"JWT iss '{dto.iss ?? string.Empty}' does not match expected issuer";
+                error = $"JWT iss '{SanitiseUntrustedForLog(dto.iss)}' does not match expected issuer";
                 return false;
             }
 
@@ -5530,11 +5854,38 @@ namespace RTMPE.Core
             {
                 WarnJwtAudienceUnconfiguredOnce();
             }
-            else if (!string.Equals(dto.aud, expectedAudience, StringComparison.Ordinal))
+            else
             {
-                error = $"JWT aud '{dto.aud ?? string.Empty}' does not match expected audience";
-                return false;
+                bool audOk;
+                if (_audValuesParsed != null && _audValuesParsed.Length > 0)
+                {
+                    // Array-shaped aud: token is valid only if expectedAudience
+                    // is a member of the array (RFC 7519 §4.1.3).
+                    audOk = false;
+                    for (int i = 0; i < _audValuesParsed.Length; i++)
+                    {
+                        if (string.Equals(_audValuesParsed[i], expectedAudience, StringComparison.Ordinal))
+                        {
+                            audOk = true;
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    audOk = string.Equals(dto.aud, expectedAudience, StringComparison.Ordinal);
+                }
+
+                if (!audOk)
+                {
+                    // Sanitise the untrusted aud value before embedding it in
+                    // a log line: an attacker-supplied JWT could otherwise
+                    // inject ANSI escape sequences or forged log delimiters.
+                    error = $"JWT aud '{SanitiseUntrustedForLog(dto.aud)}' does not match expected audience";
+                    return false;
+                }
             }
+            _audValuesParsed = null;
 
             subject = dto.sub;
             return true;
@@ -5612,6 +5963,49 @@ namespace RTMPE.Core
 
         internal static void ResetJwtIssuerUnconfiguredWarningForTests()
             => System.Threading.Interlocked.Exchange(ref _jwtIssuerUnconfiguredWarned, 0);
+
+        /// <summary>
+        /// Sanitise an attacker-controlled string before it is folded into a
+        /// log line.  JWT <c>iss</c> / <c>aud</c> claims arrive across the
+        /// wire and are echoed verbatim into the SessionAck rejection message,
+        /// which in turn lands in <see cref="UnityEngine.Debug.LogError"/> and
+        /// any downstream log aggregator (Sentry, CloudWatch, etc.).  Without
+        /// scrubbing, a hostile token could embed ANSI escape sequences to
+        /// hijack a developer's terminal, line breaks to spoof log entries,
+        /// or arbitrarily large payloads to DoS the log pipeline.
+        ///
+        /// <para>The transformation is intentionally conservative:</para>
+        /// <list type="bullet">
+        ///  <item>C0 / C1 control characters (<c>\x00</c>–<c>\x1F</c>, <c>\x7F</c>) and
+        ///        the ANSI CSI introducer (<c>\x1B</c>) are replaced with
+        ///        <c>'?'</c> — the byte-for-byte original is irrecoverable but
+        ///        the visible length is preserved for debugging.</item>
+        ///  <item>The result is truncated to 128 bytes (the longest realistic
+        ///        OIDC issuer URL fits comfortably; pathological tokens that
+        ///        attempt to flood the log are clipped with a trailing
+        ///        <c>"…"</c>).</item>
+        /// </list>
+        /// </summary>
+        private static string SanitiseUntrustedForLog(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return string.Empty;
+            const int MaxBytes = 128;
+            int copyLen = raw.Length > MaxBytes ? MaxBytes : raw.Length;
+            var sb = new System.Text.StringBuilder(copyLen + 1);
+            for (int i = 0; i < copyLen; i++)
+            {
+                char c = raw[i];
+                // \x1B (ESC) is the ANSI CSI introducer; treat it the same as
+                // any other control char so a crafted iss/aud cannot rewrite
+                // the developer's terminal via colour / cursor escapes.
+                if (c < 0x20 || c == 0x7F)
+                    sb.Append('?');
+                else
+                    sb.Append(c);
+            }
+            if (raw.Length > MaxBytes) sb.Append('…');
+            return sb.ToString();
+        }
 
         // ── Protocol-error rejection test seam ────────────────────────────────
 

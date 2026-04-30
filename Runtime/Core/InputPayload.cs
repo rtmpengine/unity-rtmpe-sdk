@@ -57,6 +57,11 @@ namespace RTMPE.Core
         public void WriteTo(byte[] buf, int offset)
         {
             if (buf == null) throw new ArgumentNullException(nameof(buf));
+            if ((uint)offset > (uint)buf.Length || buf.Length - offset < WireSize)
+                throw new ArgumentException(
+                    $"InputPayload.WriteTo: destination buffer is too small " +
+                    $"(buf.Length={buf.Length}, offset={offset}, required={WireSize}).",
+                    nameof(buf));
             // Sender-side finiteness gate.  A custom controller that
             // produces NaN MoveX (e.g. division by zero in a deadzone
             // computation) would otherwise be enqueued into the local
@@ -85,6 +90,11 @@ namespace RTMPE.Core
         public static InputPayload ReadFrom(byte[] buf, int offset)
         {
             if (buf == null) throw new ArgumentNullException(nameof(buf));
+            if ((uint)offset > (uint)buf.Length || buf.Length - offset < WireSize)
+                throw new ArgumentException(
+                    $"InputPayload.ReadFrom: source buffer is too small " +
+                    $"(buf.Length={buf.Length}, offset={offset}, required={WireSize}).",
+                    nameof(buf));
             float moveX = ReadF32LE(buf, offset + 4);
             float moveY = ReadF32LE(buf, offset + 8);
             // Reject NaN / ±Inf at the parser boundary. These values would

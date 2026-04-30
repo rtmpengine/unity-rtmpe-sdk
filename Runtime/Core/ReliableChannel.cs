@@ -264,7 +264,12 @@ namespace RTMPE.Core
                 if (!e.InUse) continue;
                 if (nowSeconds < e.NextSendAt) continue;
 
-                if (e.Attempts >= MaxAttempts)
+                // Strict greater-than: TryRegisterOutbound seeds Attempts=1 to
+                // represent the initial transmit, so the cap measured here is
+                // the number of *retransmits* performed by Tick.  With "> "
+                // semantics, MaxAttempts=8 yields exactly 8 retransmits before
+                // the entry is dropped, matching the field name's contract.
+                if (e.Attempts > MaxAttempts)
                 {
                     uint dropped = e.Sequence;
                     e = default;

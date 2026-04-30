@@ -744,6 +744,20 @@ namespace RTMPE.Sync
         /// </summary>
         public void OwnerTeleportTo(Vector3 worldPosition)
         {
+            // Reject teleport requests on objects this peer does not own.
+            // The velocity-cap reset that follows is a legitimate escape hatch
+            // for the owner (respawn, scripted travel) but a hostile path if
+            // any peer can invoke it on any object — a remote player could
+            // bypass the anti-cheat clamp on the local owner's transform.
+            if (!IsOwner)
+            {
+                UnityEngine.Debug.LogWarning(
+                    $"[RTMPE] NetworkTransform.OwnerTeleportTo on object {NetworkObjectId} " +
+                    "ignored: caller does not own this object.  Teleport is owner-only " +
+                    "by design; remote peers must use the standard reconciled position " +
+                    "stream, not this fast path.");
+                return;
+            }
             transform.position    = worldPosition;
             _lastSentPosition     = worldPosition;
             _lastSentTimeUnscaled = Time.unscaledTimeAsDouble;

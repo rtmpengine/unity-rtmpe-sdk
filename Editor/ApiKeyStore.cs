@@ -337,19 +337,32 @@ namespace RTMPE.Editor
 #if UNITY_EDITOR_OSX
         private static bool TryWriteMacKeychain(string apiKey)
         {
-            // -U upserts; -w writes the secret on stdin via -w argument
-            // (acceptable on macOS because the Editor process is the
-            // owner; ProcessStartInfo arguments are not visible to other
-            // unprivileged users on a properly-configured system).
-            var psi = new ProcessStartInfo("security",
-                $"add-generic-password -U -a \"{AccountName}\" -s \"{ServiceName}\" -w \"{EscapeShell(apiKey)}\"")
+            // The API key MUST NOT appear in argv: every user on the system
+            // can read another user's argv via `ps -ef` / `ps aux`, and on
+            // shared CI runners or developer workstations with multiple
+            // accounts that exposure leaks the key beyond the Editor's
+            // owning user.  Mirror the Linux secret-tool flow: spawn
+            // `security -i` (interactive command mode), then write the
+            // command — including the secret — to stdin.  Stdin is a pipe
+            // visible only to the parent and child processes; argv is not.
+            var psi = new ProcessStartInfo("security", "-i")
             {
                 UseShellExecute = false,
+                RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 CreateNoWindow = true,
             };
             using var p = Process.Start(psi);
+            // `security -i` reads one command per line.  Account / service
+            // / label values are quoted with backslash-escaping so a stray
+            // quote in those (developer-supplied) constants cannot break
+            // the parser; the apiKey is similarly quoted so embedded
+            // whitespace survives.  Documented `security` quoting rules
+            // accept C-style backslash escapes inside double quotes.
+            p.StandardInput.WriteLine(
+                $"add-generic-password -U -a \"{EscapeShell(AccountName)}\" -s \"{EscapeShell(ServiceName)}\" -w \"{EscapeShell(apiKey)}\"");
+            p.StandardInput.Close();
             return TryWaitForCleanExit(p, 5_000, out int exit) && exit == 0;
         }
 

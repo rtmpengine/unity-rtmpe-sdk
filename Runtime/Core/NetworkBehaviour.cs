@@ -356,6 +356,11 @@ namespace RTMPE.Core
         private bool _externallyEvicted;
         internal void MarkExternallyEvicted() => _externallyEvicted = true;
 
+        // Latched once per instance the first time FlushDirtyVariables hits
+        // the 255-variable wire-format cap.  Prevents the diagnostic warning
+        // from spamming every flush tick when the configuration is permanent.
+        private bool _overflowWarned;
+
         // ── Internal SDK API (called by SpawnManager) ──────────────────────────
 
         /// <summary>
@@ -478,9 +483,18 @@ namespace RTMPE.Core
             // bookkeeping.  Cheap (one float assignment per variable) and
             // correctness-critical for variables with low SendRateHz where the
             // throttle interval can exceed the gap between ownership handoffs.
+            //
+            // Reset the inbound-tick gate as well: the new owner's first
+            // VariableUpdate may carry a tick lower than the highest tick the
+            // previous owner observed (a different sender's tick clock), and
+            // without resetting the gate that update would be dropped as a
+            // stale replay until the new owner's tick passed the high-water
+            // mark — visible to the user as a multi-second silent under-
+            // replication after every handoff.
             for (int i = 0; i < _trackedVariables.Count; i++)
             {
                 _trackedVariables[i].ResetThrottleState();
+                _trackedVariables[i].ResetInboundTickGate();
             }
 
             OnOwnershipChanged(previous, _ownerPlayerId);
@@ -689,7 +703,21 @@ namespace RTMPE.Core
                 // never overflow it.  Any remaining dirty variables stay
                 // dirty and are sent on the next tick.  This is a hard wire
                 // limit; the alternative would be silent data corruption.
-                if (count == byte.MaxValue) break;
+                if (count == byte.MaxValue)
+                {
+                    if (!_overflowWarned)
+                    {
+                        _overflowWarned = true;
+                        UnityEngine.Debug.LogWarning(
+                            "[RTMPE] FlushDirtyVariables: " +
+                            $"NetworkBehaviour '{name}' (type {GetType().Name}) " +
+                            $"hit the 255-variable wire-format cap; remaining dirty " +
+                            "variables will be sent on later ticks. Consider splitting " +
+                            "the variable set across multiple NetworkBehaviours so each " +
+                            "object's flush fits in a single VariableUpdate packet.");
+                    }
+                    break;
+                }
             }
 
             // Flush the BinaryWriter so its internal buffer is fully committed to ms

@@ -87,8 +87,10 @@ namespace RTMPE.Infrastructure.Serialization
 
         // Rate limit warning spam so a hostile peer cannot pin the main
         // thread on UnityEngine.Debug.LogWarning string formatting alone.
-        private const long WarningCooldownTicks = TimeSpan.TicksPerSecond * 1;
-        private static long s_lastWarningTicks;
+        // Uses Environment.TickCount64 (milliseconds, monotonic) — faster than
+        // DateTime.UtcNow on Windows and immune to NTP backward steps.
+        private const long WarningCooldownMs = 1000L;
+        private static long s_lastWarningMs;
 
         /// <summary>
         /// Delegate matching the static <c>Verify</c> method emitted by the
@@ -581,13 +583,13 @@ namespace RTMPE.Infrastructure.Serialization
         private static void LogVerificationFailure(string tag, string reason)
         {
             // Atomic compare-exchange so concurrent callers do not all log.
-            var now = DateTime.UtcNow.Ticks;
-            var last = Interlocked.Read(ref s_lastWarningTicks);
-            if (now - last < WarningCooldownTicks)
+            var now  = Environment.TickCount64;
+            var last = Interlocked.Read(ref s_lastWarningMs);
+            if (now - last < WarningCooldownMs)
             {
                 return;
             }
-            if (Interlocked.CompareExchange(ref s_lastWarningTicks, now, last) != last)
+            if (Interlocked.CompareExchange(ref s_lastWarningMs, now, last) != last)
             {
                 return;
             }

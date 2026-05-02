@@ -76,7 +76,7 @@ namespace RTMPE.Tests
             Assert.AreEqual(0, purged0);
             Assert.AreEqual(0, callbackCount);
 
-            Thread.Sleep(120);
+            SpinYieldUntilElapsed(120);
             int purged1 = RequestIdAllocator.PurgeExpired();
             Assert.AreEqual(1, purged1);
             Assert.AreEqual(1, callbackCount);
@@ -100,7 +100,7 @@ namespace RTMPE.Tests
             }
             Assert.AreEqual(count, RequestIdAllocator.PendingCount);
 
-            Thread.Sleep(80);
+            SpinYieldUntilElapsed(80);
             int purged = RequestIdAllocator.PurgeExpired();
 
             Assert.AreEqual(count, purged, "All expired entries must be removed in one sweep.");
@@ -118,7 +118,7 @@ namespace RTMPE.Tests
                 onTimeout: () => Interlocked.Increment(ref callbackCount));
 
             Assert.IsTrue(RequestIdAllocator.Resolve(id));
-            Thread.Sleep(120);
+            SpinYieldUntilElapsed(120);
             RequestIdAllocator.PurgeExpired();
             Assert.AreEqual(0, callbackCount);
         }
@@ -180,7 +180,7 @@ namespace RTMPE.Tests
                 var interp = go.AddComponent<NetworkTransformInterpolator>();
                 // max = 100 seconds for the test
                 interp.ConfigureForTest(bufferSize: 5, interpolationDelay: 0.1f,
-                                        maxAcceptableTimestamp: 100.0);
+                                        maxFutureSkewSeconds: 100.0);
 
                 interp.AddState(MakeState(), double.MaxValue);
                 Assert.AreEqual(0, interp.BufferCount);
@@ -434,6 +434,84 @@ namespace RTMPE.Tests
             Assert.AreEqual(7, view.Span[0]);
             Assert.AreEqual(8, view.Span[1]);
             Assert.AreEqual(9, view.Span[2]);
+        }
+
+        // Polls Environment.TickCount64 in a Thread.Yield() loop until at least
+        // minMs wall-clock milliseconds have elapsed.  Deterministic alternative
+        // to Thread.Sleep for tests that must wait for a real-time deadline to
+        // pass (e.g. RequestIdAllocator timeout expiry).
+        private static void SpinYieldUntilElapsed(int minMs)
+        {
+            long start = Environment.TickCount64;
+            while (Environment.TickCount64 - start < minMs)
+                Thread.Yield();
+        }
+    }
+
+    // ── RequestIdAllocator clock-source perf regression ───────────────────
+    //
+    // Pins that RegisterPending and PurgeExpired stay allocation-free after
+    // the DateTime.UtcNow → Environment.TickCount64 migration.  A boxed
+    // DateTime or a ToUniversalTime call re-introduced here would appear
+    // immediately as a non-zero perCall allocation.
+
+    [TestFixture]
+    [Category("Performance")]
+    public class RequestIdAllocatorPerfTests
+    {
+        [SetUp]
+        public void SetUp() => RequestIdAllocator.ResetForTest();
+
+        [TearDown]
+        public void TearDown() => RequestIdAllocator.ResetForTest();
+
+        [Test]
+        [Description("RegisterPending must not allocate after JIT warm-up.")]
+        public void RegisterPending_IsAllocationFree()
+        {
+            // Warm up JIT + dictionary internals.
+            for (int i = 0; i < 10; i++)
+            {
+                uint id = RequestIdAllocator.Next();
+                RequestIdAllocator.RegisterPending(id, TimeSpan.FromSeconds(30));
+                RequestIdAllocator.Resolve(id);
+            }
+            RequestIdAllocator.ResetForTest();
+
+            const int Iterations = 500;
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < Iterations; i++)
+            {
+                uint id = RequestIdAllocator.Next();
+                RequestIdAllocator.RegisterPending(id, TimeSpan.FromSeconds(30));
+                RequestIdAllocator.Resolve(id);
+            }
+            long after = GC.GetAllocatedBytesForCurrentThread();
+
+            long perCall = (after - before) / Iterations;
+            // Dictionary.Add may allocate an Entry array bucket on first fill;
+            // 64 B ceiling catches any boxing or DateTimeOffset allocation
+            // re-introduced into the hot path.
+            Assert.Less(perCall, 64,
+                $"RegisterPending+Resolve allocated {perCall} B/call — clock-source regression.");
+        }
+
+        [Test]
+        [Description("PurgeExpired on an empty map must be allocation-free.")]
+        public void PurgeExpired_EmptyMap_IsAllocationFree()
+        {
+            // Warm up.
+            for (int i = 0; i < 5; i++) RequestIdAllocator.PurgeExpired();
+
+            const int Iterations = 1000;
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < Iterations; i++)
+                RequestIdAllocator.PurgeExpired();
+            long after = GC.GetAllocatedBytesForCurrentThread();
+
+            long perCall = (after - before) / Iterations;
+            Assert.Less(perCall, 8,
+                $"PurgeExpired(empty) allocated {perCall} B/call — expected zero-alloc fast exit.");
         }
     }
 

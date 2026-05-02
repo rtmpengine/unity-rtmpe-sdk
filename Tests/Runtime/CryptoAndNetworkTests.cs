@@ -632,11 +632,12 @@ namespace RTMPE.Tests
     {
         private sealed class NullTransport : NetworkTransport
         {
+            private readonly ManualResetEventSlim _pollGate = new ManualResetEventSlim(false);
             public override bool IsConnected => true;
             public override void Connect()    { }
             public override void Disconnect() { }
-            public override void Dispose()    { }
-            public override bool Poll(int microSeconds) { Thread.Sleep(1); return false; }
+            public override void Dispose()    { _pollGate.Dispose(); }
+            public override bool Poll(int microSeconds) { _pollGate.Wait(1); return false; }
             public override int  Receive(byte[] buffer) => 0;
             public override void Send(byte[] data)      { }
         }

@@ -991,5 +991,21 @@ namespace RTMPE.Rooms
                 $"{ex.GetType().Name}: {ex.Message}.  Continuing with " +
                 "remaining subscribers.");
         }
+
+        // ── Test hooks ────────────────────────────────────────────────────────
+        // Events are only accessible as delegates from within the declaring
+        // class; tests use these helpers instead of reflection to count
+        // subscribers.  Do NOT call from production code.
+
+        internal int GetOnRoomJoinedSubscriberCount()
+            => OnRoomJoined?.GetInvocationList()?.Length ?? 0;
+        internal int GetOnRoomLeftSubscriberCount()
+            => OnRoomLeft?.GetInvocationList()?.Length ?? 0;
+        internal int GetOnRoomCreatedSubscriberCount()
+            => OnRoomCreated?.GetInvocationList()?.Length ?? 0;
+        internal int GetOnPlayerLeftSubscriberCount()
+            => OnPlayerLeft?.GetInvocationList()?.Length ?? 0;
+        internal int GetOnPlayerJoinedSubscriberCount()
+            => OnPlayerJoined?.GetInvocationList()?.Length ?? 0;
     }
 }

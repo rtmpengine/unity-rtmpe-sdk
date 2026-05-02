@@ -180,9 +180,9 @@ namespace RTMPE.Tests
             // The clock fields are private; drive Tick() in a busy-loop
             // using a timer is flaky in CI, so just bound the loop to keep
             // the test fast and assert observed invariants.
-            var deadline = DateTime.UtcNow.AddSeconds(2);
+            long deadlineMs = Environment.TickCount64 + 2_000;
             uint observedCycle = 0;
-            while (DateTime.UtcNow < deadline)
+            while (Environment.TickCount64 < deadlineMs)
             {
                 hb.Tick(sink);
                 if (hb.CurrentCycleId > observedCycle)
@@ -190,7 +190,7 @@ namespace RTMPE.Tests
                     observedCycle = hb.CurrentCycleId;
                     if (observedCycle >= 1) break;
                 }
-                Thread.Sleep(20);
+                Thread.Yield();
             }
             Assert.IsTrue(observedCycle >= 1, "At least one cycle must have started.");
             Assert.IsTrue(hb.IsAwaitingAck, "After send, IsAwaitingAck must be true.");

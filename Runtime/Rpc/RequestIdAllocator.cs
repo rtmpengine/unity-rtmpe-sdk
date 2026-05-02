@@ -48,10 +48,13 @@ namespace RTMPE.Rpc
         // to avoid the per-allocation overhead of CreateInstance.
         private static readonly RandomNumberGenerator Rng = RandomNumberGenerator.Create();
 
-        // Pending registry: id → (deadlineUtcTicks, optional timeout callback).
+        // Pending registry: id → (deadlineMs, optional timeout callback).
+        // Deadline stored as Environment.TickCount64 milliseconds — monotonic,
+        // immune to NTP clock adjustments, and ~100x cheaper than DateTime.UtcNow
+        // on Windows (HPET read vs. kernel syscall).
         private struct Entry
         {
-            public long DeadlineTicks;
+            public long DeadlineMs;
             public Action OnTimeout;
         }
 
@@ -114,10 +117,13 @@ namespace RTMPE.Rpc
         public static void RegisterPending(uint id, TimeSpan timeout, Action onTimeout = null)
         {
             if (id == 0) return;
-            long deadline = DateTime.UtcNow.Add(timeout).Ticks;
+            // Environment.TickCount64 is a monotonic millisecond counter — immune
+            // to NTP corrections that can cause DateTime.UtcNow to go backward,
+            // and significantly cheaper on Windows (HPET read vs. syscall).
+            long deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
             lock (Lock)
             {
-                Pending[id] = new Entry { DeadlineTicks = deadline, OnTimeout = onTimeout };
+                Pending[id] = new Entry { DeadlineMs = deadline, OnTimeout = onTimeout };
             }
         }
 
@@ -141,7 +147,7 @@ namespace RTMPE.Rpc
         /// </summary>
         public static int PurgeExpired()
         {
-            long nowTicks = DateTime.UtcNow.Ticks;
+            long nowMs = Environment.TickCount64;
             List<Action> callbacks = null;
             int purged = 0;
 
@@ -152,7 +158,7 @@ namespace RTMPE.Rpc
                 List<uint> toRemove = null;
                 foreach (var kv in Pending)
                 {
-                    if (kv.Value.DeadlineTicks <= nowTicks)
+                    if (kv.Value.DeadlineMs <= nowMs)
                     {
                         if (toRemove == null) toRemove = new List<uint>();
                         toRemove.Add(kv.Key);

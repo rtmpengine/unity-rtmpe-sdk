@@ -98,12 +98,13 @@ namespace RTMPE.Tests
 
             receiver.Start();
 
-            // Let the receiver get into its loop, then dispose underneath it.
-            Thread.Sleep(20);
+            // Wait for the receiver to complete at least one loop iteration.
+            Assert.IsTrue(SpinWait.SpinUntil(() => receiveCount > 0, 2_000),
+                "receiver must have started looping within 2s");
             transport.Disconnect();
 
-            // Give the receiver a window to observe the disposal.
-            Thread.Sleep(50);
+            // Wait for the receiver to process at least one iteration post-disconnect.
+            SpinWait.SpinUntil(() => receiveCount > 1, 2_000);
             stop.Set();
             Assert.IsTrue(receiver.Join(2_000), "receiver thread must exit promptly");
 

@@ -321,12 +321,12 @@ namespace RTMPE.Tests
             long after = GC.GetAllocatedBytesForCurrentThread();
 
             long perCall = (after - before) / Iterations;
-            // Today: MemoryStream + BinaryWriter + ToArray() ≈ 700-900 B.
-            // The audit's NEW-PF-1 calls this out as a Tier-1 perf target.
-            // The 4 KB ceiling pins the current state and catches a 4×
-            // regression; tighten as ArrayPool wrappers land.
-            Assert.Less(perCall, 4 * 1024,
-                $"FlushDirtyVariables(1 int) allocated {perCall} B/call — over 4 KB ceiling.");
+            // MemoryStream + BinaryWriter are now cached per-instance; only
+            // ToArray() allocates per flush (≈ 21 B for one int variable).
+            // 256 B ceiling catches any regression that re-introduces per-call
+            // stream/writer allocation while allowing for managed overhead.
+            Assert.Less(perCall, 256,
+                $"FlushDirtyVariables(1 int) allocated {perCall} B/call — over 256 B ceiling (cached-stream fix regressed).");
         }
 
         // ── Test fixtures ────────────────────────────────────────────────────

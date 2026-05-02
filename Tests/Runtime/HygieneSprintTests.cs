@@ -189,8 +189,9 @@ namespace RTMPE.Tests
             }
 
             transport.Connect();
-            // Let the readers race against the freshly-published state.
-            Thread.Sleep(50);
+            // Wait until at least one reader has observed the published endpoint.
+            Assert.IsTrue(SpinWait.SpinUntil(() => reads > 0, 2_000),
+                "reader threads must have observed at least one snapshot within 2s");
             stop.Set();
             foreach (var t in readers) t.Join(2_000);
 

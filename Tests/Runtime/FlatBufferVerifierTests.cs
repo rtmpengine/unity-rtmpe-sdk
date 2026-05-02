@@ -187,5 +187,49 @@ namespace RTMPE.Tests
                     "InputPayload");
             });
         }
+
+        // ── Rate-limiter clock-source perf regression ──────────────────────
+        //
+        // LogVerificationFailure is on the receive hot path; the rate-limiter
+        // gate (s_lastWarningMs) must use Environment.TickCount64, not
+        // DateTime.UtcNow.  A DateTime allocation here would show up as a
+        // non-zero perCall allocation on the rejection path.
+
+        [Test]
+        [Category("Performance")]
+        [Description("Repeated rejection of a truncated buffer must not allocate after warm-up.")]
+        public void TryGetRoot_RepeatedRejection_RateLimiterIsAllocationFree()
+        {
+            // Truncated buffer — always fails verification, exercises the
+            // rate-limiter branch on every call once the cooldown has fired.
+            byte[] bad = new byte[3];
+
+            // Warm up: prime rate-limiter state so the cooldown is in-window.
+            for (int i = 0; i < 5; i++)
+                VerifiedFlatBuffer.TryGetRoot<FbInputPayload>(
+                    bad,
+                    FbInputPayloadVerify.Verify,
+                    FbInputPayload.GetRootAsInputPayload,
+                    out _,
+                    "perf-test");
+
+            const int Iterations = 1000;
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < Iterations; i++)
+                VerifiedFlatBuffer.TryGetRoot<FbInputPayload>(
+                    bad,
+                    FbInputPayloadVerify.Verify,
+                    FbInputPayload.GetRootAsInputPayload,
+                    out _,
+                    "perf-test");
+            long after = GC.GetAllocatedBytesForCurrentThread();
+
+            long perCall = (after - before) / Iterations;
+            // Inside the cooldown window the fast path is: read TickCount64,
+            // compare, return.  Any boxing or DateTime allocation would exceed
+            // this 8 B ceiling.
+            Assert.Less(perCall, 8,
+                $"TryGetRoot(bad buffer) allocated {perCall} B/call inside cooldown — clock-source regression.");
+        }
     }
 }

@@ -59,6 +59,19 @@ namespace RTMPE.Sync
         /// </summary>
         public static byte[] Build(byte[][] payloads, int count)
         {
+            int total = ComputeTotalSize(payloads, count);
+            var result = new byte[total];
+            BuildInto(result, 0, payloads, count);
+            return result;
+        }
+
+        /// <summary>
+        /// Returns the exact wire size in bytes that <see cref="BuildInto"/>
+        /// will produce for the given payload array, after applying the same
+        /// validation as <see cref="Build"/>.  Use to size a pooled buffer.
+        /// </summary>
+        public static int ComputeTotalSize(byte[][] payloads, int count)
+        {
             if (payloads == null) throw new ArgumentNullException(nameof(payloads));
             if (count < 0 || count > payloads.Length)
                 throw new ArgumentOutOfRangeException(nameof(count));
@@ -68,7 +81,6 @@ namespace RTMPE.Sync
                     "split into multiple batches at the call site.",
                     nameof(count));
 
-            // Pre-compute total length so the result is allocated exactly once.
             int total = 1; // count byte
             for (int i = 0; i < count; i++)
             {
@@ -80,23 +92,39 @@ namespace RTMPE.Sync
                         nameof(payloads));
                 total += 2 + len; // length prefix + payload
             }
+            return total;
+        }
 
-            var result = new byte[total];
-            result[0] = (byte)count;
-            int off = 1;
+        /// <summary>
+        /// Pooled-buffer variant: writes the batch payload into
+        /// <paramref name="dest"/> starting at <paramref name="destOffset"/>.
+        /// Returns the number of bytes written (= <see cref="ComputeTotalSize"/>).
+        /// <paramref name="dest"/> may be a buffer rented from
+        /// <c>ArrayPool&lt;byte&gt;.Shared</c>.
+        /// </summary>
+        public static int BuildInto(byte[] dest, int destOffset, byte[][] payloads, int count)
+        {
+            if (dest == null) throw new ArgumentNullException(nameof(dest));
+            int total = ComputeTotalSize(payloads, count);
+            if (destOffset < 0 || (long)destOffset + total > dest.Length)
+                throw new ArgumentOutOfRangeException(nameof(destOffset),
+                    "dest is too small for a variable batch payload at the given offset.");
+
+            dest[destOffset] = (byte)count;
+            int off = destOffset + 1;
             for (int i = 0; i < count; i++)
             {
                 int len = payloads[i] != null ? payloads[i].Length : 0;
-                result[off]     = (byte)(len);
-                result[off + 1] = (byte)(len >> 8);
+                dest[off]     = (byte)(len);
+                dest[off + 1] = (byte)(len >> 8);
                 off += 2;
                 if (len > 0)
                 {
-                    Buffer.BlockCopy(payloads[i], 0, result, off, len);
+                    Buffer.BlockCopy(payloads[i], 0, dest, off, len);
                     off += len;
                 }
             }
-            return result;
+            return total;
         }
 
         /// <summary>

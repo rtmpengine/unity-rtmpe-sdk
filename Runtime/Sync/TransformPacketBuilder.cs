@@ -113,27 +113,46 @@ namespace RTMPE.Sync
         public static byte[] BuildUpdatePayload(ulong objectId, TransformState state)
         {
             var payload = new byte[PAYLOAD_SIZE];
+            BuildUpdatePayloadInto(payload, 0, objectId, state);
+            return payload;
+        }
+
+        /// <summary>
+        /// Pooled-buffer variant: writes the 48-byte transform payload into
+        /// <paramref name="dest"/> starting at <paramref name="destOffset"/>.
+        /// Returns <see cref="PAYLOAD_SIZE"/>.  Callers may rent
+        /// <paramref name="dest"/> from <c>ArrayPool&lt;byte&gt;.Shared</c>
+        /// to keep the per-tick send path allocation-free.
+        /// </summary>
+        public static int BuildUpdatePayloadInto(byte[] dest, int destOffset, ulong objectId, TransformState state)
+        {
+            if (dest == null) throw new ArgumentNullException(nameof(dest));
+            // Use a long-typed sum so a short dest (length < PAYLOAD_SIZE)
+            // does not wrap into a positive uint and skip the check.
+            if (destOffset < 0 || (long)destOffset + PAYLOAD_SIZE > dest.Length)
+                throw new ArgumentOutOfRangeException(nameof(destOffset),
+                    "dest is too small for a transform payload at the given offset.");
 
             // ── ObjectID (u64 LE) ─────────────────────────────────────────────
-            WriteU64LE(payload, OFFSET_OBJECT_ID, objectId);
+            WriteU64LE(dest, destOffset + OFFSET_OBJECT_ID, objectId);
 
             // ── Position (3 × f32 LE) ─────────────────────────────────────────
-            WriteF32LE(payload, OFFSET_POSITION + 0,  state.Position.x);
-            WriteF32LE(payload, OFFSET_POSITION + 4,  state.Position.y);
-            WriteF32LE(payload, OFFSET_POSITION + 8,  state.Position.z);
+            WriteF32LE(dest, destOffset + OFFSET_POSITION + 0,  state.Position.x);
+            WriteF32LE(dest, destOffset + OFFSET_POSITION + 4,  state.Position.y);
+            WriteF32LE(dest, destOffset + OFFSET_POSITION + 8,  state.Position.z);
 
             // ── Rotation (4 × f32 LE, x y z w) ──────────────────────────────
-            WriteF32LE(payload, OFFSET_ROTATION + 0,  state.Rotation.x);
-            WriteF32LE(payload, OFFSET_ROTATION + 4,  state.Rotation.y);
-            WriteF32LE(payload, OFFSET_ROTATION + 8,  state.Rotation.z);
-            WriteF32LE(payload, OFFSET_ROTATION + 12, state.Rotation.w);
+            WriteF32LE(dest, destOffset + OFFSET_ROTATION + 0,  state.Rotation.x);
+            WriteF32LE(dest, destOffset + OFFSET_ROTATION + 4,  state.Rotation.y);
+            WriteF32LE(dest, destOffset + OFFSET_ROTATION + 8,  state.Rotation.z);
+            WriteF32LE(dest, destOffset + OFFSET_ROTATION + 12, state.Rotation.w);
 
             // ── Scale (3 × f32 LE) ────────────────────────────────────────────
-            WriteF32LE(payload, OFFSET_SCALE + 0, state.Scale.x);
-            WriteF32LE(payload, OFFSET_SCALE + 4, state.Scale.y);
-            WriteF32LE(payload, OFFSET_SCALE + 8, state.Scale.z);
+            WriteF32LE(dest, destOffset + OFFSET_SCALE + 0, state.Scale.x);
+            WriteF32LE(dest, destOffset + OFFSET_SCALE + 4, state.Scale.y);
+            WriteF32LE(dest, destOffset + OFFSET_SCALE + 8, state.Scale.z);
 
-            return payload;
+            return PAYLOAD_SIZE;
         }
 
         /// <summary>
@@ -147,31 +166,50 @@ namespace RTMPE.Sync
         /// </summary>
         public static byte[] BuildQuantizedUpdatePayload(ulong objectId, TransformState state)
         {
+            var payload = new byte[QUANTIZED_PAYLOAD_SIZE];
+            int written = BuildQuantizedUpdatePayloadInto(payload, 0, objectId, state);
+            return written > 0 ? payload : null;
+        }
+
+        /// <summary>
+        /// Pooled-buffer variant of <see cref="BuildQuantizedUpdatePayload"/>.
+        /// Writes the 25-byte payload into <paramref name="dest"/> starting at
+        /// <paramref name="destOffset"/>.  Returns the number of bytes
+        /// written (<see cref="QUANTIZED_PAYLOAD_SIZE"/>) on success, or
+        /// <c>0</c> when the source state is non-finite or the rotation is
+        /// degenerate — matching the legacy <c>null</c> return contract.
+        /// </summary>
+        public static int BuildQuantizedUpdatePayloadInto(byte[] dest, int destOffset, ulong objectId, TransformState state)
+        {
+            if (dest == null) throw new ArgumentNullException(nameof(dest));
+            if (destOffset < 0 || (long)destOffset + QUANTIZED_PAYLOAD_SIZE > dest.Length)
+                throw new ArgumentOutOfRangeException(nameof(destOffset),
+                    "dest is too small for a quantized transform payload at the given offset.");
+
             // Half-precision floats lose ~20 bits of mantissa; rejecting NaN/Inf
             // at the encoder keeps the wire format total over its declared
             // domain (finite rigid-body poses) and prevents a degenerate
             // simulation from propagating sentinel bit patterns to peers.
             if (!IsFinite(state.Position.x) || !IsFinite(state.Position.y) || !IsFinite(state.Position.z))
-                return null;
+                return 0;
             if (!IsFinite(state.Scale.x)    || !IsFinite(state.Scale.y)    || !IsFinite(state.Scale.z))
-                return null;
+                return 0;
 
-            var payload = new byte[QUANTIZED_PAYLOAD_SIZE];
-            payload[0] = FLAG_QUANTIZED;
+            dest[destOffset + 0] = FLAG_QUANTIZED;
 
-            WriteU64LE(payload, 1, objectId);
+            WriteU64LE(dest, destOffset + 1, objectId);
 
-            if (!TransformQuantization.TryWriteHalf(payload, 9,  state.Position.x)) return null;
-            if (!TransformQuantization.TryWriteHalf(payload, 11, state.Position.y)) return null;
-            if (!TransformQuantization.TryWriteHalf(payload, 13, state.Position.z)) return null;
+            if (!TransformQuantization.TryWriteHalf(dest, destOffset +  9, state.Position.x)) return 0;
+            if (!TransformQuantization.TryWriteHalf(dest, destOffset + 11, state.Position.y)) return 0;
+            if (!TransformQuantization.TryWriteHalf(dest, destOffset + 13, state.Position.z)) return 0;
 
-            if (!TransformQuantization.TryWriteSmallestThree(payload, 15, state.Rotation)) return null;
+            if (!TransformQuantization.TryWriteSmallestThree(dest, destOffset + 15, state.Rotation)) return 0;
 
-            if (!TransformQuantization.TryWriteHalf(payload, 19, state.Scale.x)) return null;
-            if (!TransformQuantization.TryWriteHalf(payload, 21, state.Scale.y)) return null;
-            if (!TransformQuantization.TryWriteHalf(payload, 23, state.Scale.z)) return null;
+            if (!TransformQuantization.TryWriteHalf(dest, destOffset + 19, state.Scale.x)) return 0;
+            if (!TransformQuantization.TryWriteHalf(dest, destOffset + 21, state.Scale.y)) return 0;
+            if (!TransformQuantization.TryWriteHalf(dest, destOffset + 23, state.Scale.z)) return 0;
 
-            return payload;
+            return QUANTIZED_PAYLOAD_SIZE;
         }
 
         private static bool IsFinite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);

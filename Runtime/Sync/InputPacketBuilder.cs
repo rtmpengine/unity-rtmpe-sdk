@@ -77,6 +77,58 @@ namespace RTMPE.Sync
         /// <exception cref="ArgumentOutOfRangeException"/>
         public static byte[] BuildBatchPayload(InputPayload[] payloads, int count)
         {
+            ValidateBuildArgs(payloads, count);
+            var buf = new byte[BatchHeaderSize + count * InputPayload.WireSize];
+            BuildBatchPayloadInto(buf, 0, payloads, count);
+            return buf;
+        }
+
+        /// <summary>
+        /// Returns the exact wire size in bytes that
+        /// <see cref="BuildBatchPayloadInto"/> will produce for
+        /// <paramref name="count"/> entries.
+        /// </summary>
+        public static int ComputeBatchPayloadSize(int count)
+        {
+            if (count < 0 || count > MaxBatchSize)
+                throw new ArgumentOutOfRangeException(nameof(count), count,
+                    $"count must be in [0, {MaxBatchSize}].");
+            return BatchHeaderSize + count * InputPayload.WireSize;
+        }
+
+        /// <summary>
+        /// Pooled-buffer variant: writes the input batch payload into
+        /// <paramref name="dest"/> starting at <paramref name="destOffset"/>.
+        /// Returns the number of bytes written.  <paramref name="dest"/> may
+        /// be a buffer rented from <c>ArrayPool&lt;byte&gt;.Shared</c> sized
+        /// at least <see cref="ComputeBatchPayloadSize"/> bytes.
+        /// </summary>
+        public static int BuildBatchPayloadInto(byte[] dest, int destOffset, InputPayload[] payloads, int count)
+        {
+            if (dest == null) throw new ArgumentNullException(nameof(dest));
+            ValidateBuildArgs(payloads, count);
+            int size = BatchHeaderSize + count * InputPayload.WireSize;
+            if (destOffset < 0 || (long)destOffset + size > dest.Length)
+                throw new ArgumentOutOfRangeException(nameof(destOffset),
+                    "dest is too small for an input batch payload at the given offset.");
+
+            // [0..1] count : u16 LE
+            dest[destOffset + 0] = (byte)(count       & 0xFF);
+            dest[destOffset + 1] = (byte)((count >> 8) & 0xFF);
+
+            // [2..2+13*N] InputPayload entries
+            int offset = destOffset + BatchHeaderSize;
+            for (int i = 0; i < count; i++)
+            {
+                payloads[i].WriteTo(dest, offset);
+                offset += InputPayload.WireSize;
+            }
+
+            return size;
+        }
+
+        private static void ValidateBuildArgs(InputPayload[] payloads, int count)
+        {
             if (payloads == null) throw new ArgumentNullException(nameof(payloads));
             if (count < 0 || count > MaxBatchSize)
                 throw new ArgumentOutOfRangeException(
@@ -88,22 +140,6 @@ namespace RTMPE.Sync
                     nameof(count),
                     count,
                     $"count ({count}) exceeds payloads.Length ({payloads.Length}).");
-
-            var buf = new byte[BatchHeaderSize + count * InputPayload.WireSize];
-
-            // [0..1] count : u16 LE
-            buf[0] = (byte)(count       & 0xFF);
-            buf[1] = (byte)((count >> 8) & 0xFF);
-
-            // [2..2+13*N] InputPayload entries
-            int offset = BatchHeaderSize;
-            for (int i = 0; i < count; i++)
-            {
-                payloads[i].WriteTo(buf, offset);
-                offset += InputPayload.WireSize;
-            }
-
-            return buf;
         }
     }
 }

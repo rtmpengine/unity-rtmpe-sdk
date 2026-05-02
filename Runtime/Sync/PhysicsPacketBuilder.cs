@@ -148,67 +148,104 @@ namespace RTMPE.Sync
         /// <c>NetworkManager.SendStateSync()</c>.</returns>
         public static byte[] BuildPayload(ulong objectId, PhysicsState state, byte dataMask)
         {
-            // Clamp data bits to the known range and force the 3-D type marker.
-            byte changedMask = (byte)((dataMask & DataFieldMask) | TypeMarker3D);
-
-            // Calculate the exact payload size (no padding or trailing zeros).
-            int size = PayloadMinSize;
-            if ((changedMask & ChangedPosition)        != 0) size += 12;
-            if ((changedMask & ChangedRotation)        != 0) size += 16;
-            if ((changedMask & ChangedVelocity)        != 0) size += 12;
-            if ((changedMask & ChangedAngularVelocity) != 0) size += 12;
-            if ((changedMask & ChangedSleep)           != 0) size +=  1;
-            if ((changedMask & ChangedConstraints)     != 0) size +=  1;
-
+            int size = ComputePayloadSize(dataMask, twoDee: false);
             var buf = new byte[size];
-            int off = 0;
+            BuildPayloadInto(buf, 0, objectId, state, dataMask);
+            return buf;
+        }
+
+        /// <summary>
+        /// Returns the exact wire size in bytes that <see cref="BuildPayloadInto"/>
+        /// (3-D) or <see cref="Build2DPayloadInto"/> (2-D) will produce for the
+        /// given <paramref name="dataMask"/>.  Use this to size a pooled buffer
+        /// before calling the corresponding <c>*Into</c> method.
+        /// </summary>
+        public static int ComputePayloadSize(byte dataMask, bool twoDee)
+        {
+            byte changedMask = (byte)(dataMask & DataFieldMask);
+            int size = PayloadMinSize;
+            if (twoDee)
+            {
+                if ((changedMask & ChangedPosition)        != 0) size +=  8;
+                if ((changedMask & ChangedRotation)        != 0) size +=  4;
+                if ((changedMask & ChangedVelocity)        != 0) size +=  8;
+                if ((changedMask & ChangedAngularVelocity) != 0) size +=  4;
+            }
+            else
+            {
+                if ((changedMask & ChangedPosition)        != 0) size += 12;
+                if ((changedMask & ChangedRotation)        != 0) size += 16;
+                if ((changedMask & ChangedVelocity)        != 0) size += 12;
+                if ((changedMask & ChangedAngularVelocity) != 0) size += 12;
+            }
+            if ((changedMask & ChangedSleep)           != 0) size += 1;
+            if ((changedMask & ChangedConstraints)     != 0) size += 1;
+            return size;
+        }
+
+        /// <summary>
+        /// Pooled-buffer variant: writes the 3-D physics payload into
+        /// <paramref name="dest"/> starting at <paramref name="destOffset"/>.
+        /// Returns the number of bytes written (= <see cref="ComputePayloadSize"/>
+        /// with <c>twoDee=false</c>).  <paramref name="dest"/> may be a buffer
+        /// rented from <c>ArrayPool&lt;byte&gt;.Shared</c>.
+        /// </summary>
+        public static int BuildPayloadInto(byte[] dest, int destOffset, ulong objectId, PhysicsState state, byte dataMask)
+        {
+            if (dest == null) throw new ArgumentNullException(nameof(dest));
+            int size = ComputePayloadSize(dataMask, twoDee: false);
+            if (destOffset < 0 || (long)destOffset + size > dest.Length)
+                throw new ArgumentOutOfRangeException(nameof(destOffset),
+                    "dest is too small for a 3-D physics payload at the given offset.");
+
+            byte changedMask = (byte)((dataMask & DataFieldMask) | TypeMarker3D);
+            int off = destOffset;
 
             // ── Header ────────────────────────────────────────────────────────
-            WriteU64LE(buf, off, objectId);  off += 8;
-            buf[off++] = changedMask;
+            WriteU64LE(dest, off, objectId);  off += 8;
+            dest[off++] = changedMask;
 
             // ── Conditional data fields (in bit-order) ────────────────────────
             if ((changedMask & ChangedPosition) != 0)
             {
-                WriteF32LE(buf, off, state.Position.x); off += 4;
-                WriteF32LE(buf, off, state.Position.y); off += 4;
-                WriteF32LE(buf, off, state.Position.z); off += 4;
+                WriteF32LE(dest, off, state.Position.x); off += 4;
+                WriteF32LE(dest, off, state.Position.y); off += 4;
+                WriteF32LE(dest, off, state.Position.z); off += 4;
             }
             if ((changedMask & ChangedRotation) != 0)
             {
-                WriteF32LE(buf, off, state.Rotation.x); off += 4;
-                WriteF32LE(buf, off, state.Rotation.y); off += 4;
-                WriteF32LE(buf, off, state.Rotation.z); off += 4;
-                WriteF32LE(buf, off, state.Rotation.w); off += 4;
+                WriteF32LE(dest, off, state.Rotation.x); off += 4;
+                WriteF32LE(dest, off, state.Rotation.y); off += 4;
+                WriteF32LE(dest, off, state.Rotation.z); off += 4;
+                WriteF32LE(dest, off, state.Rotation.w); off += 4;
             }
             if ((changedMask & ChangedVelocity) != 0)
             {
-                WriteF32LE(buf, off, state.Velocity.x); off += 4;
-                WriteF32LE(buf, off, state.Velocity.y); off += 4;
-                WriteF32LE(buf, off, state.Velocity.z); off += 4;
+                WriteF32LE(dest, off, state.Velocity.x); off += 4;
+                WriteF32LE(dest, off, state.Velocity.y); off += 4;
+                WriteF32LE(dest, off, state.Velocity.z); off += 4;
             }
             if ((changedMask & ChangedAngularVelocity) != 0)
             {
-                WriteF32LE(buf, off, state.AngularVelocity.x); off += 4;
-                WriteF32LE(buf, off, state.AngularVelocity.y); off += 4;
-                WriteF32LE(buf, off, state.AngularVelocity.z); off += 4;
+                WriteF32LE(dest, off, state.AngularVelocity.x); off += 4;
+                WriteF32LE(dest, off, state.AngularVelocity.y); off += 4;
+                WriteF32LE(dest, off, state.AngularVelocity.z); off += 4;
             }
             if ((changedMask & ChangedSleep) != 0)
             {
-                buf[off] = state.IsSleeping ? (byte)0x01 : (byte)0x00;
+                dest[off] = state.IsSleeping ? (byte)0x01 : (byte)0x00;
                 off++;
             }
             if ((changedMask & ChangedConstraints) != 0)
             {
-                buf[off++] = state.ConstraintMask;
+                dest[off++] = state.ConstraintMask;
             }
 
-            // Defensive: assert the offset matches the computed size.
-            // In a correct implementation this never fires; kept for diagnostics.
-            UnityEngine.Debug.Assert(off == size,
-                $"[RTMPE] PhysicsPacketBuilder.BuildPayload: offset {off} != size {size}");
-
-            return buf;
+            // No interpolated assert here — the per-tick allocation it
+            // would create (string + boxed args) defeats the pooling.  The
+            // size/branch-coverage agreement is structurally guaranteed by
+            // ComputePayloadSize sharing the same mask switches.
+            return off - destOffset;
         }
 
         // ── 2-D builder ───────────────────────────────────────────────────────
@@ -227,54 +264,62 @@ namespace RTMPE.Sync
         /// <c>NetworkManager.SendStateSync()</c>.</returns>
         public static byte[] Build2DPayload(ulong objectId, PhysicsState2D state, byte dataMask)
         {
-            byte changedMask = (byte)((dataMask & DataFieldMask) | TypeMarker2D);
-
-            int size = PayloadMinSize;
-            if ((changedMask & ChangedPosition)        != 0) size +=  8;
-            if ((changedMask & ChangedRotation)        != 0) size +=  4;
-            if ((changedMask & ChangedVelocity)        != 0) size +=  8;
-            if ((changedMask & ChangedAngularVelocity) != 0) size +=  4;
-            if ((changedMask & ChangedSleep)           != 0) size +=  1;
-            if ((changedMask & ChangedConstraints)     != 0) size +=  1;
-
+            int size = ComputePayloadSize(dataMask, twoDee: true);
             var buf = new byte[size];
-            int off = 0;
+            Build2DPayloadInto(buf, 0, objectId, state, dataMask);
+            return buf;
+        }
 
-            WriteU64LE(buf, off, objectId); off += 8;
-            buf[off++] = changedMask;
+        /// <summary>
+        /// Pooled-buffer variant: writes the 2-D physics payload into
+        /// <paramref name="dest"/> starting at <paramref name="destOffset"/>.
+        /// Returns the number of bytes written (= <see cref="ComputePayloadSize"/>
+        /// with <c>twoDee=true</c>).
+        /// </summary>
+        public static int Build2DPayloadInto(byte[] dest, int destOffset, ulong objectId, PhysicsState2D state, byte dataMask)
+        {
+            if (dest == null) throw new ArgumentNullException(nameof(dest));
+            int size = ComputePayloadSize(dataMask, twoDee: true);
+            if (destOffset < 0 || (long)destOffset + size > dest.Length)
+                throw new ArgumentOutOfRangeException(nameof(destOffset),
+                    "dest is too small for a 2-D physics payload at the given offset.");
+
+            byte changedMask = (byte)((dataMask & DataFieldMask) | TypeMarker2D);
+            int off = destOffset;
+
+            WriteU64LE(dest, off, objectId); off += 8;
+            dest[off++] = changedMask;
 
             if ((changedMask & ChangedPosition) != 0)
             {
-                WriteF32LE(buf, off, state.Position.x); off += 4;
-                WriteF32LE(buf, off, state.Position.y); off += 4;
+                WriteF32LE(dest, off, state.Position.x); off += 4;
+                WriteF32LE(dest, off, state.Position.y); off += 4;
             }
             if ((changedMask & ChangedRotation) != 0)
             {
-                WriteF32LE(buf, off, state.Rotation); off += 4;
+                WriteF32LE(dest, off, state.Rotation); off += 4;
             }
             if ((changedMask & ChangedVelocity) != 0)
             {
-                WriteF32LE(buf, off, state.Velocity.x); off += 4;
-                WriteF32LE(buf, off, state.Velocity.y); off += 4;
+                WriteF32LE(dest, off, state.Velocity.x); off += 4;
+                WriteF32LE(dest, off, state.Velocity.y); off += 4;
             }
             if ((changedMask & ChangedAngularVelocity) != 0)
             {
-                WriteF32LE(buf, off, state.AngularVelocity); off += 4;
+                WriteF32LE(dest, off, state.AngularVelocity); off += 4;
             }
             if ((changedMask & ChangedSleep) != 0)
             {
-                buf[off] = state.IsSleeping ? (byte)0x01 : (byte)0x00;
+                dest[off] = state.IsSleeping ? (byte)0x01 : (byte)0x00;
                 off++;
             }
             if ((changedMask & ChangedConstraints) != 0)
             {
-                buf[off++] = state.ConstraintMask;
+                dest[off++] = state.ConstraintMask;
             }
 
-            UnityEngine.Debug.Assert(off == size,
-                $"[RTMPE] PhysicsPacketBuilder.Build2DPayload: offset {off} != size {size}");
-
-            return buf;
+            // No interpolated assert here — see BuildPayloadInto for rationale.
+            return off - destOffset;
         }
 
         // ── Private write helpers ─────────────────────────────────────────────

@@ -361,6 +361,15 @@ namespace RTMPE.Core
         // from spamming every flush tick when the configuration is permanent.
         private bool _overflowWarned;
 
+        // Cached serialization resources for FlushDirtyVariables.  Lazy-init
+        // on the first dirty flush so objects that are never dirty (read-only
+        // replicas) pay zero cost.  MemoryStream and BinaryWriter hold no
+        // unmanaged handles; GC collects them when the behaviour is destroyed.
+        // Reset via SetLength(0) before each flush — reuses the internal buffer
+        // that the stream already allocated, eliminating per-tick heap churn.
+        private MemoryStream _flushMs;
+        private BinaryWriter _flushWriter;
+
         // ── Internal SDK API (called by SpawnManager) ──────────────────────────
 
         /// <summary>
@@ -654,14 +663,25 @@ namespace RTMPE.Core
             }
             if (!hasEligibleDirty) return;
 
-            // Use a growable MemoryStream so that long NetworkVariableString values
-            // (or many simultaneously dirty variables) never throw the
-            // NotSupportedException that a fixed-capacity backing buffer raises.
-            // InitialCapacity covers the common case without reallocation:
-            // object_id(8) + tick(4) + count(1) + ~15 variables at ~16 bytes each ≈ 253 bytes.
+            // Lazy-init cached stream + writer.  Reusing them across ticks
+            // eliminates per-flush MemoryStream and BinaryWriter allocations
+            // (previously ~700–900 B per call at 30 Hz × N objects).
+            // InitialCapacity covers the common case without internal realloc:
+            // object_id(8) + tick(4) + count(1) + ~15 variables at ~16 B each ≈ 253 bytes.
             const int InitialCapacity = 256;
-            using var ms     = new MemoryStream(InitialCapacity);
-            using var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
+            if (_flushMs == null)
+            {
+                _flushMs     = new MemoryStream(InitialCapacity);
+                _flushWriter = new BinaryWriter(_flushMs, Encoding.UTF8, leaveOpen: true);
+            }
+            else
+            {
+                // Reset without deallocating the internal buffer — reuses the
+                // previously grown capacity without any heap allocation.
+                _flushMs.SetLength(0);
+            }
+            var ms     = _flushMs;
+            var writer = _flushWriter;
 
             // [object_id:8 LE]
             writer.Write(NetworkObjectId);

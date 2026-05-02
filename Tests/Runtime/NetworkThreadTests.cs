@@ -55,9 +55,9 @@ namespace RTMPE.Tests
 
             Assert.IsTrue(errorObserved.Wait(2_000), "OnError must fire within 2s");
 
-            // Give the failing thread time to finish unwinding its catch /
-            // teardown / start-flag-reset sequence.
-            Thread.Sleep(100);
+            // Wait for the failing thread to finish its teardown and clear _startFlag.
+            Assert.IsTrue(SpinWait.SpinUntil(() => !failingThread.IsRunning, 2_000),
+                "failing thread must stop running within 2s");
 
             Assert.IsNotNull(reconnected, "OnError handler must have created the replacement");
             Assert.IsTrue(fresh.IsConnected,
@@ -82,7 +82,7 @@ namespace RTMPE.Tests
 
             thread.Start();
             Assert.IsTrue(errorFired.Wait(2_000));
-            Thread.Sleep(50); // settle
+            SpinWait.SpinUntil(() => !thread.IsRunning, 2_000);
 
             // Replace the inner transport so the next Start can succeed.
             // (We can't swap _transport on the same NetworkThread, so we
@@ -103,7 +103,7 @@ namespace RTMPE.Tests
             thread.OnError += _ => throw new InvalidOperationException("user bug");
 
             Assert.DoesNotThrow(() => thread.Start());
-            Thread.Sleep(200);
+            SpinWait.SpinUntil(() => !thread.IsRunning, 2_000);
 
             Assert.IsFalse(thread.IsRunning,
                 "Thread must report stopped after a user OnError handler throws");
@@ -164,7 +164,8 @@ namespace RTMPE.Tests
             using var thread = new NetworkThread(transport, maxOutboundQueueSize: 16);
 
             thread.Start();
-            Thread.Sleep(50);
+            Assert.IsTrue(SpinWait.SpinUntil(() => thread.IsRunning, 2_000),
+                "thread must be running before Stop");
             thread.Stop();
 
             // Producer racing with Stop: must be rejected.
@@ -180,7 +181,8 @@ namespace RTMPE.Tests
             // survived in a stale ConcurrentQueue they would be transmitted now.
             transport.ResetCounters();
             thread.Start();
-            Thread.Sleep(100);
+            Assert.IsTrue(SpinWait.SpinUntil(() => thread.IsRunning, 2_000),
+                "thread must be running within 2s");
             thread.Stop();
 
             Assert.AreEqual(0, transport.SendCount,

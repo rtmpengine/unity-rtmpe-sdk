@@ -49,7 +49,13 @@ namespace RTMPE.Core
     {
         // ── Singleton ──────────────────────────────────────────────────────────
         private static NetworkManager  _instance;
-        private static volatile bool   _applicationIsQuitting;
+        // Not `volatile` — instead every read site uses Volatile.Read and every
+        // write site uses Volatile.Write.  The `volatile` keyword has undefined
+        // semantics under IL2CPP on ARM (the C++ compiler is not required to honour
+        // C# acquire/release on `volatile` static fields), while the explicit
+        // System.Threading.Volatile API is spec-guaranteed to emit the correct
+        // barriers on every backend.
+        private static bool            _applicationIsQuitting;
         private static readonly object _instLock = new object();
 
         // Reset static state on each Play-Mode entry (or standalone restart) so that
@@ -62,7 +68,7 @@ namespace RTMPE.Core
             lock (_instLock)
             {
                 _instance              = null;
-                _applicationIsQuitting = false;
+                System.Threading.Volatile.Write(ref _applicationIsQuitting, false);
                 _missingInstanceWarned = 0;
                 // Do NOT clear _transportFactory here — tests and WebGL bootstraps
                 // install it once at module init, before any singleton is created.
@@ -96,7 +102,7 @@ namespace RTMPE.Core
         {
             get
             {
-                if (_applicationIsQuitting) return null;
+                if (System.Threading.Volatile.Read(ref _applicationIsQuitting)) return null;
 
                 // Fast-path: a scene-placed Awake has already published _instance.
                 // Volatile.Read pairs with the release-barrier on the lock-protected
@@ -121,7 +127,7 @@ namespace RTMPE.Core
                 NetworkManager found;
                 lock (_instLock)
                 {
-                    if (_applicationIsQuitting) return null;
+                    if (System.Threading.Volatile.Read(ref _applicationIsQuitting)) return null;
                     // Re-check inside the lock — another main-thread caller may
                     // have populated _instance between our fast-path read and
                     // the lock acquisition.
@@ -170,7 +176,7 @@ namespace RTMPE.Core
         /// </summary>
         public static bool TryGetInstance(out NetworkManager manager)
         {
-            if (_applicationIsQuitting)
+            if (System.Threading.Volatile.Read(ref _applicationIsQuitting))
             {
                 manager = null;
                 return false;
@@ -196,7 +202,7 @@ namespace RTMPE.Core
 
             lock (_instLock)
             {
-                if (_applicationIsQuitting)
+                if (System.Threading.Volatile.Read(ref _applicationIsQuitting))
                 {
                     manager = null;
                     return false;
@@ -220,7 +226,7 @@ namespace RTMPE.Core
         {
             get
             {
-                lock (_instLock) { return _instance != null && !_applicationIsQuitting; }
+                lock (_instLock) { return _instance != null && !System.Threading.Volatile.Read(ref _applicationIsQuitting); }
             }
         }
 
@@ -1236,7 +1242,7 @@ namespace RTMPE.Core
 
         private void OnApplicationQuit()
         {
-            _applicationIsQuitting = true;
+            System.Threading.Volatile.Write(ref _applicationIsQuitting, true);
             Cleanup();
         }
 
@@ -1342,6 +1348,28 @@ namespace RTMPE.Core
             // InitialiseNetwork twice on the same instance would silently
             // double-fire StateSync without this line.
             OnDataReceived -= HandleStateSyncPacket;
+
+            // Break the circular delegate reference: RoomManager holds delegate
+            // instances that capture `this` (the NetworkManager).  Without this
+            // unsubscription the two objects form a reference cycle that survives
+            // until GC finalisation — preventing timely collection after teardown
+            // and keeping room-state alive in memory across scene reloads.
+            // This is the only place outside RecreateRoomAndSpawnManagers that
+            // modifies _roomManager; Disconnect() → ClearSessionData() does NOT
+            // unsubscribe, so the subscriptions would leak for the remainder of
+            // the component's lifetime if we did not clean them up here.
+            if (_roomManager != null)
+            {
+                _roomManager.OnRoomJoined   -= OnRoomManagerJoined;
+                _roomManager.OnRoomLeft     -= OnRoomManagerLeft;
+                _roomManager.OnRoomCreated  -= OnRoomManagerCreated;
+                _roomManager.OnPlayerLeft   -= OnRoomManagerPlayerLeft;
+                _roomManager.OnPlayerJoined -= OnRoomManagerPlayerJoined;
+                _roomManager = null;
+            }
+            _spawnManager       = null;
+            _lobbyManager       = null;
+            _matchmakingManager = null;
         }
 
         // ── Public API ─────────────────────────────────────────────────────────
@@ -6069,6 +6097,50 @@ namespace RTMPE.Core
 
         internal static void ResetJwtAudienceUnconfiguredWarningForTests()
             => System.Threading.Interlocked.Exchange(ref _jwtAudienceUnconfiguredWarned, 0);
+
+        // ── Issue-5 test hooks: _applicationIsQuitting Volatile semantics ────────
+
+        /// <summary>
+        /// Simulates OnApplicationQuit without invoking Cleanup — lets tests
+        /// verify that all singleton accessors return null once the quitting
+        /// flag is set.  Do NOT call from production code.
+        /// </summary>
+        internal static void SimulateApplicationQuitForTests()
+            => System.Threading.Volatile.Write(ref _applicationIsQuitting, true);
+
+        /// <summary>
+        /// Clears the quitting flag after a SimulateApplicationQuitForTests call
+        /// so subsequent tests start from a clean state.  Do NOT call from
+        /// production code.
+        /// </summary>
+        internal static void ResetApplicationQuittingForTests()
+            => System.Threading.Volatile.Write(ref _applicationIsQuitting, false);
+
+        // ── Issue-6 test hooks: RoomManager subscription lifecycle ───────────────
+
+        /// <summary>
+        /// Exposes the current RoomManager instance for subscription-leak
+        /// assertions in tests.  Do NOT call from production code.
+        /// </summary>
+        internal RoomManager GetRoomManagerForTests() => _roomManager;
+
+        /// <summary>
+        /// Creates a PacketBuilder and calls RecreateRoomAndSpawnManagers so
+        /// tests can reach a state where _roomManager has live subscriptions
+        /// without opening a real transport.  Do NOT call from production code.
+        /// </summary>
+        internal void SetupRoomManagerForTests()
+        {
+            _packetBuilder = new PacketBuilder();
+            RecreateRoomAndSpawnManagers();
+        }
+
+        /// <summary>
+        /// Invokes the internal Cleanup method so tests can verify teardown
+        /// without going through DestroyImmediate or OnApplicationQuit.
+        /// Do NOT call from production code.
+        /// </summary>
+        internal void InvokeCleanupForTests() => Cleanup();
 
         /// <summary>
         /// Instance shim that resolves keying material from <see cref="_settings"/>

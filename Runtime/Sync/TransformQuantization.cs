@@ -44,6 +44,19 @@ namespace RTMPE.Sync
         /// <summary>Bytes occupied by a smallest-three encoded quaternion.</summary>
         public const int QuaternionSize = 4;
 
+        /// <summary>
+        /// Largest finite magnitude representable by an IEEE 754 binary16
+        /// half-precision float.  Any input to <see cref="TryWriteHalf"/>
+        /// whose absolute value exceeds this threshold is saturated to
+        /// <c>±HalfMaxFinite</c> before encoding so the wire never carries
+        /// a half-precision <c>±Inf</c> bit pattern (which the decoder
+        /// folds to zero for non-finite-input safety).  Game code that
+        /// needs world-space coordinates beyond this range must disable
+        /// transform quantisation (<c>NetworkSettings.quantizeTransforms = false</c>)
+        /// and pay the doubled wire size for full-precision floats.
+        /// </summary>
+        public const float HalfMaxFinite = 65504f;
+
         // The smallest-three packer needs to know the upper bound any
         // non-largest unit-quaternion component can take.  When one
         // component holds the maximum magnitude, the remaining three sum-of-
@@ -76,6 +89,22 @@ namespace RTMPE.Sync
             // Reject up-front so the encoder is total over its declared
             // domain (finite floats only).
             if (float.IsNaN(value) || float.IsInfinity(value)) return false;
+
+            // Pre-clamp to the half-precision finite range BEFORE bit-level
+            // conversion.  FloatToHalfBits already saturates exponents that
+            // are obviously out-of-range, but the round-half-to-even step
+            // on the normal-binary16 path can still carry into the exponent
+            // for inputs in the narrow window (HalfMaxFinite, HalfMaxFinite +
+            // 1 ULP] and emit ±Inf — which ReadHalf folds to zero, silently
+            // teleporting a transform component to the origin.  Clamping
+            // here makes the encoder's output total over the finite domain:
+            // any in-range float lands on its representable half-precision
+            // neighbour, and any out-of-range float lands on ±HalfMaxFinite,
+            // preserving sign and order of magnitude rather than
+            // collapsing to zero.  No allocation, no branch on the hot
+            // (in-range) path beyond the magnitude compare.
+            if (value > HalfMaxFinite)       value = HalfMaxFinite;
+            else if (value < -HalfMaxFinite) value = -HalfMaxFinite;
 
             ushort half = FloatToHalfBits(value);
             buf[offset]     = (byte)(half & 0xFF);

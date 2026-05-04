@@ -100,7 +100,7 @@ from blocking socket I/O.
 │  NetworkVariable.OnValueChanged callbacks               │
 │  SpawnManager.Spawn/Despawn (Instantiate/Destroy/Pool)  │
 │  MainThreadDispatcher.Update() — drains action queue    │
-│    (up to 200 actions per frame, queue capped @ 4096)   │
+│    (up to 200 actions per frame, queue capped @ 10 000) │
 │                                                         │
 │  ⚠ Never block this thread with socket calls            │
 └────────────────┬────────────────────────────────────────┘
@@ -195,8 +195,8 @@ All game traffic travels over a single **UDP socket** (`System.Net.Sockets.Socke
 | Protocol       | UDP (unreliable, unordered)               |
 | Default port   | 7777                                      |
 | Reliable path  | KCP over UDP — port 7778                  |
-| Send buffer    | configurable — default 4 096 bytes        |
-| Receive buffer | configurable — default 4 096 bytes        |
+| Send buffer    | configurable — default 262 144 bytes (256 KiB) |
+| Receive buffer | configurable — default 262 144 bytes (256 KiB) |
 | IPv6           | IPv4-preferred; falls back to IPv6 for IPv6-only hosts |
 
 **Local IP discovery** — `UdpTransport` opens a temporary routing probe UDP socket

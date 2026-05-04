@@ -223,7 +223,39 @@ namespace RTMPE.Core
 
         // Cached delegate for SendVariableUpdate — method-group-to-delegate
         // conversion allocates on every call unless stored in a field.
-        private System.Action<byte[]> _sendVariableUpdateDelegate;
+        // GC Round 2 (2026-05-02): now bound to the (byte[], int) overload
+        // so callers can pass an oversized cached/pooled buffer + length.
+        private System.Action<byte[], int> _sendVariableUpdateDelegate;
+
+        // GC Round 3 (2026-05-02) — per-direction 12-byte AEAD nonce
+        // scratch buffers reused across packets.  Replaces the per-packet
+        // `new byte[12]` that AeadNonce.Build allocated.  Two separate
+        // fields keep the inbound and outbound paths re-entrancy-safe even
+        // if a future change runs them concurrently; both are written
+        // before being read inside the same Seal/Open call so a stale-read
+        // from the prior packet is never observable.  Sized exactly to
+        // AeadNonce.Size — the wire-format invariant is enforced at every
+        // call site that consumes them.
+        private readonly byte[] _outboundNonceScratch = new byte[RTMPE.Core.Aead.AeadNonce.Size];
+        private readonly byte[] _inboundNonceScratch  = new byte[RTMPE.Core.Aead.AeadNonce.Size];
+
+        // Per-direction AAD scratch buffer reused across packets.  16 bytes
+        // covers the maximum AAD size (2 baseline + 4 app_seq + 4
+        // gameplay_seq = 10 bytes today) with headroom for future
+        // sub-headers.  ChaCha20Poly1305Impl.Seal/OpenInto accept
+        // (aad, aadOffset, aadLength) so the meaningful prefix is signalled
+        // explicitly — the trailing slack bytes never participate in the
+        // Poly1305 computation.
+        //
+        // Two separate fields keep the inbound and outbound paths
+        // re-entrancy-safe even if a future change runs them concurrently;
+        // both are fully overwritten before being passed to Seal/Open
+        // inside the same call so a stale read from the prior packet is
+        // never observable.  Mirrors the threading invariant of the
+        // nonce scratch fields above.
+        private const int AeadAadScratchCapacity = 16;
+        private readonly byte[] _outboundAadScratch = new byte[AeadAadScratchCapacity];
+        private readonly byte[] _inboundAadScratch  = new byte[AeadAadScratchCapacity];
 
         // Default-fallback tick interval used until NetworkSettings has been
         // resolved (e.g. very early Awake reentrancy, edit-mode tests with no

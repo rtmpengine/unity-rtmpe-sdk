@@ -62,6 +62,8 @@
 //  • Sleep state is only included in the payload when it changes, reducing the
 //    common-case payload size for active objects.
 
+using System.Buffers;
+
 using UnityEngine;
 using RTMPE.Core;
 using RTMPE.Sync.Internal;
@@ -269,6 +271,16 @@ namespace RTMPE.Sync
         // before the next render.  Capture the desired correction here and
         // apply it from FixedUpdate so the write lands exactly once per
         // physics tick — the LCM beat goes away.
+        //
+        // Newer-wins (intentional): if multiple reconciliation packets arrive
+        // between two FixedUpdate beats (e.g. when Update runs faster than
+        // physics or under frame hitch), only the most recent pending snap is
+        // kept.  This is correct because the most recent server state supersedes
+        // all earlier states in the same reconciliation window; applying an older
+        // snap followed immediately by a newer snap would produce a visible
+        // double-teleport artifact.  The single-slot design is a deliberate
+        // trade-off: it eliminates the artifact at the cost of discarding
+        // intermediate snaps that would have been overwritten anyway.
         private Vector3    _pendingOwnerSnapPosition;
         private bool       _hasPendingOwnerSnapPosition;
         private Quaternion _pendingOwnerSnapRotation;
@@ -397,8 +409,24 @@ namespace RTMPE.Sync
             var manager = NetworkManager.Instance;
             if (manager == null) return;
 
-            var payload = PhysicsPacketBuilder.BuildPayload(NetworkObjectId, current, dataMask);
-            manager.SendStateSync(payload);
+            // Pooled physics send path (GC Round 2, 2026-05-02).
+            // Compute exact size, rent, write into the buffer, send only the
+            // written bytes, return.  ArrayPool.Rent may give a larger
+            // buffer; passing `size` explicitly to SendStateSync caps the
+            // wire frame's payload_len to the bytes we actually wrote.
+            int size   = PhysicsPacketBuilder.ComputePayloadSize(dataMask, twoDee: false);
+            var pool   = ArrayPool<byte>.Shared;
+            var buffer = pool.Rent(size);
+            try
+            {
+                int written = PhysicsPacketBuilder.BuildPayloadInto(
+                    buffer, 0, NetworkObjectId, current, dataMask);
+                manager.SendStateSync(buffer, written);
+            }
+            finally
+            {
+                pool.Return(buffer);
+            }
 
             _lastSentState       = current;
             _lastSleepState      = current.IsSleeping;

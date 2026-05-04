@@ -189,6 +189,38 @@ namespace RTMPE.Sync
         ///
        /// Wire layout: [var_id:2 LE][value_len:2 LE][value_bytes:N]
         /// </summary>
+        // GC Round 2 (2026-05-02) — cached fast-path serializer state.
+        //
+        // The fast path needs a non-growable MemoryStream + BinaryWriter to
+        // detect "value too big for the pool buffer" via NotSupportedException
+        // and fall back to the growable slow path.  Pre-Round-2, both objects
+        // were `using var` locals — one MemoryStream + one BinaryWriter
+        // allocated per SerializeWithId call (≈ N variables × M objects ×
+        // 30 Hz = several hundred allocs/sec on a busy game).
+        //
+        // Caching strategy:
+        //   • The rented byte[] still comes from ArrayPool<byte>.Shared per
+        //     call.  This is required because the buffer must be *cleared*
+        //     before return to avoid leaking the prior tick's variable
+        //     payload to the next renter; a per-instance buffer would leak
+        //     the same payload across ticks of the SAME variable.
+        //   • The MemoryStream + BinaryWriter wrappers are allocated once
+        //     per NetworkVariable instance (stored in _fastMs / _fastBw)
+        //     and re-targeted onto each new rented buffer via reflection-
+        //     free APIs: SetLength(0)+TrySetBuffer.  .NET Standard 2.1 does
+        //     not expose SetBuffer publicly, so we wrap a fresh
+        //     MemoryStream around the rented buffer the first time and
+        //     leave the wrapper objects alive afterwards.
+        //   • Threading: NetworkVariableBase is touched only from the Unity
+        //     main thread (FlushDirtyVariables runs on Update); the cached
+        //     fields are NOT thread-safe.  See NetworkVariable threading
+        //     notes at the file header.
+        private MemoryStream _fastMs;
+        private BinaryWriter _fastBw;
+        private byte[]       _fastMsBuffer;  // Cached reference for fast identity check (avoids GetBuffer's UnauthorizedAccessException risk path)
+        private MemoryStream _slowMs;
+        private BinaryWriter _slowBw;
+
         public void SerializeWithId(BinaryWriter writer)
         {
             // Write var_id first.
@@ -220,8 +252,48 @@ namespace RTMPE.Sync
             bool overflowed = false;
             try
             {
-                using var fast = new MemoryStream(rented, 0, rented.Length, writable: true);
-                using var bw = new BinaryWriter(fast, Encoding.UTF8, leaveOpen: true);
+                // Cached MemoryStream + BinaryWriter (lazy-init).  The
+                // MemoryStream is bound to the rented buffer on construction;
+                // since rented buffers vary in length call-to-call (ArrayPool
+                // returns the same bucket size for a given Rent request, but
+                // .Length may exceed the requested size), we always
+                // construct a fresh MemoryStream around the new rented
+                // buffer — but we cache the BinaryWriter against the cached
+                // stream.  In practice ArrayPool's bucket logic means the
+                // rented array reference is usually identical across calls
+                // on a given instance, so the MemoryStream allocation is
+                // O(1) but its internal buffer reference does not change.
+                if (_fastMs == null || !ReferenceEquals(_fastMsBuffer, rented))
+                {
+                    // (Re)bind: the rented buffer reference changed since
+                    // last call (or first call).  Allocate a new
+                    // MemoryStream over the new buffer.  We use the 5-arg
+                    // constructor with publiclyVisible: true so the cached
+                    // stream's GetBuffer() call (used elsewhere) does not
+                    // throw UnauthorizedAccessException — the buffer is
+                    // ours to expose since we rented it locally.  We also
+                    // store the buffer reference in _fastMsBuffer for the
+                    // ReferenceEquals check above; calling GetBuffer() on
+                    // a non-rebound stream is allowed but is only invoked
+                    // for the buffer-identity check, never for slicing.
+                    // Disposing the BinaryWriter would close the
+                    // underlying stream, so we deliberately do NOT dispose
+                    // either object — they are root-rooted by _fastMs /
+                    // _fastBw and reclaimed when this NetworkVariable is
+                    // finalized.
+                    _fastMs = new MemoryStream(rented, 0, rented.Length,
+                                               writable: true, publiclyVisible: true);
+                    _fastBw = new BinaryWriter(_fastMs, Encoding.UTF8, leaveOpen: true);
+                    _fastMsBuffer = rented;
+                }
+                else
+                {
+                    // Same buffer reference — just reset the position.
+                    _fastMs.SetLength(0);
+                    _fastMs.Position = 0;
+                }
+                var fast = _fastMs;
+                var bw   = _fastBw;
                 try
                 {
                     Serialize(bw);
@@ -270,11 +342,24 @@ namespace RTMPE.Sync
                 pool.Return(rented, clearArray: true);
             }
 
-            // Slow path: allocate a growable stream.  Matches the pre-pool
-            // behaviour for NetworkVariableString and similarly large values.
-            using (var growable = new MemoryStream(PoolBufferSize))
-            using (var bw = new BinaryWriter(growable, Encoding.UTF8, leaveOpen: true))
+            // Slow path: cache a growable stream + writer the first time
+            // it's needed.  The slow path is rare (long-string variables
+            // only) so the cache pays for itself slowly, but it costs
+            // nothing on instances that never hit it.  We must reset
+            // length/position on each entry because the stream is reused.
+            if (_slowMs == null)
             {
+                _slowMs = new MemoryStream(PoolBufferSize);
+                _slowBw = new BinaryWriter(_slowMs, Encoding.UTF8, leaveOpen: true);
+            }
+            else
+            {
+                _slowMs.SetLength(0);
+                _slowMs.Position = 0;
+            }
+            {
+                var growable = _slowMs;
+                var bw       = _slowBw;
                 try
                 {
                     Serialize(bw);
@@ -301,6 +386,7 @@ namespace RTMPE.Sync
                 writer.Write(growable.GetBuffer(), 0, valueLen);
             }
         }
+
 
         /// <summary>
         /// Read a value from <paramref name="reader"/> and apply it without

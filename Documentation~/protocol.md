@@ -179,7 +179,10 @@ payload = [crypto_id:4 LE][jwt_len:2 LE][jwt:jwt_len][rc_len:2 LE][reconnect_tok
 ```
 
 - `crypto_id` — a server-assigned `u32` used as the high 4 bytes of every subsequent AEAD nonce.
-- `jwt` — HS256-signed JWT session token (UTF-8 encoded).
+- `jwt` — EdDSA (Ed25519) signed JWT session token (UTF-8 encoded). The
+  SDK validates the signature against the configured Ed25519 public key
+  (`NetworkSettings.jwtSigningKeyHex`); RFC 8725 §3.1 `alg=none` is
+  rejected unconditionally.
 - `reconnect_token` — opaque single-use token that resumes the session via
   `ReconnectInit` (0x09). Used by `NetworkManager.Reconnect()`. Also used by
   the HKDF N-8 path to derive an IP-migration HMAC key.

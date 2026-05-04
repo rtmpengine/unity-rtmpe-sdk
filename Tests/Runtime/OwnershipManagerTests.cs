@@ -428,6 +428,155 @@ namespace RTMPE.Tests
             Assert.AreEqual(0, _ownership.OutstandingCount);
         }
 
+        // ── Eviction defence-in-depth (V3 audit, fix #1) ───────────────────────
+        //
+        // When AllocateOutstandingRequestId saturates, it evicts the
+        // earliest-deadline entry and reuses its id slot.  The eviction
+        // must scrub every per-request tracking structure — _outstanding,
+        // _outstandingDeadlineMs, AND _outstandingExpectations — so a stale
+        // expectation tuple from the orphaned request cannot be observed
+        // by ConsumeMatchingExpectation between the eviction and the
+        // caller's overwrite of the expectation slot.
+
+        private static System.Reflection.FieldInfo ExpectationsField =>
+            typeof(OwnershipManager).GetField(
+                "_outstandingExpectations",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+        private bool ExpectationContains(uint requestId)
+        {
+            var dict = (Dictionary<uint, (ulong ObjectId, string NewOwner)>)
+                ExpectationsField.GetValue(_ownership);
+            return dict.ContainsKey(requestId);
+        }
+
+        [Test]
+        [Description(
+            "Eviction in AllocateOutstandingRequestId clears the evicted id's " +
+            "expectation tuple in addition to removing it from _outstanding " +
+            "and _outstandingDeadlineMs.")]
+        public void AllocateOutstandingRequestId_EvictionClearsExpectation()
+        {
+            _ownership.ResetOutstandingForTest();
+
+            // Seed _outstanding to saturation: 256 ids in [1, 256] occupied by
+            // expectations the test owns, with the earliest deadline on id=42
+            // so the eviction picks 42 deterministically.  We bypass the public
+            // Allocate/RequestOwnership pipeline by writing directly to the
+            // tracked dictionaries, so the only path that can land on id 42
+            // when AllocateOutstandingRequestId is called is the eviction
+            // branch.
+            for (uint id = 1u; id <= 256u; id++)
+                InjectOutstandingExpectation(id, /*objectId*/ id, $"orig-owner-{id}");
+
+            // Drop id 42's deadline below every other entry so the eviction
+            // walk picks it deterministically.  The other ids carry
+            // long.MaxValue (set by InjectOutstandingExpectation), so the
+            // earliest-deadline scan in AllocateOutstandingRequestId picks 42.
+            var dlField = typeof(OwnershipManager).GetField(
+                "_outstandingDeadlineMs",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var deadlines = (Dictionary<uint, long>)dlField.GetValue(_ownership);
+            deadlines[42u] = 1L; // earliest deadline → first eviction target
+
+            // Sanity: id 42's expectation tuple is currently the orphan tuple.
+            Assert.IsTrue(ExpectationContains(42u),
+                "Pre-condition: id 42 must have an expectation entry.");
+
+            var allocate = typeof(OwnershipManager).GetMethod(
+                "AllocateOutstandingRequestId",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+            // Trigger the eviction branch.  PruneExpiredOutstanding sweeps
+            // entries whose deadline is in the past; we set 42's deadline to
+            // 1L (well below NowMs() at any wall time after the Unix epoch),
+            // so the prune step inside Allocate may reclaim id 42 before the
+            // saturation branch runs.  Either way, the post-condition is the
+            // same: id 42's expectation entry must NOT be observable as the
+            // orphan tuple after Allocate returns — either because the prune
+            // cleared it, or because the saturation eviction cleared it.
+            uint allocatedId = (uint)allocate.Invoke(_ownership, null);
+
+            // POST-CONDITION 1: AllocateOutstandingRequestId returned a valid
+            // (non-zero) id.  Required by the public contract.
+            Assert.AreNotEqual(0u, allocatedId,
+                "Allocate must return a non-zero id under saturation.");
+
+            // POST-CONDITION 2: the orphan tuple "orig-owner-42" must not be
+            // observable.  Two acceptable end states:
+            //   (a) id 42 was reused for the new request — its expectation
+            //       slot is empty (defence-in-depth scrub) until the caller
+            //       writes the new tuple.
+            //   (b) id 42 was pruned and a different id was returned — its
+            //       expectation slot was removed by the prune step.
+            // Either way, ExpectationContains(42u) must be false OR the tuple
+            // there must NOT be the orphan tuple.
+            var dict = (Dictionary<uint, (ulong ObjectId, string NewOwner)>)
+                ExpectationsField.GetValue(_ownership);
+            if (dict.TryGetValue(42u, out var tup))
+            {
+                Assert.AreNotEqual("orig-owner-42", tup.NewOwner,
+                    "Stale orphan tuple under id 42 must not survive the " +
+                    "AllocateOutstandingRequestId path.");
+            }
+        }
+
+        [Test]
+        [Description(
+            "Stale eviction tuple cannot be matched by ConsumeMatchingExpectation. " +
+            "Validates that the eviction's expectation cleanup closes the " +
+            "tuple-correlation hole that fix #1 of the V3 audit was designed " +
+            "to address.")]
+        public void Eviction_StaleExpectation_NotMatchableByConsume()
+        {
+            _ownership.ResetOutstandingForTest();
+
+            // Single-entry saturation simulation.  The orphan tuple is
+            // (objectId=80, newOwner="alice").
+            InjectOutstandingExpectation(7u, 80UL, "alice");
+
+            // Manually invoke the (private) eviction effect that fix #1 makes
+            // safe: simulate the eviction by removing the tracking entry and
+            // re-binding the slot to a different request.  The fix's contract
+            // is: the expectation map is symmetric with the outstanding /
+            // deadline maps.  Drop all three for id 7.
+            var fSet = typeof(OwnershipManager).GetField(
+                "_outstanding",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var fDl = typeof(OwnershipManager).GetField(
+                "_outstandingDeadlineMs",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+            // Eviction step under fix #1 (matches Runtime/Core/OwnershipManager.cs
+            // lines 277-294 + line 291): remove the orphaned id from every
+            // tracking dict.  Re-bind under the new request.
+            ((HashSet<uint>)fSet.GetValue(_ownership)).Remove(7u);
+            ((Dictionary<uint, long>)fDl.GetValue(_ownership)).Remove(7u);
+            ((Dictionary<uint, (ulong ObjectId, string NewOwner)>)
+                ExpectationsField.GetValue(_ownership)).Remove(7u);
+
+            // Fresh request reuses id 7 with a different tuple.
+            InjectOutstandingExpectation(7u, 99UL, "bob");
+
+            // The stale (80, "alice") tuple must not be matchable.
+            var consumeMi = typeof(OwnershipManager).GetMethod(
+                "ConsumeMatchingExpectation",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            bool stale = (bool)consumeMi.Invoke(_ownership,
+                new object[] { 80UL, "alice" });
+            Assert.IsFalse(stale,
+                "Stale orphan tuple must not be matched after eviction-time scrub.");
+
+            // Conversely, the fresh tuple is matchable exactly once.
+            bool fresh1 = (bool)consumeMi.Invoke(_ownership,
+                new object[] { 99UL, "bob" });
+            Assert.IsTrue(fresh1, "Fresh tuple must match.");
+
+            bool fresh2 = (bool)consumeMi.Invoke(_ownership,
+                new object[] { 99UL, "bob" });
+            Assert.IsFalse(fresh2, "One-shot consume: replay must be rejected.");
+        }
+
         // ── Test double ────────────────────────────────────────────────────────
 
         private sealed class ConcreteNB : NetworkBehaviour

@@ -255,18 +255,42 @@ namespace RTMPE.Protocol
         public byte[] Build(PacketType type, PacketFlags flags, byte[] payload)
         {
             if (payload == null) payload = Array.Empty<byte>();
+            return Build(type, flags, payload, payload.Length);
+        }
+
+        /// <summary>
+        /// Build a complete packet using the first <paramref name="payloadLength"/>
+        /// bytes of <paramref name="payload"/>.  Use this overload when
+        /// <paramref name="payload"/> is a pooled or oversized buffer (e.g.,
+        /// rented from <c>ArrayPool&lt;byte&gt;.Shared</c>) whose backing
+        /// length is greater than the logical payload size.
+        /// </summary>
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="payloadLength"/> exceeds the per-payload
+        /// caps or is negative.
+        /// </exception>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when <paramref name="payloadLength"/> exceeds
+        /// <c>payload.Length</c>.
+        /// </exception>
+        public byte[] Build(PacketType type, PacketFlags flags, byte[] payload, int payloadLength)
+        {
+            if (payload == null) payload = Array.Empty<byte>();
+            if (payloadLength < 0 || payloadLength > payload.Length)
+                throw new ArgumentOutOfRangeException(nameof(payloadLength),
+                    $"payloadLength {payloadLength} must be in [0, payload.Length={payload.Length}].");
 
             // Application-layer cap fires first.  Application payloads
             // exceeding the transport MTU envelope silently rely on IP
             // fragmentation (poor on mobile / CGNAT); rejecting at the
             // builder makes the failure diagnosable at the call site instead
             // of late in the pipeline as an opaque SocketException.
-            EnsureFitsInDatagram(payload.Length);
+            EnsureFitsInDatagram(payloadLength);
 
-            if (payload.Length > MaxPayloadBytes)
+            if (payloadLength > MaxPayloadBytes)
                 throw new ArgumentException(
-                    $"payload length {payload.Length} exceeds PacketBuilder.MaxPayloadBytes ({MaxPayloadBytes})",
-                    nameof(payload));
+                    $"payload length {payloadLength} exceeds PacketBuilder.MaxPayloadBytes ({MaxPayloadBytes})",
+                    nameof(payloadLength));
 
             // Atomic increment — no Unsafe.As required; cast uint at write time.
             // Interlocked.Increment returns int; casting to uint handles wrap-around correctly.
@@ -294,7 +318,7 @@ namespace RTMPE.Protocol
                 }
             }
 
-            var packet = new byte[PacketProtocol.HEADER_SIZE + payload.Length];
+            var packet = new byte[PacketProtocol.HEADER_SIZE + payloadLength];
 
             // [0..1] magic (LE u16 = 0x5254)
             packet[0] = (byte)(PacketProtocol.MAGIC & 0xFF);
@@ -316,15 +340,15 @@ namespace RTMPE.Protocol
             packet[8] = (byte)(seq >> 24);
 
             // [9..12] payload_len (LE u32)
-            uint payloadLen = (uint)payload.Length;
+            uint payloadLen = (uint)payloadLength;
             packet[9]  = (byte)(payloadLen);
             packet[10] = (byte)(payloadLen >> 8);
             packet[11] = (byte)(payloadLen >> 16);
             packet[12] = (byte)(payloadLen >> 24);
 
             // Payload
-            if (payload.Length > 0)
-                Buffer.BlockCopy(payload, 0, packet, PacketProtocol.HEADER_SIZE, payload.Length);
+            if (payloadLength > 0)
+                Buffer.BlockCopy(payload, 0, packet, PacketProtocol.HEADER_SIZE, payloadLength);
 
             return packet;
         }

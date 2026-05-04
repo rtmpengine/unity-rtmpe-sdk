@@ -69,7 +69,7 @@
 1. Client calls `NetworkManager.Instance.Connect(apiKey)`.
 2. Gateway validates the API key against the database and issues a session token.
 3. Client enters `NetworkState.Connected`.
-4. Client creates or joins a **Room** (1–16 players).
+4. Client creates or joins a **Room** (1–100 players, configurable per room).
 5. Each client spawns their player object via `SpawnManager.Spawn()`.
 6. The server broadcasts state at **30 Hz** to every player in the room.
 7. Players see each other moving in real time at P99 < 30 ms latency (within region).
@@ -170,8 +170,8 @@ You can maintain multiple profiles (e.g. `RTMPESettings_Dev.asset`, `RTMPESettin
 | `Connection Timeout Ms`            | `10000`                                    | 10-second handshake timeout                   |
 | `Tick Rate`                        | `30`                                       | Must match the server room-service config     |
 | `Auto Rejoin Last Room On Reconnect` | `true` (default)                          | v1.1 — auto-rejoin the last room after a successful token-based `Reconnect()` |
-| `Send Buffer Bytes`                | `4096`                                     | UDP socket SO_SNDBUF                          |
-| `Receive Buffer Bytes`             | `4096`                                     | UDP socket SO_RCVBUF                          |
+| `Send Buffer Bytes`                | `262144` (256 KiB)                         | UDP socket SO_SNDBUF                          |
+| `Receive Buffer Bytes`             | `262144` (256 KiB)                         | UDP socket SO_RCVBUF                          |
 | `Network Thread Buffer Bytes`      | `8192`                                     | Background thread read buffer                 |
 | `Enable Debug Logs`                | `true` during development, `false` in production | Unity Console connection traces         |
 | `Api Key Psk Hex`                  | 64-char hex — copy from the RTMPE dashboard | Encrypts the API key in transit; leave blank for local dev only |
@@ -900,7 +900,7 @@ bool IsInRoom                    // true when inside a room
 // Identity & tokens
 ulong  LocalPlayerId             // numeric session ID (valid after SessionAck)
 string LocalPlayerStringId       // room player UUID (valid after JoinRoom/CreateRoom)
-string JwtToken                  // HS256 JWT — use with Room Service REST API
+string JwtToken                  // EdDSA (Ed25519) JWT — use with Room Service REST API
 string ReconnectToken            // reconnect token (valid until consumed / cleared)
 bool   CanReconnect              // true when a reconnect token is held
 
@@ -956,7 +956,7 @@ event Action<string>      OnRoomError
 new CreateRoomOptions
 {
     Name       = "My Room",   // display name (max 64 chars)
-    MaxPlayers = 4,            // 1–16; 0 = server default (16)
+    MaxPlayers = 4,            // 1–100; 0 = server default (100)
     IsPublic   = true,         // visible in ListRooms results
 }
 ```

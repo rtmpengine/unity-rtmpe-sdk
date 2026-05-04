@@ -118,7 +118,7 @@ ulong LocalPlayerId { get; }
 // receives a successful Create/Join response. Used by NetworkBehaviour.IsOwner.
 string LocalPlayerStringId { get; }
 
-// HS256 JWT bearer token issued at SessionAck. Use with Room Service REST API.
+// EdDSA (Ed25519) JWT bearer token issued at SessionAck. Use with Room Service REST API.
 string JwtToken { get; }
 
 // Reconnect token issued at SessionAck. Non-null whenever a token is held and
@@ -195,6 +195,13 @@ event Action OnDataAcknowledged
 // Rooms.OnRoomJoined / Rooms.OnRoomError events.
 // Not fired when autoRejoinLastRoomOnReconnect is false or LastRoomId is null.
 event Action<string> OnAutoRejoinAttempt
+
+// Fired when the bounded reconnect loop kicked off by Reconnect() exhausts
+// NetworkSettings.maxReconnectAttempts without reaching Connected. Argument
+// is the number of attempts actually made. When this fires the manager has
+// transitioned back to Disconnected and cleared all session state — the
+// application MUST fall back to Connect(apiKey) to recover.
+event Action<int> OnReconnectFailed
 ```
 
 ### Obsolete events (v1.0 compatibility shims)
@@ -282,6 +289,35 @@ event Action<RoomInfo[]> OnRoomListReceived
 
 // A room operation failed. The string contains a diagnostic description.
 event Action<string> OnRoomError
+
+// Fired after the server accepts a RoomPropertyUpdate and broadcasts the
+// new state to all clients. Argument is the post-update RoomInfo snapshot;
+// RoomInfo.Properties reflects the authoritative map. Subscribers that need
+// a delta should diff against CurrentRoom captured BEFORE the event fires —
+// RoomManager swaps CurrentRoom to the new snapshot BEFORE invoking this event.
+event Action<RoomInfo> OnRoomPropertiesChanged
+
+// Fired after the server accepts a PlayerPropertyUpdate and broadcasts the
+// new state to all clients. Arguments are (playerId, updatedPlayerInfo).
+event Action<string, PlayerInfo> OnPlayerPropertiesChanged
+
+// Fired when the room's master client changes — either automatically (FIFO
+// promotion after the previous master disconnected) or manually (a
+// TransferMasterClient request was accepted). Arguments are
+// (previousMasterId, newMasterId); either may be empty when unknown
+// (e.g. initial assignment).
+event Action<string, string> OnMasterClientChanged
+
+// Fired when the host removes a player from the room via KickPlayer.
+// Arguments are (kickerId, targetPlayerId). Every client in the room
+// receives this event — the kicked client observes their own ID as the
+// target and should treat it as an authoritative disconnect.
+event Action<string, string> OnPlayerKicked
+
+// Fired when every player in the room has reported scene-loaded readiness
+// for the authoritative scene (stored in the reserved Scene property).
+// Argument is the scene name that just finished loading for everyone.
+event Action<string> OnAllPlayersSceneLoaded
 ```
 
 ---
@@ -665,8 +701,8 @@ Set them in the Unity Inspector or assign them in code by field name.
 | `connectionTimeoutMs`          | `int`    | `10000`     | Milliseconds before handshake times out |
 | `tickRate`                     | `int`    | `30`        | Must match the server room-service config |
 | `autoRejoinLastRoomOnReconnect`| `bool`   | `true`      | v1.1 — auto-call `Rooms.JoinRoom(LastRoomId)` after a successful token-based Reconnect() |
-| `sendBufferBytes`              | `int`    | `4096`      | UDP socket SO_SNDBUF |
-| `receiveBufferBytes`           | `int`    | `4096`      | UDP socket SO_RCVBUF |
+| `sendBufferBytes`              | `int`    | `262144`    | UDP socket SO_SNDBUF (256 KiB) |
+| `receiveBufferBytes`           | `int`    | `262144`    | UDP socket SO_RCVBUF (256 KiB) |
 | `networkThreadBufferBytes`     | `int`    | `8192`      | Background thread read buffer |
 | `enableDebugLogs`              | `bool`   | `false`     | Unity Console tracing — set true only in development |
 | `apiKeyPskHex`                 | `string` | `""`        | 64-char hex PSK — copy from the RTMPE dashboard |
@@ -684,7 +720,8 @@ public sealed class CreateRoomOptions
     // Display name shown in room lists. Max 64 bytes UTF-8. Default: "" (server assigns a name).
     public string Name { get; set; } = string.Empty;
 
-    // Max players allowed. Range: 1–16. 0 = server default (16).
+    // Max players allowed. Range: 1–100. 0 = server default (100).
+    // Values outside [1, 100] are silently clamped to 100 by the room service.
     public int MaxPlayers { get; set; } = 0;
 
     // Whether the room appears in public room listings. Default: true.
@@ -906,8 +943,8 @@ is installed via `NetworkManager.SetTransportFactory`.
 UdpTransport(
     string host,
     int    port,
-    int    sendBufferBytes    = 4096,
-    int    receiveBufferBytes = 4096)
+    int    sendBufferBytes    = 262144,   // 256 KiB
+    int    receiveBufferBytes = 262144)   // 256 KiB
 
 // Also exposed for zero-copy hot paths (e.g. ArrayPool-rented buffers).
 public void Send(byte[] buffer, int offset, int count)

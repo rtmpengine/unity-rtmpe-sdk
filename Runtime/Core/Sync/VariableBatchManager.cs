@@ -17,8 +17,23 @@
 //   buffers (_pending, _scratch) are not synchronised; they assume the
 //   single-thread invariant of the Update path.
 //
+// GC Round 2 (2026-05-02):
+//   • Collector signature is now Action<byte[], int> so callers can pass a
+//     pooled / cached buffer that is larger than the logical payload —
+//     CollectIntoBatch reads only the leading `length` bytes.
+//   • Pending entries are still per-payload byte[] allocations because they
+//     must persist across CollectIntoBatch calls until FlushPending sends
+//     the combined batch.  This per-entry allocation is the same cost the
+//     pre-Round-2 ms.ToArray() path paid; the win is on the non-batching
+//     path which now bypasses the copy entirely (NetworkBehaviour hands
+//     ms.GetBuffer() + length straight to SendVariableUpdate).
+//   • The combined batch byte[] (built by VariableBatchBuilder) is rented
+//     from ArrayPool<byte>.Shared and returned after SendVariableBatchUpdate
+//     wraps it.  Eliminates the per-tick batch allocation that scaled with
+//     pending count.
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 
 using UnityEngine;
@@ -39,16 +54,16 @@ namespace RTMPE.Core.Sync
 
         private int _activeCap;
 
-        private readonly Action<byte[]> _sendBatch;        // → NetworkManager.SendVariableBatchUpdate
-        private readonly Action<byte[]> _sendSingleFallback; // → NetworkManager.SendVariableUpdate (used on builder failure)
+        private readonly Action<byte[], int> _sendBatch;        // → NetworkManager.SendVariableBatchUpdate(byte[], int)
+        private readonly Action<byte[], int> _sendSingleFallback; // → NetworkManager.SendVariableUpdate(byte[], int) (used on builder failure)
 
         // Cached delegate for the batch collector. Method-group conversion
         // would allocate a new closure on every CollectIntoBatch read; one
         // allocation amortised across the lifetime of the manager keeps the
         // hot flush path allocation-free.
-        private Action<byte[]> _collectorCache;
+        private Action<byte[], int> _collectorCache;
 
-        public VariableBatchManager(Action<byte[]> sendBatch, Action<byte[]> sendSingleFallback)
+        public VariableBatchManager(Action<byte[], int> sendBatch, Action<byte[], int> sendSingleFallback)
         {
             _sendBatch         = sendBatch         ?? throw new ArgumentNullException(nameof(sendBatch));
             _sendSingleFallback = sendSingleFallback ?? throw new ArgumentNullException(nameof(sendSingleFallback));
@@ -65,16 +80,28 @@ namespace RTMPE.Core.Sync
         public void SetActiveCap(int cap) => _activeCap = cap;
 
         /// <summary>
-        /// The cached <see cref="Action{Byte[]}"/> form of <see cref="CollectIntoBatch"/>.
+        /// The cached <see cref="Action{Byte[], Int32}"/> form of <see cref="CollectIntoBatch"/>.
         /// Hot-path: returned once and reused on every tick to keep
         /// FlushDirtyVariables's per-NetworkBehaviour callback allocation-free.
         /// </summary>
-        public Action<byte[]> Collector => _collectorCache ??= CollectIntoBatch;
+        public Action<byte[], int> Collector => _collectorCache ??= CollectIntoBatch;
 
-        private void CollectIntoBatch(byte[] payload)
+        private void CollectIntoBatch(byte[] payload, int length)
         {
-            if (payload == null || payload.Length == 0) return;
-            _pending.Add(payload);
+            if (payload == null || length <= 0) return;
+            // The pending entry must persist across CollectIntoBatch calls
+            // until FlushPending fires.  The caller's buffer (NetworkBehaviour's
+            // cached _flushMs backing array, or another pooled buffer) will
+            // be reused on the next tick, so we MUST copy out into our own
+            // exact-sized byte[] here.  This per-payload allocation is
+            // unavoidable at the batching boundary without a deeper redesign
+            // (e.g. a per-tick parallel-lengths array + pooled mega-buffer);
+            // it matches the cost of the pre-Round-2 ms.ToArray() call, so
+            // batching is no worse than before, and non-batching is cheaper.
+            var entry = new byte[length];
+            Buffer.BlockCopy(payload, 0, entry, 0, length);
+
+            _pending.Add(entry);
             if (_pending.Count >= _activeCap)
             {
                 FlushPending();
@@ -115,21 +142,51 @@ namespace RTMPE.Core.Sync
             for (int i = count; i < _scratch.Length; i++) _scratch[i] = null;
             _pending.Clear();
 
-            byte[] batchPayload;
+            // GC Round 2 (2026-05-02): rent the batch byte[] from ArrayPool
+            // and use the BuildInto overload to write the wire bytes
+            // directly into the rented buffer.  ComputeTotalSize gives the
+            // exact size; ArrayPool.Rent may return a buffer larger than
+            // the requested size, so we explicitly pass `total` to
+            // SendVariableBatchUpdate(byte[], int) so the wire frame's
+            // payload_len matches the bytes we actually wrote.
+            int total;
             try
             {
-                batchPayload = VariableBatchBuilder.Build(_scratch, count);
+                total = VariableBatchBuilder.ComputeTotalSize(_scratch, count);
             }
             catch (Exception ex)
             {
                 Debug.LogWarning(
-                    $"[RTMPE] VariableBatchBuilder.Build threw {ex.GetType().Name}: {ex.Message}. " +
+                    $"[RTMPE] VariableBatchBuilder.ComputeTotalSize threw {ex.GetType().Name}: {ex.Message}. " +
                     "Falling back to per-object VariableUpdate packets for this batch.");
-                for (int i = 0; i < count; i++) _sendSingleFallback(_scratch[i]);
+                for (int i = 0; i < count; i++) _sendSingleFallback(_scratch[i], _scratch[i].Length);
                 return;
             }
 
-            _sendBatch(batchPayload);
+            var pool   = ArrayPool<byte>.Shared;
+            var buffer = pool.Rent(total);
+            try
+            {
+                int written;
+                try
+                {
+                    written = VariableBatchBuilder.BuildInto(buffer, 0, _scratch, count);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning(
+                        $"[RTMPE] VariableBatchBuilder.BuildInto threw {ex.GetType().Name}: {ex.Message}. " +
+                        "Falling back to per-object VariableUpdate packets for this batch.");
+                    for (int i = 0; i < count; i++) _sendSingleFallback(_scratch[i], _scratch[i].Length);
+                    return;
+                }
+
+                _sendBatch(buffer, written);
+            }
+            finally
+            {
+                pool.Return(buffer);
+            }
         }
     }
 }

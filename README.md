@@ -27,13 +27,13 @@ default `UdpTransport` cannot run inside the browser sandbox.
 2. Click **+** → **Add package from git URL…**
 3. Paste:
    ```
-   https://github.com/Faisalzz1/unity-rtmpe-sdk.git
+   https://github.com/rtmpengine/unity-rtmpe-sdk.git
    ```
 
 Or add manually to your project's `Packages/manifest.json`:
 
 ```json
-"com.rtmpe.sdk": "https://github.com/Faisalzz1/unity-rtmpe-sdk.git"
+"com.rtmpe.sdk": "https://github.com/rtmpengine/unity-rtmpe-sdk.git"
 ```
 
 ## Quick Start
@@ -114,4 +114,4 @@ Full documentation lives in [`Documentation~/index.md`](Documentation~/index.md)
 
 ## License
 
-MIT — see [LICENSE](https://github.com/Faisalzz1/unity-rtmpe-sdk/blob/main/LICENSE.md).
+MIT — see [LICENSE](https://github.com/rtmpengine/unity-rtmpe-sdk/blob/main/LICENSE.md).

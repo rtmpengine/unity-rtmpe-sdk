@@ -98,7 +98,7 @@ Open your game's `Packages/manifest.json` and add:
 ```json
 {
   "dependencies": {
-    "com.rtmpe.sdk": "https://github.com/Faisalzz1/unity-rtmpe-sdk.git"
+    "com.rtmpe.sdk": "https://github.com/rtmpengine/unity-rtmpe-sdk.git"
   }
 }
 ```
@@ -106,7 +106,7 @@ Open your game's `Packages/manifest.json` and add:
 Or in Unity: **Window → Package Manager → + → Add package from git URL**, paste:
 
 ```
-https://github.com/Faisalzz1/unity-rtmpe-sdk.git
+https://github.com/rtmpengine/unity-rtmpe-sdk.git
 ```
 
 ### Option B — Local copy
@@ -137,7 +137,7 @@ The `RTMPE` namespace is now available in all scripts.
 
 ### About the mirror repository
 
-The Git URL above points to `Faisalzz1/unity-rtmpe-sdk` — a flat,
+The Git URL above points to `rtmpengine/unity-rtmpe-sdk` — a flat,
 UPM-installable mirror of the package directory inside the RTMPE
 monorepo. The mirror is published automatically by the
 `publish-unity-sdk-mirror` GitHub Actions workflow on every commit to

@@ -279,7 +279,7 @@ UnityEngine.SceneManagement.SceneManager.LoadScene("NextLevel");
 ## Reporting bugs
 
 If none of the above resolves the issue, open an issue at
-<https://github.com/Faisalzz1/unity-rtmpe-sdk/issues> and include:
+<https://github.com/rtmpengine/unity-rtmpe-sdk/issues> and include:
 
 1. SDK version — found in `Packages/com.rtmpe.sdk/package.json`.
 2. Unity version (e.g. `6000.1.0f1`) and scripting backend (Mono / IL2CPP).

@@ -5,9 +5,9 @@
     "description": "Real-Time Multiplayer Engine — Unity client SDK for converting single-player games to multiplayer in under 15 minutes.",
     "license": "MIT",
     "unity": "2022.3",
-    "documentationUrl": "https://github.com/Faisalzz1/unity-rtmpe-sdk/blob/main/Documentation~/index.md",
-    "changelogUrl": "https://github.com/Faisalzz1/unity-rtmpe-sdk/blob/main/CHANGELOG.md",
-    "licensesUrl": "https://github.com/Faisalzz1/unity-rtmpe-sdk/blob/main/LICENSE.md",
+    "documentationUrl": "https://github.com/rtmpengine/unity-rtmpe-sdk/blob/main/Documentation~/index.md",
+    "changelogUrl": "https://github.com/rtmpengine/unity-rtmpe-sdk/blob/main/CHANGELOG.md",
+    "licensesUrl": "https://github.com/rtmpengine/unity-rtmpe-sdk/blob/main/LICENSE.md",
     "keywords": [
         "multiplayer",
         "networking",
@@ -18,7 +18,7 @@
     ],
     "author": {
         "name": "RTMPE",
-        "url": "https://github.com/Faisalzz1"
+        "url": "https://github.com/rtmpengine"
     },
     "dependencies": {},
     "samples": [

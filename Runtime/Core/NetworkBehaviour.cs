@@ -370,6 +370,117 @@ namespace RTMPE.Core
         private MemoryStream _flushMs;
         private BinaryWriter _flushWriter;
 
+        // ── Sync-component cache ────────────────────────────────────────────
+        //
+        // The receive hot-path (HandleStateSyncPacket / HandlePhysicsSyncPacket
+        // / HandlePhysicsSync2DPacket / HandleVariableUpdatePacket) dispatches
+        // each inbound packet to one of these sync components on the same
+        // GameObject.  Unity 2022+ resolves GetComponent<T> in O(1) via an
+        // internal typed cache (~50–100 ns/call), but at 30 Hz × 8 peers that
+        // tallies ~24 µs/sec per object spent on type lookups; under IL2CPP
+        // without the JIT cache the overhead is materially higher.
+        //
+        // These fields hold the lazily-resolved sync components for this
+        // GameObject so the hot-path resolves to a single field load.
+        // Lookups are gated by a "queried" flag so an object that genuinely
+        // lacks a sync component pays the GetComponent cost exactly once
+        // per spawn cycle rather than per packet.  Both fields and flags
+        // are cleared on despawn — see [ResetSyncComponentCache].
+        //
+        // The Unity null operator (==) is used everywhere instead of `is`
+        // so a destroyed-but-not-finalised component is treated as missing
+        // and re-queried; `(object)` checks would observe the destroyed
+        // wrapper and incorrectly skip the refetch.
+        [NonSerialized] private NetworkTransform              _cachedNetworkTransform;
+        [NonSerialized] private bool                          _cachedNetworkTransformQueried;
+        [NonSerialized] private NetworkTransformInterpolator  _cachedNetworkTransformInterpolator;
+        [NonSerialized] private bool                          _cachedNetworkTransformInterpolatorQueried;
+        [NonSerialized] private NetworkRigidbody              _cachedNetworkRigidbody;
+        [NonSerialized] private bool                          _cachedNetworkRigidbodyQueried;
+        [NonSerialized] private NetworkRigidbody2D            _cachedNetworkRigidbody2D;
+        [NonSerialized] private bool                          _cachedNetworkRigidbody2DQueried;
+
+        /// <summary>
+        /// Sync-component accessor used by the receive hot-path.  Caches
+        /// <see cref="UnityEngine.Component.GetComponent{T}"/> after the
+        /// first call within a spawn cycle so per-packet dispatch resolves
+        /// to a field load rather than a typed component lookup.
+        /// </summary>
+        internal NetworkTransform CachedNetworkTransform
+        {
+            get
+            {
+                if (_cachedNetworkTransform != null) return _cachedNetworkTransform;
+                if (_cachedNetworkTransformQueried) return null;
+                _cachedNetworkTransform = GetComponent<NetworkTransform>();
+                _cachedNetworkTransformQueried = true;
+                return _cachedNetworkTransform;
+            }
+        }
+
+        /// <summary>
+        /// Sync-component accessor — see <see cref="CachedNetworkTransform"/>.
+        /// </summary>
+        internal NetworkTransformInterpolator CachedNetworkTransformInterpolator
+        {
+            get
+            {
+                if (_cachedNetworkTransformInterpolator != null) return _cachedNetworkTransformInterpolator;
+                if (_cachedNetworkTransformInterpolatorQueried) return null;
+                _cachedNetworkTransformInterpolator = GetComponent<NetworkTransformInterpolator>();
+                _cachedNetworkTransformInterpolatorQueried = true;
+                return _cachedNetworkTransformInterpolator;
+            }
+        }
+
+        /// <summary>
+        /// Sync-component accessor — see <see cref="CachedNetworkTransform"/>.
+        /// </summary>
+        internal NetworkRigidbody CachedNetworkRigidbody
+        {
+            get
+            {
+                if (_cachedNetworkRigidbody != null) return _cachedNetworkRigidbody;
+                if (_cachedNetworkRigidbodyQueried) return null;
+                _cachedNetworkRigidbody = GetComponent<NetworkRigidbody>();
+                _cachedNetworkRigidbodyQueried = true;
+                return _cachedNetworkRigidbody;
+            }
+        }
+
+        /// <summary>
+        /// Sync-component accessor — see <see cref="CachedNetworkTransform"/>.
+        /// </summary>
+        internal NetworkRigidbody2D CachedNetworkRigidbody2D
+        {
+            get
+            {
+                if (_cachedNetworkRigidbody2D != null) return _cachedNetworkRigidbody2D;
+                if (_cachedNetworkRigidbody2DQueried) return null;
+                _cachedNetworkRigidbody2D = GetComponent<NetworkRigidbody2D>();
+                _cachedNetworkRigidbody2DQueried = true;
+                return _cachedNetworkRigidbody2D;
+            }
+        }
+
+        /// <summary>
+        /// Wipe the sync-component cache.  Invoked on every despawn so a
+        /// pool-recycled instance does not retain references from its
+        /// previous spawn — components attached after pool re-acquire will
+        /// be picked up by the next hot-path access.
+        /// </summary>
+        private void ResetSyncComponentCache()
+        {
+            _cachedNetworkTransform                   = null;
+            _cachedNetworkTransformQueried            = false;
+            _cachedNetworkTransformInterpolator       = null;
+            _cachedNetworkTransformInterpolatorQueried = false;
+            _cachedNetworkRigidbody                   = null;
+            _cachedNetworkRigidbodyQueried            = false;
+            _cachedNetworkRigidbody2D                 = null;
+            _cachedNetworkRigidbody2DQueried          = false;
+        }
+
         // ── Internal SDK API (called by SpawnManager) ──────────────────────────
 
         /// <summary>
@@ -441,6 +552,12 @@ namespace RTMPE.Core
             {
                 _isSpawned = false;
                 OnNetworkDespawn();
+                // Wipe the sync-component cache after user code has run so
+                // OnNetworkDespawn handlers can still observe the cached
+                // references during teardown.  A pool-recycled instance
+                // re-acquired by SpawnManager will populate the cache
+                // afresh on its next hot-path access.
+                ResetSyncComponentCache();
             }
         }
 
@@ -628,16 +745,43 @@ namespace RTMPE.Core
         }
 
         /// <summary>
+        /// Backward-compatibility shim that copies the cached buffer's
+        /// leading <c>length</c> bytes into a fresh <c>byte[]</c> before
+        /// forwarding to the caller.  Production hot-paths use the
+        /// <see cref="FlushDirtyVariables(Action{byte[], int})"/> overload
+        /// directly to avoid this per-call copy; this overload exists for
+        /// SDK test fixtures that pre-date the GC Round 2 (2026-05-02)
+        /// signature change.
+        /// </summary>
+        internal void FlushDirtyVariables(Action<byte[]> sendPayload)
+        {
+            if (sendPayload == null) return;
+            FlushDirtyVariables((buf, len) =>
+            {
+                var copy = new byte[len];
+                if (len > 0) System.Buffer.BlockCopy(buf, 0, copy, 0, len);
+                sendPayload(copy);
+            });
+        }
+
+        /// <summary>
         /// Serialize all dirty tracked variables into a single <c>VariableUpdate</c>
         /// payload and call <paramref name="sendPayload"/> with it.
         /// No-op when not spawned, not owner, or all variables are clean.
         /// Called by <c>NetworkManager.FlushDirtyNetworkVariables</c> at 30 Hz.
         /// </summary>
         /// <param name="sendPayload">
-        /// Delegate that transmits the built payload bytes, e.g.
-        /// <c>NetworkManager.SendVariableUpdate</c>.
+        /// Delegate that transmits the built payload bytes.  Receives
+        /// <c>(buffer, length)</c> — only the leading <c>length</c> bytes of
+        /// <c>buffer</c> are valid (the buffer is the cached MemoryStream's
+        /// internal array, which may be larger than the logical payload).
+        /// Implementations must NOT retain a reference to the buffer past
+        /// the call: it is reused on the next flush tick.  Routes to
+        /// <c>NetworkManager.SendVariableUpdate(byte[], int)</c> in the
+        /// non-batching path, or <c>VariableBatchManager.CollectIntoBatch</c>
+        /// (which copies into a per-pending entry) when batching is enabled.
         /// </param>
-        internal void FlushDirtyVariables(Action<byte[]> sendPayload)
+        internal void FlushDirtyVariables(Action<byte[], int> sendPayload)
         {
             if (!IsOwner || !IsSpawned || _trackedVariables.Count == 0) return;
 
@@ -753,9 +897,19 @@ namespace RTMPE.Core
             writer.Write(count);
             writer.Flush();
 
-            // ms.ToArray() returns all bytes from 0 to _length (the high-water mark),
-            // regardless of the current Position — exactly the bytes we wrote above.
-            sendPayload(ms.ToArray());
+            // GC Round 2 (2026-05-02): hand the cached MemoryStream's
+            // backing buffer + written length to sendPayload instead of
+            // copying via ms.ToArray().  The non-batching consumer
+            // (SendVariableUpdate(byte[], int)) wraps only the leading
+            // `length` bytes into a packet and never retains the
+            // reference; the batching consumer (CollectIntoBatch) copies
+            // into a per-pending entry before returning.  Both paths are
+            // safe against the buffer being reused on the next tick.
+            // ms.GetBuffer() returns the underlying array (possibly larger
+            // than ms.Length); we always pass (int)ms.Length as the
+            // payload length so the wire frame's payload_len matches the
+            // bytes actually written.
+            sendPayload(ms.GetBuffer(), (int)ms.Length);
         }
 
         /// <summary>

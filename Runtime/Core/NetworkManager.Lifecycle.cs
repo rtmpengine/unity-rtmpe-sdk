@@ -228,7 +228,7 @@ namespace RTMPE.Core
             // avoids torn reads if the NetworkSettings asset is
             // hot-reloaded mid-flush.
             _variableBatchManager.SetActiveCap(batchCap);
-            System.Action<byte[]> sender = batching
+            System.Action<byte[], int> sender = batching
                 ? _variableBatchManager.Collector
                 : _sendVariableUpdateDelegate;
 

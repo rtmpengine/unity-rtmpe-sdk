@@ -37,6 +37,8 @@
 //
 // Threading: all methods run on the Unity main thread.
 
+using System.Buffers;
+
 using UnityEngine;
 using RTMPE.Core;
 
@@ -683,18 +685,42 @@ namespace RTMPE.Sync
                 state.Position = ClampOwnerVelocity(state.Position);
             }
 
-            byte[] payload = null;
-            if (settings != null && settings.quantizeTransforms)
+            // ── Pooled transform send path (GC Round 2, 2026-05-02) ─────
+            // Rent the maximum possible size (full-precision = 48 B); the
+            // quantized builder writes 25 B into the same buffer when
+            // enabled.  ArrayPool.Rent may return a buffer larger than the
+            // requested size, so we always pass the *exact* written length
+            // (PAYLOAD_SIZE or QUANTIZED_PAYLOAD_SIZE) to SendData so the
+            // wire frame's payload_len matches the bytes we actually wrote.
+            // Renting always at the larger size keeps the rent path
+            // single-bucket and lets the quantized fallback path reuse the
+            // same buffer without a second rent.
+            var pool   = ArrayPool<byte>.Shared;
+            var buffer = pool.Rent(TransformPacketBuilder.PAYLOAD_SIZE);
+            try
             {
-                payload = TransformPacketBuilder.BuildQuantizedUpdatePayload(NetworkObjectId, state);
-                // Quantized builder returns null on a degenerate / non-finite
-                // input.  Fall back to the full-precision encoder so the peer
-                // still receives a coherent update; the legacy decoder rejects
-                // NaN/Inf at parse time.
-            }
-            payload ??= TransformPacketBuilder.BuildUpdatePayload(NetworkObjectId, state);
+                int written = 0;
+                if (settings != null && settings.quantizeTransforms)
+                {
+                    written = TransformPacketBuilder.BuildQuantizedUpdatePayloadInto(
+                        buffer, 0, NetworkObjectId, state);
+                    // Quantized builder returns 0 on a degenerate / non-finite
+                    // input.  Fall back to the full-precision encoder so the
+                    // peer still receives a coherent update; the legacy
+                    // decoder rejects NaN/Inf at parse time.
+                }
+                if (written == 0)
+                {
+                    written = TransformPacketBuilder.BuildUpdatePayloadInto(
+                        buffer, 0, NetworkObjectId, state);
+                }
 
-            manager.SendData(payload);
+                manager.SendData(buffer, written);
+            }
+            finally
+            {
+                pool.Return(buffer);
+            }
 
             _lastSentPosition = state.Position;
             _lastSentTimeUnscaled = Time.unscaledTimeAsDouble;
@@ -798,8 +824,22 @@ namespace RTMPE.Sync
             int count = _inputBuffer.CopyUnacknowledgedTo(_inputSendScratch);
             if (count == 0) return;
 
-            var payload = InputPacketBuilder.BuildBatchPayload(_inputSendScratch, count);
-            manager.SendInput(payload);
+            // Pooled input batch send path (GC Round 2, 2026-05-02).
+            // Rent the exact size; pass the written length back so SendInput
+            // wraps only the bytes we wrote.
+            int size   = InputPacketBuilder.ComputeBatchPayloadSize(count);
+            var pool   = ArrayPool<byte>.Shared;
+            var buffer = pool.Rent(size);
+            try
+            {
+                int written = InputPacketBuilder.BuildBatchPayloadInto(
+                    buffer, 0, _inputSendScratch, count);
+                manager.SendInput(buffer, written);
+            }
+            finally
+            {
+                pool.Return(buffer);
+            }
         }
 
         // Componentwise IsFinite over the position, rotation, and scale of a

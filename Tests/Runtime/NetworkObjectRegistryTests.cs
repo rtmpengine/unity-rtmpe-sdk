@@ -351,6 +351,200 @@ namespace RTMPE.Tests
                 "GetAll's zero-allocation contract returns the shared buffer for both top-level calls");
         }
 
+        // ── Re-entrance guard (V3 audit, fix #2) ──────────────────────────────
+        //
+        // Register releases its lock before invoking SetSpawned(false) on the
+        // evicted entry so an OnNetworkDespawn handler that calls back into
+        // the registry does not deadlock.  But that release also exposes a
+        // window where re-entrant Register on the same id would clobber the
+        // outer call's freshly-installed slot, then despawn it inside the
+        // inner call's eviction step — silently corrupting state.
+        //
+        // The fix gates re-entrant Register calls issued from within the
+        // despawn callback dispatch with a [ThreadStatic] depth counter and
+        // refuses them, surfacing a clear error log so the offending call
+        // site is visible.
+
+        // Stub that calls back into the registry from OnNetworkDespawn.
+        private sealed class ReentrantRegistryNB : NetworkBehaviour
+        {
+            public NetworkObjectRegistry Target;
+            public NetworkBehaviour      Replacement;
+            public bool                  ReentrantRegisterAttempted;
+
+            protected override void OnNetworkDespawn()
+            {
+                if (Target == null || Replacement == null) return;
+                ReentrantRegisterAttempted = true;
+                // This is the corruption pattern fix #2 prevents: a despawn
+                // handler that registers a NEW object under the SAME id
+                // would clobber the outer Register's slot and then have its
+                // own SetSpawned(false) tear down the new registration.
+                Target.Register(Replacement);
+            }
+        }
+
+        [Test]
+        [Description(
+            "Register from inside a same-id collision's OnNetworkDespawn " +
+            "callback is rejected (re-entrance guard).  The outer call's " +
+            "registration must remain intact and observable.")]
+        public void Register_ReentrantFromDespawn_IsRejected()
+        {
+            // First object: vanilla, will become the eviction target.
+            var go0 = new GameObject("evict-me");
+            _created.Add(go0);
+            var first = go0.AddComponent<ReentrantRegistryNB>();
+            first.Initialize(100UL, "p1");
+            first.SetSpawned(true);                  // make IsSpawned true so SetSpawned(false) fires OnNetworkDespawn
+            _registry.Register(first);
+
+            // The would-be replacement that the despawn callback will try to
+            // register under the SAME id.  Without the guard, this would
+            // clobber the outer Register's slot and then be despawned by the
+            // outer's SetSpawned(false) call.
+            var goRepl = new GameObject("replacement");
+            _created.Add(goRepl);
+            var replacement = goRepl.AddComponent<ConcreteNB>();
+            replacement.Initialize(100UL, "p1");
+
+            // Wire the despawn re-entrance.
+            first.Target      = _registry;
+            first.Replacement = replacement;
+
+            // Trigger the eviction path: register a SECOND object under the
+            // same id.  The eviction's SetSpawned(false) on `first` fires
+            // first.OnNetworkDespawn, which tries the re-entrant Register.
+            //
+            // Expected logs:
+            //   1. ERROR — same-id collision (eviction)
+            //   2. ERROR — re-entrant Register from inside OnNetworkDespawn
+            LogAssert.Expect(LogType.Error, new System.Text.RegularExpressions.Regex(
+                "same-id collision"));
+            LogAssert.Expect(LogType.Error, new System.Text.RegularExpressions.Regex(
+                "re-entrant call"));
+
+            var go1 = new GameObject("outer-replacement");
+            _created.Add(go1);
+            var outer = go1.AddComponent<ConcreteNB>();
+            outer.Initialize(100UL, "p1");
+            _registry.Register(outer);
+
+            // Re-entrant attempt was made.
+            Assert.IsTrue(first.ReentrantRegisterAttempted,
+                "Pre-condition: the despawn callback should have run and " +
+                "attempted the re-entrant Register.");
+
+            // Post-condition: the outer call's registration is the live
+            // registry slot — neither the inner re-entrant attempt nor any
+            // collateral despawn has clobbered it.
+            Assert.AreSame(outer, _registry.Get(100UL),
+                "Outer Register's installed object must remain authoritative; " +
+                "the re-entrance guard rejected the inner Register and so the " +
+                "outer slot is intact.");
+        }
+
+        [Test]
+        [Description(
+            "Re-entrance guard's depth counter is decremented after the " +
+            "despawn callback returns, so subsequent legitimate Register " +
+            "calls on the same thread are not rejected.")]
+        public void Register_AfterReentrantAttempt_NextCallStillSucceeds()
+        {
+            // Set up a despawn callback that attempts a re-entrant Register
+            // under id 200.  After the eviction completes, registering id 201
+            // (a different id, from outside any despawn dispatch) must
+            // succeed normally — the depth counter is back at zero.
+            var goEvict = new GameObject("evict-me");
+            _created.Add(goEvict);
+            var evict = goEvict.AddComponent<ReentrantRegistryNB>();
+            evict.Initialize(200UL, "p1");
+            evict.SetSpawned(true);
+            _registry.Register(evict);
+
+            var goRepl = new GameObject("inner-repl");
+            _created.Add(goRepl);
+            var innerRepl = goRepl.AddComponent<ConcreteNB>();
+            innerRepl.Initialize(200UL, "p1");
+            evict.Target      = _registry;
+            evict.Replacement = innerRepl;
+
+            // Allow the same-id collision and re-entrance error logs.
+            LogAssert.Expect(LogType.Error, new System.Text.RegularExpressions.Regex("same-id collision"));
+            LogAssert.Expect(LogType.Error, new System.Text.RegularExpressions.Regex("re-entrant call"));
+
+            var goOuter = new GameObject("outer");
+            _created.Add(goOuter);
+            var outer = goOuter.AddComponent<ConcreteNB>();
+            outer.Initialize(200UL, "p1");
+            _registry.Register(outer);
+
+            // Now that the despawn dispatch has unwound, register an
+            // unrelated id from outside any despawn.  The guard must NOT
+            // reject this call.
+            var goFresh = new GameObject("fresh");
+            _created.Add(goFresh);
+            var fresh = goFresh.AddComponent<ConcreteNB>();
+            fresh.Initialize(201UL, "p1");
+            Assert.DoesNotThrow(() => _registry.Register(fresh));
+            Assert.AreSame(fresh, _registry.Get(201UL),
+                "Post-despawn registrations must succeed normally — the " +
+                "re-entrance guard's depth counter must have been " +
+                "decremented when the despawn dispatch returned.");
+        }
+
+        [Test]
+        [Description(
+            "An exception from inside the despawn callback must NOT pin the " +
+            "depth counter; subsequent Register calls on the same thread " +
+            "must still succeed.  Validates the try/finally pairing in " +
+            "fix #2's instrumentation.")]
+        public void Register_ExceptionInDespawn_DepthCounterRestored()
+        {
+            // ThrowingNB is the existing test double (declared below) that
+            // throws from OnNetworkDespawn.  Trigger an eviction on it; the
+            // exception will surface from the try/catch around SetSpawned —
+            // wait, that try/catch is in Clear() not Register().  In
+            // Register(), exceptions ARE allowed to propagate — but the
+            // try/finally that brackets _despawnReentryDepth must still
+            // restore the depth even when the inner SetSpawned throws.
+            //
+            // The contract being verified is the try/finally pairing, not
+            // the swallowing of exceptions.
+
+            var goThrow = new GameObject("throw");
+            _created.Add(goThrow);
+            var thr = goThrow.AddComponent<ThrowingNB>();
+            thr.Initialize(300UL, "p1");
+            thr.SetSpawned(true);
+            _registry.Register(thr);
+
+            LogAssert.Expect(LogType.Error, new System.Text.RegularExpressions.Regex("same-id collision"));
+
+            var go2 = new GameObject("repl");
+            _created.Add(go2);
+            var repl = go2.AddComponent<ConcreteNB>();
+            repl.Initialize(300UL, "p1");
+
+            // The eviction's SetSpawned(false) call propagates the
+            // InvalidOperationException out of Register.  We catch it here
+            // because Register doesn't swallow it (only Clear does).
+            Assert.Throws<System.InvalidOperationException>(
+                () => _registry.Register(repl));
+
+            // After the exception, the depth counter MUST be back at zero —
+            // verified by the next Register call succeeding without rejection.
+            var go3 = new GameObject("after");
+            _created.Add(go3);
+            var after = go3.AddComponent<ConcreteNB>();
+            after.Initialize(301UL, "p1");
+            Assert.DoesNotThrow(() => _registry.Register(after));
+            Assert.AreSame(after, _registry.Get(301UL),
+                "The post-exception registration must have succeeded; the " +
+                "try/finally pairing in fix #2 ensures the depth counter is " +
+                "restored even on an exception.");
+        }
+
         // ── Test doubles ───────────────────────────────────────────────────────
 
         private sealed class ThrowingNB : NetworkBehaviour

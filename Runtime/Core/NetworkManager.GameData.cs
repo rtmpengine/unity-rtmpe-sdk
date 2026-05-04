@@ -84,11 +84,15 @@ namespace RTMPE.Core
 
                     if (qNb.IsOwner)
                     {
-                        qNb.GetComponent<NetworkTransform>()?.ApplyReconciliation(qState);
+                        // Receive hot-path uses the cached NetworkBehaviour
+                        // accessor: at 30 Hz × N peers, GetComponent<T> per
+                        // packet adds up to a measurable slice of the frame
+                        // budget on mobile / IL2CPP builds.
+                        qNb.CachedNetworkTransform?.ApplyReconciliation(qState);
                         return;
                     }
 
-                    var qInterp = qNb.GetComponent<NetworkTransformInterpolator>();
+                    var qInterp = qNb.CachedNetworkTransformInterpolator;
                     if (qInterp == null) return;
                     qInterp.AddState(qState, UnityEngine.Time.timeAsDouble);
                     return;
@@ -142,10 +146,16 @@ namespace RTMPE.Core
                 // Fields absent from the delta keep zero-initialised values in `state`
                 // which would clobber the current transform — fall back to the live
                 // transform for those axes.
-                var current = nb.GetComponent<NetworkTransform>()?.GetState()
-                              ?? new TransformState { Position = nb.transform.position,
-                                                      Rotation = nb.transform.rotation,
-                                                      Scale    = nb.transform.localScale };
+                //
+                // Resolve the cached NetworkTransform once so both the
+                // delta-merge below and the owner reconciliation branch
+                // share a single field load.
+                var cachedNetTransform = nb.CachedNetworkTransform;
+                var current = cachedNetTransform != null
+                    ? cachedNetTransform.GetState()
+                    : new TransformState { Position = nb.transform.position,
+                                           Rotation = nb.transform.rotation,
+                                           Scale    = nb.transform.localScale };
                 var blended = new TransformState
                 {
                     Position = (changedMask & TransformPacketParser.ChangedPosition) != 0
@@ -158,11 +168,11 @@ namespace RTMPE.Core
 
                 if (nb.IsOwner)
                 {
-                    nb.GetComponent<NetworkTransform>()?.ApplyReconciliation(blended);
+                    cachedNetTransform?.ApplyReconciliation(blended);
                     return;
                 }
 
-                var interp = nb.GetComponent<NetworkTransformInterpolator>();
+                var interp = nb.CachedNetworkTransformInterpolator;
                 if (interp == null) return;
                 interp.AddState(blended, UnityEngine.Time.timeAsDouble);
                 return;
@@ -209,13 +219,15 @@ namespace RTMPE.Core
                 if (!InterestManager.ShouldDeliver(objectId, dx * dx + dh2 * dh2)) return;
             }
 
+            // Resolve the cached component once; both branches read it.
+            var cachedNetRb = nb.CachedNetworkRigidbody;
             if (nb.IsOwner)
             {
-                nb.GetComponent<NetworkRigidbody>()?.ApplyReconciliation(state, changedMask);
+                cachedNetRb?.ApplyReconciliation(state, changedMask);
                 return;
             }
 
-            nb.GetComponent<NetworkRigidbody>()?.ApplyRemoteState(state, changedMask);
+            cachedNetRb?.ApplyRemoteState(state, changedMask);
         }
 
         /// <summary>
@@ -246,13 +258,15 @@ namespace RTMPE.Core
                 if (!InterestManager.ShouldDeliver(objectId, dx * dx + dh2 * dh2)) return;
             }
 
+            // Resolve the cached component once; both branches read it.
+            var cachedNetRb2D = nb.CachedNetworkRigidbody2D;
             if (nb.IsOwner)
             {
-                nb.GetComponent<NetworkRigidbody2D>()?.ApplyReconciliation(state, changedMask);
+                cachedNetRb2D?.ApplyReconciliation(state, changedMask);
                 return;
             }
 
-            nb.GetComponent<NetworkRigidbody2D>()?.ApplyRemoteState(state, changedMask);
+            cachedNetRb2D?.ApplyRemoteState(state, changedMask);
         }
 
         // ── Variable update inbound handler ────────────────────────────
@@ -391,14 +405,23 @@ namespace RTMPE.Core
         /// owned object that has dirty NetworkVariables.
         /// </summary>
         internal void SendVariableUpdate(byte[] payload)
+            => SendVariableUpdate(payload, payload?.Length ?? 0);
+
+        /// <summary>
+        /// Pooled-buffer overload of <see cref="SendVariableUpdate(byte[])"/>.
+        /// Wraps <paramref name="payloadLength"/> bytes from <paramref name="payload"/>
+        /// — accepts an oversized buffer (e.g. rented from <c>ArrayPool&lt;byte&gt;.Shared</c>)
+        /// and uses only the leading <paramref name="payloadLength"/> bytes.
+        /// </summary>
+        internal void SendVariableUpdate(byte[] payload, int payloadLength)
         {
             if (_networkThread == null || _packetBuilder == null) return;
-            if (payload == null || payload.Length == 0) return;
+            if (payload == null || payloadLength <= 0) return;
 
             var packet = _packetBuilder.Build(
                 PacketType.VariableUpdate,
                 PacketFlags.Reliable,  // variable updates need guaranteed delivery
-                payload);
+                payload, payloadLength);
 
             EncryptAndSend(packet);
         }
@@ -410,14 +433,20 @@ namespace RTMPE.Core
         /// payload was built by <see cref="VariableBatchBuilder.Build"/>.
         /// </summary>
         internal void SendVariableBatchUpdate(byte[] payload)
+            => SendVariableBatchUpdate(payload, payload?.Length ?? 0);
+
+        /// <summary>
+        /// Pooled-buffer overload of <see cref="SendVariableBatchUpdate(byte[])"/>.
+        /// </summary>
+        internal void SendVariableBatchUpdate(byte[] payload, int payloadLength)
         {
             if (_networkThread == null || _packetBuilder == null) return;
-            if (payload == null || payload.Length == 0) return;
+            if (payload == null || payloadLength <= 0) return;
 
             var packet = _packetBuilder.Build(
                 PacketType.VariableBatchUpdate,
                 PacketFlags.Reliable,
-                payload);
+                payload, payloadLength);
 
             EncryptAndSend(packet);
         }
@@ -652,14 +681,20 @@ namespace RTMPE.Core
         /// is silently ignored.
         /// </param>
         internal void SendData(byte[] payload)
+            => SendData(payload, payload?.Length ?? 0);
+
+        /// <summary>
+        /// Pooled-buffer overload of <see cref="SendData(byte[])"/>.
+        /// </summary>
+        internal void SendData(byte[] payload, int payloadLength)
         {
             if (_networkThread == null || _packetBuilder == null) return;
-            if (payload == null || payload.Length == 0) return;
+            if (payload == null || payloadLength <= 0) return;
 
             var packet = _packetBuilder.Build(
                 PacketType.Data,
                 PacketFlags.None,
-                payload);
+                payload, payloadLength);
 
             EncryptAndSend(packet);
         }
@@ -688,14 +723,20 @@ namespace RTMPE.Core
         /// A <see langword="null"/> or empty array is silently ignored.
         /// </param>
         internal void SendInput(byte[] payload)
+            => SendInput(payload, payload?.Length ?? 0);
+
+        /// <summary>
+        /// Pooled-buffer overload of <see cref="SendInput(byte[])"/>.
+        /// </summary>
+        internal void SendInput(byte[] payload, int payloadLength)
         {
             if (_networkThread == null || _packetBuilder == null) return;
-            if (payload == null || payload.Length == 0) return;
+            if (payload == null || payloadLength <= 0) return;
 
             var packet = _packetBuilder.Build(
                 PacketType.InputPayload,
                 PacketFlags.None,
-                payload);
+                payload, payloadLength);
 
             EncryptAndSend(packet);
         }
@@ -718,14 +759,20 @@ namespace RTMPE.Core
         /// A <see langword="null"/> or empty array is silently ignored.
         /// </param>
         internal void SendStateSync(byte[] payload)
+            => SendStateSync(payload, payload?.Length ?? 0);
+
+        /// <summary>
+        /// Pooled-buffer overload of <see cref="SendStateSync(byte[])"/>.
+        /// </summary>
+        internal void SendStateSync(byte[] payload, int payloadLength)
         {
             if (_networkThread == null || _packetBuilder == null) return;
-            if (payload == null || payload.Length == 0) return;
+            if (payload == null || payloadLength <= 0) return;
 
             var packet = _packetBuilder.Build(
                 PacketType.StateSync,
                 PacketFlags.None,
-                payload);
+                payload, payloadLength);
 
             EncryptAndSend(packet);
         }

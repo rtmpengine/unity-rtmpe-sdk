@@ -388,6 +388,13 @@ namespace RTMPE.Core
             // policy rather than a stale roster-anchored closure.
             RTMPE.Rpc.EnhancedRpcVerifier.SenderVerifier =
                 RTMPE.Rpc.EnhancedRpcVerifier.DefaultSenderVerifier;
+            // Reset the peer-admission advisory latch so each new session
+            // receives the one-time warning if non-zero peer RPCs are admitted
+            // without a session-id-keyed roster anchor.  Without this reset,
+            // the static latch would suppress the advisory for every session
+            // after the first, silently hiding the architectural limitation
+            // from developers who did not capture the very first warning log.
+            System.Threading.Interlocked.Exchange(ref _peerAdmissionAdvisoryEmitted, 0);
             _handshakeHandler?.Dispose();  // Zero key material before GC can observe it
             _handshakeHandler = null;
             // Reset every per-session AEAD field as a single bundled
@@ -596,75 +603,24 @@ namespace RTMPE.Core
             if (effectivePayload.Length > 0)
                 Buffer.BlockCopy(effectivePayload, 0, plaintext, 4, effectivePayload.Length);
 
-            // ── 5. Build AAD = [packet_type, flags_without_encrypted] ────────────
-            // flags now includes FLAG_COMPRESSED if compression was applied.
-            // flags does NOT yet include FLAG_ENCRYPTED — this must match exactly
-            // what the gateway sees as AAD on its decrypt_inbound() path.
-            //
-            // When NetworkSettings.preserveApplicationSequence is on, the AAD
-            // additionally binds a 4-byte LE u32 application sequence and the
-            // wire flags carry FLAG_APP_SEQUENCE.  The application sequence is
-            // tamper-evident through the AEAD tag — an on-path attacker who
-            // rewrites the wire bytes to a different sequence value will fail
-            // Poly1305 verification on the receiver because the AAD differs
-            // from what was sealed.
-            uint appSeqForWire = 0u;
+            // ── 5. Decide which sub-headers we will emit on the wire ────────────
+            // Compute the emission decisions up-front so the AAD construction
+            // below reflects the actual wire frame.  Binding emit decisions
+            // BEFORE building the AAD lets us:
+            //   (a) include app_seq + gameplay_seq in the AAD when and only
+            //       when they appear on the wire — the gateway's build_aad
+            //       branches off the same flag bits, so the two AADs MUST
+            //       match byte-for-byte;
+            //   (b) clear flag bits we are NOT emitting so the on-wire flags
+            //       byte matches the AAD's flags byte exactly — a flag bit
+            //       set without its corresponding sub-header would yield a
+            //       malformed frame the gateway rejects as truncated.
             bool stampAppSeq = _settings != null
                             && _settings.preserveApplicationSequence;
             if (stampAppSeq)
             {
-                appSeqForWire = (uint)System.Threading.Interlocked.Increment(
-                    ref _outboundAppSequenceCounter);
                 flags |= (byte)PacketFlags.AppSequence;
             }
-            byte[] aad = stampAppSeq
-                ? new byte[]
-                  {
-                      packetType,
-                      flags,
-                      (byte) appSeqForWire,
-                      (byte)(appSeqForWire >>  8),
-                      (byte)(appSeqForWire >> 16),
-                      (byte)(appSeqForWire >> 24),
-                  }
-                : new byte[] { packetType, flags };
-
-            // ── 6. Build 12-byte nonce = [counter:8 LE][crypto_id:4 LE] ─────────
-            // The SDK's outbound counter is a uint; the high four bytes of
-            // the LE-u64 counter region are therefore always zero on the
-            // wire.  See AeadNonce.Build for the byte-level layout.
-            var nonce = AeadNonce.Build(nonceCounter, _sessionKeyStore.CryptoId);
-            // Wire-format invariant: every AEAD frame is sealed with a
-            // 12-byte nonce.  A regression in AeadNonce.Build would produce
-            // a Poly1305 mismatch on the gateway and a hard-to-trace drop
-            // storm; assert here so the bug surfaces at the offending call.
-            if (nonce == null || nonce.Length != 12)
-                throw new InvalidOperationException(
-                    "AeadNonce.Build returned a non-12-byte nonce — wire format invariant violated.");
-
-            // ── 7. Seal (ChaCha20-Poly1305) ──────────────────────────────────────
-            var ciphertext = ChaCha20Poly1305Impl.Seal(
-                _sessionKeyStore.SessionKeys.EncryptKey, nonce, plaintext, aad);
-            // ciphertext.Length == ptLen + 16  (Poly1305 tag appended)
-
-            // ── 8. Assemble the encrypted packet ────────────────────────────────
-            // Wire layout (sub-headers appear in this fixed order before the
-            // ciphertext, each gated by its corresponding flag bit):
-            //   [header(13)]
-            //   [arq_seq(4 LE)        if FLAG_RELIABLE        and EmitArqSequence]
-            //   [app_seq(4 LE)        if FLAG_APP_SEQUENCE]
-            //   [gameplay_seq(4 LE)   if FLAG_GAMEPLAY_ORDERED and EmitGameplaySequencePrefix]
-            //   [ciphertext]
-            //
-            // The 4-byte app sequence is on the wire so the receiver can read
-            // it without first decrypting; the AAD binds those same bytes so
-            // any tampering causes Poly1305 verification to fail and the
-            // packet is silently dropped.
-            //
-            // arq_seq and gameplay_seq are NOT bound into the AAD on the
-            // gateway side (see `build_aad` in modules/gateway/src/crypto/pipeline.rs),
-            // so they pass through as plaintext sub-headers; the AEAD key still
-            // protects every byte of the ciphertext that follows.
             bool emitArq =
                 _settings != null
                 && _settings.EmitArqSequence
@@ -673,11 +629,30 @@ namespace RTMPE.Core
                 _settings != null
                 && _settings.EmitGameplaySequencePrefix
                 && (flags & (byte)PacketFlags.GameplayOrdered) != 0;
-            int arqWireBytes      = emitArq      ? 4 : 0;
-            int appSeqWireBytes   = stampAppSeq  ? 4 : 0;
-            int gameplayWireBytes = emitGameplay ? 4 : 0;
-            int subHeaderBytes    = arqWireBytes + appSeqWireBytes + gameplayWireBytes;
 
+            // Synchronize the wire flags byte with what we actually emit.
+            // If a caller marked FLAG_RELIABLE / FLAG_GAMEPLAY_ORDERED but
+            // the corresponding setting suppresses emission, drop the bit
+            // here.  Without this, the AAD's flags byte would advertise a
+            // sub-header the wire frame doesn't carry — the gateway sees a
+            // truncated sub-header region and silently drops every packet.
+            if (!emitArq)
+            {
+                flags &= unchecked((byte)~(byte)PacketFlags.Reliable);
+            }
+            if (!emitGameplay)
+            {
+                flags &= unchecked((byte)~(byte)PacketFlags.GameplayOrdered);
+            }
+
+            // ── 5a. Allocate the per-packet sub-header values now so the
+            //        AAD below can bind app_seq and gameplay_seq.
+            uint appSeqForWire = 0u;
+            if (stampAppSeq)
+            {
+                appSeqForWire = (uint)System.Threading.Interlocked.Increment(
+                    ref _outboundAppSequenceCounter);
+            }
             uint arqSeqForWire = 0u;
             if (emitArq)
             {
@@ -699,7 +674,91 @@ namespace RTMPE.Core
                     (uint)System.Threading.Interlocked.Increment(
                         ref _outboundGameplaySequenceCounter));
             }
-            var result = new byte[PacketProtocol.HEADER_SIZE + subHeaderBytes + ciphertext.Length];
+
+            // ── 5b. Build AAD = [packet_type, flags] [+app_seq] [+gameplay_seq] ─
+            // flags now reflects the on-the-wire flags byte exactly (minus
+            // FLAG_ENCRYPTED, which the gateway's decrypt_inbound() path
+            // strips before reconstructing AAD).  Both sub-headers we
+            // emit are bound into the AAD: the AEAD tag therefore detects
+            // any tampering with them — an on-path attacker who rewrites
+            // app_seq or gameplay_seq fails Poly1305 verification on the
+            // receiver and the packet is silently dropped.
+            //
+            // arq_seq is intentionally NOT bound — a retransmit reuses
+            // the same ciphertext with a different arq_seq, so binding it
+            // would force a fresh AEAD seal per retry.  Both other
+            // sub-headers are stable per (encrypted payload, sequence)
+            // pair and binding them is essentially free.
+            //
+            // The AAD is written into the per-direction reusable
+            // _outboundAadScratch buffer instead of a fresh byte[] every
+            // packet.  SealInto reads exactly aadLen bytes from offset 0,
+            // so the slack capacity past aadLen never participates in
+            // the tag.
+            int aadLen = 2 + (stampAppSeq ? 4 : 0) + (emitGameplay ? 4 : 0);
+            byte[] aad = _outboundAadScratch;
+            aad[0] = packetType;
+            aad[1] = flags;
+            int aadOff = 2;
+            if (stampAppSeq)
+            {
+                aad[aadOff    ] = (byte) appSeqForWire;
+                aad[aadOff + 1] = (byte)(appSeqForWire >>  8);
+                aad[aadOff + 2] = (byte)(appSeqForWire >> 16);
+                aad[aadOff + 3] = (byte)(appSeqForWire >> 24);
+                aadOff += 4;
+            }
+            if (emitGameplay)
+            {
+                aad[aadOff    ] = (byte) gameplaySeqForWire;
+                aad[aadOff + 1] = (byte)(gameplaySeqForWire >>  8);
+                aad[aadOff + 2] = (byte)(gameplaySeqForWire >> 16);
+                aad[aadOff + 3] = (byte)(gameplaySeqForWire >> 24);
+            }
+
+            // ── 6. Build 12-byte nonce = [counter:8 LE][crypto_id:4 LE] ─────────
+            // The SDK's outbound counter is a uint; the high four bytes of
+            // the LE-u64 counter region are therefore always zero on the
+            // wire.  See AeadNonce.Build for the byte-level layout.
+            //
+            // GC Round 3 (2026-05-02): write into the cached outbound
+            // scratch buffer instead of allocating a fresh 12-byte array
+            // per packet.  EncryptAndSend is called serially from the
+            // Unity main thread (see file-header threading note in
+            // EncryptAndSendRedundant); the buffer is fully overwritten
+            // before being read by the Seal call, so a stale value from
+            // the previous packet is never observable.
+            AeadNonce.BuildInto(nonceCounter, _sessionKeyStore.CryptoId, _outboundNonceScratch);
+
+            // ── 7. Compute wire-frame layout up-front so we can SealInto the
+            //       final destination buffer (avoids the intermediate
+            //       ciphertext byte[] that the legacy Seal call allocates).
+            //
+            // Wire layout (sub-headers appear in this fixed order before the
+            // ciphertext, each gated by its corresponding flag bit):
+            //   [header(13)]
+            //   [arq_seq(4 LE)        if FLAG_RELIABLE        and EmitArqSequence]
+            //   [app_seq(4 LE)        if FLAG_APP_SEQUENCE]
+            //   [gameplay_seq(4 LE)   if FLAG_GAMEPLAY_ORDERED and EmitGameplaySequencePrefix]
+            //   [ciphertext]
+            //
+            // The 4-byte app sequence is on the wire so the receiver can read
+            // it without first decrypting; the AAD binds those same bytes so
+            // any tampering causes Poly1305 verification to fail and the
+            // packet is silently dropped.
+            //
+            // app_seq AND gameplay_seq are bound into the AAD on the
+            // gateway side (see `build_aad` in modules/gateway/src/crypto/
+            // pipeline.rs).  arq_seq is NOT bound — retransmits reuse the
+            // ciphertext with a different arq_seq.
+            int arqWireBytes      = emitArq      ? 4 : 0;
+            int appSeqWireBytes   = stampAppSeq  ? 4 : 0;
+            int gameplayWireBytes = emitGameplay ? 4 : 0;
+            int subHeaderBytes    = arqWireBytes + appSeqWireBytes + gameplayWireBytes;
+
+            // ciphertextLen = plaintextLen + 16-byte Poly1305 tag.
+            int ciphertextLen = ptLen + 16;
+            var result = new byte[PacketProtocol.HEADER_SIZE + subHeaderBytes + ciphertextLen];
             // Copy header as-is first, then patch the three affected fields.
             Buffer.BlockCopy(packet, 0, result, 0, PacketProtocol.HEADER_SIZE);
 
@@ -715,7 +774,7 @@ namespace RTMPE.Core
 
             // header.payload_len counts every byte after the 13-byte header,
             // i.e. every present sub-header prefix plus the ciphertext.
-            uint ctLen = (uint)(subHeaderBytes + ciphertext.Length);
+            uint ctLen = (uint)(subHeaderBytes + ciphertextLen);
             result[PacketProtocol.OFFSET_PAYLOAD_LEN]     = (byte) ctLen;
             result[PacketProtocol.OFFSET_PAYLOAD_LEN + 1] = (byte)(ctLen >>  8);
             result[PacketProtocol.OFFSET_PAYLOAD_LEN + 2] = (byte)(ctLen >> 16);
@@ -746,7 +805,23 @@ namespace RTMPE.Core
                 result[subOffset + 3] = (byte)(gameplaySeqForWire >> 24);
                 subOffset += 4;
             }
-            Buffer.BlockCopy(ciphertext, 0, result, subOffset, ciphertext.Length);
+
+            // ── 8. Seal directly into the final wire packet ─────────────────────
+            // SealInto writes [ciphertext || tag] = ptLen + 16 bytes into
+            // result[subOffset..].  This skips the intermediate ciphertext
+            // byte[] allocation that the legacy `Seal()` shim materialises and
+            // then BlockCopy's into result; the wire bytes are bit-for-bit
+            // identical.  ChaCha20 XORs the keystream into result, then
+            // Poly1305 reads the just-written ciphertext from result to
+            // compute the MAC, which it writes into result[subOffset+ptLen..].
+            ChaCha20Poly1305Impl.SealInto(
+                _sessionKeyStore.SessionKeys.EncryptKey,
+                _outboundNonceScratch,
+                plaintext, 0, plaintext.Length,
+                // Pass aadLen (not aad.Length) — the scratch buffer is
+                // larger than the meaningful AAD; only the prefix is bound.
+                aad,       0, aadLen,
+                result,    subOffset);
 
             SendToWire(result);
         }
@@ -821,26 +896,33 @@ namespace RTMPE.Core
             // unique per session: it is HKDF-derived from a fresh ECDH shared
             // secret negotiated during the current handshake, and the key is
             // single-use (scrubbed below after a definitive verdict).  Re-using
-            // a (key, nonce) pair under ChaCha20-Poly1305 is catastrophic, so a
-            // DEBUG-time guard verifies the key is not the all-zero sentinel —
-            // an all-zero key would indicate that derivation never ran or
-            // produced no output, rather than a fresh ECDH product.  The guard
-            // compiles out of release builds so the production hot path is
-            // unaffected.
-#if DEBUG || UNITY_EDITOR
+            // a (key, nonce) pair under ChaCha20-Poly1305 is catastrophic, so
+            // we verify at runtime (in every build configuration) that the key
+            // is not the all-zero sentinel.  An all-zero key would indicate
+            // that derivation never ran or produced no output, rather than a
+            // fresh ECDH product; in that case we fail closed by treating the
+            // frame as authentication-failed (return null), which lets the
+            // gateway-driven handshake timeout tear the connection down via
+            // the documented bootstrap-once contract.  Failing closed costs at
+            // most a single legitimate retransmit and never surrenders a
+            // (key, nonce) reuse opportunity.
             {
                 bool keyAllZero = true;
                 for (int i = 0; i < _sessionAckKey.Length; i++)
                 {
                     if (_sessionAckKey[i] != 0) { keyAllZero = false; break; }
                 }
-                System.Diagnostics.Debug.Assert(
-                    !keyAllZero,
-                    "[RTMPE] SessionAck bootstrap key is all-zero; ECDH key " +
-                    "derivation is broken. The all-zero nonce is only safe " +
-                    "when the per-session key is unique.");
+                if (keyAllZero)
+                {
+                    // Wipe and null the buffer so the failed-bootstrap state
+                    // matches the post-decrypt invariant below: the key is
+                    // never resident in managed memory after a definitive
+                    // verdict, success or failure.
+                    Array.Clear(_sessionAckKey, 0, _sessionAckKey.Length);
+                    _sessionAckKey = null;
+                    return null;
+                }
             }
-#endif
 
             byte[] plaintext;
             bool openThrew = false;
@@ -930,57 +1012,109 @@ namespace RTMPE.Core
             if (length < PacketProtocol.HEADER_SIZE + subHeaderBytes + 4 + 16)
                 return null; // truncated: sub-headers + SEQ prefix + tag minimum
 
+            // Decode app_seq and gameplay_seq from their wire offsets so the
+            // AAD construction below can bind both.  arq_seq is intentionally
+            // left out of the AAD (a retransmit reuses the same ciphertext
+            // with a different arq_seq); app_seq and gameplay_seq are
+            // bound because they steer application-layer ordering and a
+            // tampered value would otherwise slip past Poly1305.
+            int subCursor = PacketProtocol.HEADER_SIZE + (hasArq ? 4 : 0);
             uint inboundAppSeq = 0u;
             if (hasAppSeq)
             {
-                int o = PacketProtocol.HEADER_SIZE + (hasArq ? 4 : 0);
                 inboundAppSeq = (uint)(
-                      data[o]
-                    | (data[o + 1] << 8)
-                    | (data[o + 2] << 16)
-                    | (data[o + 3] << 24));
+                      data[subCursor]
+                    | (data[subCursor + 1] <<  8)
+                    | (data[subCursor + 2] << 16)
+                    | (data[subCursor + 3] << 24));
+                subCursor += 4;
+            }
+            uint inboundGameplaySeq = 0u;
+            if (hasGameplay)
+            {
+                inboundGameplaySeq = (uint)(
+                      data[subCursor]
+                    | (data[subCursor + 1] <<  8)
+                    | (data[subCursor + 2] << 16)
+                    | (data[subCursor + 3] << 24));
+                // subCursor is intentionally not advanced past the
+                // gameplay_seq field; no callers below this point read
+                // the sub-header region again — the next consumer is the
+                // ciphertext which sits at PacketProtocol.HEADER_SIZE +
+                // subHeaderBytes (computed independently above).
             }
 
-            // ── 3. Build AAD = [packet_type, flags & ~FLAG_ENCRYPTED] (+app_seq) ─
-            // Stripping FLAG_ENCRYPTED reproduces the AAD the gateway used when
-            // sealing.  When FLAG_APP_SEQUENCE is set the same 4-byte
-            // application sequence the sender bound is appended; an attacker
-            // that rewrites either the wire bytes or the flag bit changes the
-            // AAD and Poly1305 verification fails on the next line.
-            byte[] aad = hasAppSeq
-                ? new byte[]
-                  {
-                      packetType,
-                      (byte)(flags & ~(byte)PacketFlags.Encrypted),
-                      (byte) inboundAppSeq,
-                      (byte)(inboundAppSeq >>  8),
-                      (byte)(inboundAppSeq >> 16),
-                      (byte)(inboundAppSeq >> 24),
-                  }
-                : new byte[] { packetType,
-                               (byte)(flags & ~(byte)PacketFlags.Encrypted) };
+            // ── 3. Build AAD = [packet_type, flags & ~FLAG_ENCRYPTED] (+app_seq) (+gameplay_seq) ─
+            // Stripping FLAG_ENCRYPTED reproduces the AAD the gateway used
+            // when sealing.  When FLAG_APP_SEQUENCE / FLAG_GAMEPLAY_ORDERED
+            // are set the matching 4-byte sub-header values are appended in
+            // that order; an attacker that rewrites either the wire bytes
+            // or the flag bit changes the AAD and Poly1305 verification
+            // fails on the next line.
+            //
+            // The AAD is written into the per-direction reusable
+            // _inboundAadScratch buffer instead of a fresh byte[] every
+            // packet.  OpenInto reads exactly aadLen bytes from offset 0;
+            // the slack capacity past aadLen never participates in tag
+            // verification.
+            int aadLen = 2 + (hasAppSeq ? 4 : 0) + (hasGameplay ? 4 : 0);
+            byte[] aad = _inboundAadScratch;
+            aad[0] = packetType;
+            aad[1] = (byte)(flags & ~(byte)PacketFlags.Encrypted);
+            int aadOff = 2;
+            if (hasAppSeq)
+            {
+                aad[aadOff    ] = (byte) inboundAppSeq;
+                aad[aadOff + 1] = (byte)(inboundAppSeq >>  8);
+                aad[aadOff + 2] = (byte)(inboundAppSeq >> 16);
+                aad[aadOff + 3] = (byte)(inboundAppSeq >> 24);
+                aadOff += 4;
+            }
+            if (hasGameplay)
+            {
+                aad[aadOff    ] = (byte) inboundGameplaySeq;
+                aad[aadOff + 1] = (byte)(inboundGameplaySeq >>  8);
+                aad[aadOff + 2] = (byte)(inboundGameplaySeq >> 16);
+                aad[aadOff + 3] = (byte)(inboundGameplaySeq >> 24);
+            }
 
             // ── 4. Build 12-byte nonce ───────────────────────────────────────────
-            var nonce = AeadNonce.Build(nonceCounter, _sessionKeyStore.CryptoId);
-            // Same wire-format invariant as the outbound side; see EncryptAndSend.
-            if (nonce == null || nonce.Length != 12)
-                throw new InvalidOperationException(
-                    "AeadNonce.Build returned a non-12-byte nonce — wire format invariant violated.");
+            // GC Round 3 (2026-05-02): reuse the cached inbound scratch
+            // buffer.  Like the outbound counterpart, DecryptInboundPacket
+            // is invoked from the main-thread receive dispatch path, so
+            // sequential writes-then-reads of the scratch are race-free.
+            AeadNonce.BuildInto(nonceCounter, _sessionKeyStore.CryptoId, _inboundNonceScratch);
 
-            // ── 5. Extract ciphertext (skip header + every sub-header prefix) ────
+            // ── 5. Locate ciphertext in-place (skip header + every sub-header prefix) ────
             // Use the explicit <c>length</c> argument — the rented buffer's
             // physical .Length may be larger than the meaningful packet.
-            int ctLen = length - PacketProtocol.HEADER_SIZE - subHeaderBytes;
+            //
+            // GC Round 4 (2026-05-02): instead of copying the ciphertext out
+            // of <c>data</c> into a freshly-allocated byte[], we point
+            // OpenInto directly at the in-place ciphertext slice.  OpenInto
+            // verifies the Poly1305 tag without writing into <c>data</c>
+            // (it reads ciphertext + tag from the source slice and writes
+            // plaintext into a separate destination buffer); the original
+            // packet bytes are therefore left untouched.
+            int ctOffset = PacketProtocol.HEADER_SIZE + subHeaderBytes;
+            int ctLen = length - ctOffset;
             if (ctLen < 16) return null; // ciphertext must at least carry the Poly1305 tag
-            var ciphertext = new byte[ctLen];
-            Buffer.BlockCopy(data,
-                             PacketProtocol.HEADER_SIZE + subHeaderBytes,
-                             ciphertext, 0, ctLen);
 
             // ── 6. Open: decrypt + verify Poly1305 tag ───────────────────────────
-            var plaintext = ChaCha20Poly1305Impl.Open(
-                _sessionKeyStore.SessionKeys.DecryptKey, nonce, ciphertext, aad);
-            if (plaintext == null) return null; // MAC failure — drop
+            // Allocate plaintext at exact-fit size so the caller can use
+            // .Length without a separate length parameter.  OpenInto
+            // returns the plaintext byte count or -1 on MAC failure.
+            int plaintextLen = ctLen - 16;
+            var plaintext = new byte[plaintextLen];
+            int written = ChaCha20Poly1305Impl.OpenInto(
+                _sessionKeyStore.SessionKeys.DecryptKey,
+                _inboundNonceScratch,
+                data,      ctOffset, ctLen,
+                // Pass aadLen (not aad.Length) — the scratch buffer is
+                // larger than the meaningful AAD; only the prefix is bound.
+                aad,       0,        aadLen,
+                plaintext, 0);
+            if (written < 0) return null; // MAC failure — drop
 
             // plaintext = [orig_seq:4 LE] || actual_payload (possibly LZ4-compressed)
             if (plaintext.Length < 4) return null; // should never happen

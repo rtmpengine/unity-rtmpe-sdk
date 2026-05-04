@@ -32,6 +32,24 @@ namespace RTMPE.Core
 
         private readonly object _lock = new object();
 
+        // Re-entrance guard for the despawn callback.  The Register flow
+        // releases the lock before invoking SetSpawned(false) on the evicted
+        // entry so an OnNetworkDespawn handler that calls back into the
+        // registry does not deadlock.  That same lock release, however,
+        // exposes a window where re-entrant Register on the same id would
+        // clobber the just-installed entry and then despawn it — the new
+        // registration's predecessor is observed inside the inner Register
+        // as the just-installed object, and the inner SetSpawned(false)
+        // tears it down before the outer caller's SetSpawned(true) lands.
+        // Tracking depth via [ThreadStatic] is sufficient because the
+        // registry contract is main-thread only; any future cross-thread
+        // call would be a separate bug surfaced loudly by Unity's
+        // main-thread-only API checks.  Counter form (rather than a bool)
+        // tolerates legitimate nesting one level deeper than the current
+        // single-frame despawn we expect, without changing semantics.
+        [System.ThreadStatic]
+        private static int _despawnReentryDepth;
+
         // ── Mutation ───────────────────────────────────────────────────────────
 
         /// <summary>
@@ -52,10 +70,38 @@ namespace RTMPE.Core
         /// to avoid a layering inversion — registry sits below SpawnManager
         /// in the dependency stack.
         /// </para>
+        /// <para>
+        /// <b>Re-entrance contract:</b> calling <c>Register</c> from inside
+        /// an <c>OnNetworkDespawn</c> handler that the registry itself
+        /// invoked is rejected.  Allowing it would let the inner call clobber
+        /// the outer call's freshly-installed slot and then despawn the
+        /// outer caller's just-registered object — the outer caller would
+        /// observe the registry transition through SetSpawned and then
+        /// silently lose it before its own callback finishes.  Defer such
+        /// late registrations to the next frame (e.g. via a deferred queue
+        /// drained from <c>Update</c>); the registry surfaces a clear error
+        /// log on rejection so the offending call site is easy to find.
+        /// </para>
         /// </summary>
         public void Register(NetworkBehaviour obj)
         {
             if (obj == null) return;
+
+            // Reject re-entrant registrations issued from within an
+            // OnNetworkDespawn handler that the registry itself is currently
+            // dispatching.  See the field-level comment on
+            // _despawnReentryDepth for the corruption pattern this prevents.
+            if (_despawnReentryDepth > 0)
+            {
+                UnityEngine.Debug.LogError(
+                    "[RTMPE] NetworkObjectRegistry.Register: re-entrant call " +
+                    $"detected from inside an OnNetworkDespawn callback (objectId " +
+                    $"{obj.NetworkObjectId}).  Re-registration during despawn would " +
+                    "clobber the outer call's slot and silently despawn the new " +
+                    "object.  Defer the registration to the next frame (e.g. via " +
+                    "a deferred queue drained from Update).  Rejected.");
+                return;
+            }
 
             NetworkBehaviour previous = null;
             lock (_lock)
@@ -78,7 +124,18 @@ namespace RTMPE.Core
                     "been despawned but its GameObject remains live; SpawnManager " +
                     "counters / prefab map may be out of sync.  This indicates an " +
                     "upstream id-allocation bug.");
-                previous.SetSpawned(false);
+                _despawnReentryDepth++;
+                try
+                {
+                    previous.SetSpawned(false);
+                }
+                finally
+                {
+                    // Decrement in finally so an exception in user code does
+                    // not leave the depth counter pinned and break every
+                    // subsequent Register call on this thread.
+                    _despawnReentryDepth--;
+                }
             }
         }
 
@@ -252,16 +309,32 @@ namespace RTMPE.Core
                 _objects.Clear();
             }
 
-            // Call despawn callbacks outside the lock.
-            foreach (var obj in snapshot)
+            // Call despawn callbacks outside the lock under the same
+            // re-entrance guard that Register's eviction path uses, so a
+            // user OnNetworkDespawn handler that calls Register from
+            // inside Clear() is rejected with the same diagnostic instead
+            // of partially repopulating the just-cleared registry.
+            _despawnReentryDepth++;
+            try
             {
-                // Unity null check: skip already-destroyed GameObjects.
-                if (obj == null) continue;
+                foreach (var obj in snapshot)
+                {
+                    // Unity null check: skip already-destroyed GameObjects.
+                    if (obj == null) continue;
 
-                // Isolate per-object despawn: an exception in one object's
-                // OnNetworkDespawn callback must not prevent others from being despawned.
-                try   { obj.SetSpawned(false); }
-                catch (Exception ex) { Debug.LogException(ex); }
+                    // Isolate per-object despawn: an exception in one
+                    // object's OnNetworkDespawn callback must not prevent
+                    // others from being despawned.
+                    try   { obj.SetSpawned(false); }
+                    catch (Exception ex) { Debug.LogException(ex); }
+                }
+            }
+            finally
+            {
+                // Decrement in finally so an unhandled exception that
+                // escapes the inner try/catch (e.g. OutOfMemoryException)
+                // does not pin the depth counter.
+                _despawnReentryDepth--;
             }
         }
     }

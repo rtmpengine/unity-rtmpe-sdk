@@ -35,6 +35,8 @@
 //  Quaternion.Angle is NOT used for rotation-change detection; Mathf.Abs of
 //  the delta angle (with DeltaAngle normalisation) is used instead.
 
+using System.Buffers;
+
 using UnityEngine;
 using RTMPE.Core;
 using RTMPE.Sync.Internal;
@@ -237,8 +239,20 @@ namespace RTMPE.Sync
             var manager = NetworkManager.Instance;
             if (manager == null) return;
 
-            var payload = PhysicsPacketBuilder.Build2DPayload(NetworkObjectId, current, dataMask);
-            manager.SendStateSync(payload);
+            // Pooled 2-D physics send path (GC Round 2, 2026-05-02).
+            int size   = PhysicsPacketBuilder.ComputePayloadSize(dataMask, twoDee: true);
+            var pool   = ArrayPool<byte>.Shared;
+            var buffer = pool.Rent(size);
+            try
+            {
+                int written = PhysicsPacketBuilder.Build2DPayloadInto(
+                    buffer, 0, NetworkObjectId, current, dataMask);
+                manager.SendStateSync(buffer, written);
+            }
+            finally
+            {
+                pool.Return(buffer);
+            }
 
             _lastSentState       = current;
             _lastSleepState      = current.IsSleeping;
@@ -507,6 +521,15 @@ namespace RTMPE.Sync
                 float err = Vector2.Distance(_rb.position, sp);
                 if (err > _ownerReconcileSnapThreshold)
                 {
+                    // Snap applied immediately (no FixedUpdate deferral).  2D
+                    // physics ticks synchronously with FixedUpdate on the same
+                    // thread, so a direct write here does not produce the
+                    // LCM-beat artifact that the 3D path avoids with its
+                    // deferred pending-snap buffer.  If multiple reconciliation
+                    // packets arrive in a single frame, each one overwrites the
+                    // previous position (newer-wins); this is intentional —
+                    // stale intermediate states would produce a stutter even if
+                    // applied, and the latest state is always the most accurate.
                     if (_makeRemoteKinematic) _rb.position = sp;
                     else                      _rb.MovePosition(sp);
                 }

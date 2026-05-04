@@ -278,6 +278,17 @@ namespace RTMPE.Core
             {
                 _outstanding.Remove(evictId);
                 _outstandingDeadlineMs.Remove(evictId);
+                // Defence-in-depth: clear the evicted request's expectation
+                // tuple before reusing its id slot.  The caller
+                // (RequestOwnershipTransfer) overwrites the entry in the
+                // immediate next statement, but if a future caller path
+                // forgets to write the new tuple — or runs intermediate
+                // code that reads the dictionary — the stale tuple from
+                // the orphaned request must not be observable as a
+                // "matching expectation" in ConsumeMatchingExpectation.
+                // Removing here makes the eviction's effect on every
+                // tracking structure symmetric.
+                _outstandingExpectations.Remove(evictId);
                 _outstanding.Add(evictId);
                 _outstandingDeadlineMs[evictId] = NowMs() + OutstandingRequestTtlMs;
                 return evictId;
@@ -285,7 +296,11 @@ namespace RTMPE.Core
 
             // Unreachable in practice — _outstanding cannot be empty AND
             // every probe candidate occupied — but keep a defined return
-            // for the static analyser.
+            // for the static analyser.  Defence-in-depth: scrub any stale
+            // expectation that may have been left under id=1 by an earlier
+            // path so the fallback id is in a clean state when the caller
+            // writes the fresh tuple.
+            _outstandingExpectations.Remove(1u);
             _outstanding.Add(1u);
             _outstandingDeadlineMs[1u] = NowMs() + OutstandingRequestTtlMs;
             return 1u;

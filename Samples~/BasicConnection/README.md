@@ -7,7 +7,7 @@ scene and press Play.
 
 ## Prerequisites
 
-- Unity 6000.0 or newer.
+- Unity 2022.3 LTS or newer (also supports 2023 LTS and Unity 6 / 6000.0+).
 - An RTMPE gateway you can reach (local Docker stack, dev cluster, or
   production). Default settings target `127.0.0.1:7777`.
 - An API key issued by the RTMPE dashboard (or any value if your gateway

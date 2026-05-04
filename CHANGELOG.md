@@ -10,6 +10,70 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
 
 ## [Unreleased]
 
+### Security
+- **Critical (8 findings remediated)** — eight CRITICAL audit findings
+  closed across cryptography, session handling, and authorization paths.
+- **High (31 of 32 findings remediated)** — Rust gateway, Go portal-api,
+  Go room-service, and Unity SDK hardening: TOCTOU class fixes via
+  transactional repo methods, JWT revocation infrastructure, default
+  RPC sender verifier now self-only with explicit opt-in, OwnershipManager
+  one-shot tuple correlation on inbound grants, ObjectExistsVerifier
+  defaults to registry membership, NetworkVariable.SetValueWithoutNotify
+  guards on IsSpawned, SpawnManager.CreateLocal reordered so OnNetworkSpawn
+  observes a fully-initialized object.
+- **Medium + Low (49 MEDIUM + 15 LOW findings remediated)** — broad
+  hardening sweep across the entire SDK and backend.
+- **V3 deep-audit defence-in-depth** — `OwnershipManager` eviction now
+  scrubs the orphaned-request expectation tuple symmetrically across
+  every tracking dictionary; `NetworkObjectRegistry.Register` rejects
+  re-entrant calls issued from inside an `OnNetworkDespawn` handler via
+  a `[ThreadStatic]` depth counter so the outer slot cannot be
+  silently clobbered; `TransformQuantization.TryWriteHalf` now
+  saturating-clamps inputs to ±`HalfMaxFinite` (65504) BEFORE the
+  bit-level conversion so the encoder is total over the finite domain
+  and a far-overflow position component cannot teleport to the origin
+  via an Inf round-trip.
+- **Low crypto/pinning hardening (Beta-readiness)** — three
+  Beta-readiness gaps closed in the SDK plus LOW-severity crypto and
+  server-key-pinning improvements.
+- **SessionAck encryption gate** — `ExpectEncryptedSessionAck` is now
+  consulted on the AEAD pipeline so a misconfigured client cannot
+  silently accept a plaintext SessionAck on a session that negotiated
+  bootstrap encryption.
+- **Principal-engineer manual review** — six remaining issues from a
+  manual code review closed (handshake state machine, dispatcher
+  shutdown ordering, edge cases in reconcile, etc.).
+
+### Performance & Threading
+- **GC Round 2 / Round 3 (2026-05-02)** — eliminated per-packet
+  allocations on the AEAD hot path: `AeadNonce.BuildInto` writes the
+  12-byte nonce into a caller-provided buffer (saves ~12 B/packet ×
+  2 directions × 30 Hz × 32 connections ≈ 23 KB/sec); `NetworkVariable`
+  fast-path serializer caches the `MemoryStream` + `BinaryWriter`
+  wrappers per instance so `SerializeWithId` no longer allocates them
+  per call (saves several hundred allocations/sec on a busy game);
+  `Lz4Compressor` rents both the output buffer AND the int hash table
+  from `ArrayPool`, returning with `clearArray:true`.
+- **Lock-free interpolation cursor** — `NetworkTransformInterpolator`
+  now uses a per-object cursor hint to reduce the bracket lookup from
+  O(N) to amortised O(1) at large object counts (5000+ replicas).
+- **Threading model audit** — `MainThreadDispatcher`, `NetworkThread`,
+  and `ReliableChannel` mutations re-audited for race conditions,
+  `Interlocked` discipline, and shutdown ordering.
+
+### Tests
+- **+20 Unity Edit-Mode tests** added for V3 fixes:
+  `AllocateOutstandingRequestId_EvictionClearsExpectation`,
+  `Eviction_StaleExpectation_NotMatchableByConsume`,
+  `Register_ReentrantFromDespawn_IsRejected`,
+  `Register_AfterReentrantAttempt_NextCallStillSucceeds`,
+  `Register_ExceptionInDespawn_DepthCounterRestored`,
+  plus 15 new tests in `Tests/Runtime/TransformQuantizationTests.cs`
+  covering IEEE 754 binary16 boundary cases, saturating clamp, and
+  the encoder-totality property.
+- Comprehensive Performance, Threading, and security stress tests
+  added across multiple test files.
+
 ### Compatibility
 - `package.json` — `unity` floor lowered to `2022.3` so the package
   installs cleanly on Unity 2022.3 LTS, 2023 LTS, and Unity 6 (6000.0+).
@@ -40,7 +104,26 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   asset prerequisite that has to happen before the first `Connect()` call.
 - `Documentation~/getting-started.md` — Unity version requirement updated
   to reflect 2022.3 LTS / 2023 LTS support and the auto-published mirror
-  repository workflow.
+  repository workflow.  `Send Buffer Bytes` / `Receive Buffer Bytes`
+  default values corrected from `4096` (stale) to `262144` (256 KiB) to
+  match `NetworkSettings.cs` and `UdpTransport.DefaultSocketBufferBytes`.
+- `Documentation~/api/index.md` —
+  - `sendBufferBytes` / `receiveBufferBytes` default values corrected
+    (`4096` → `262144`) in both the `NetworkSettings` field table and
+    the `UdpTransport` constructor signature.
+  - `CreateRoomOptions.MaxPlayers` range corrected (`1–16` → `1–100`)
+    to match `MaxPlayersLimit = 100` in the room-service entity layer.
+  - Added documentation for `NetworkManager.OnReconnectFailed` and
+    five `RoomManager` events (`OnRoomPropertiesChanged`,
+    `OnPlayerPropertiesChanged`, `OnMasterClientChanged`,
+    `OnPlayerKicked`, `OnAllPlayersSceneLoaded`) that exist in the
+    Runtime but were missing from the API reference.
+- `Documentation~/architecture.md` — `MainThreadDispatcher` queue cap
+  diagram corrected from `4096` to `10000` (matches
+  `MainThreadDispatcher.MaxQueueDepth`).
+- `Samples~/BasicConnection/README.md` — Unity version requirement
+  corrected from "Unity 6000.0 or newer" to "Unity 2022.3 LTS or newer"
+  to match `package.json` and the top-level `README.md`.
 
 ### CI/CD
 - `.github/workflows/publish-unity-sdk-mirror.yml` — new workflow that

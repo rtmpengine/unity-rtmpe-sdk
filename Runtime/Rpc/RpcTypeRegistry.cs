@@ -65,6 +65,14 @@ namespace RTMPE.Rpc
         private static readonly ConcurrentDictionary<string, Type> _byName =
             new ConcurrentDictionary<string, Type>(StringComparer.Ordinal);
 
+        // IL2CPP-compatible factory functions stored by Register<T>().
+        // () => new T() is a statically-dispatched constructor the AOT compiler
+        // can trace and preserve.  Types registered via Register(Type) do NOT
+        // get a factory entry; CreateInstance() returns null for them and logs
+        // a warning — use Register<T>() in IL2CPP builds.
+        private static readonly ConcurrentDictionary<string, Func<INetworkSerializable>> _factories =
+            new ConcurrentDictionary<string, Func<INetworkSerializable>>(StringComparer.Ordinal);
+
         // Tracks whether the AppDomain-wide reflection scan has run.
         private static int _scanState; // 0 = not scanned, 1 = scanned
 
@@ -107,6 +115,7 @@ namespace RTMPE.Rpc
         private static void ResetStaticState()
         {
             _byName.Clear();
+            _factories.Clear();
             System.Threading.Interlocked.Exchange(ref _scanState, 0);
             _allowAppDomainScan = false;
         }
@@ -120,6 +129,11 @@ namespace RTMPE.Rpc
         /// </summary>
         public static void Register<T>() where T : INetworkSerializable, new()
         {
+            // Store an AOT-safe factory before delegating to Register(Type).
+            // () => new T() is a statically-dispatched constructor call that
+            // IL2CPP can trace and preserve; Activator.CreateInstance cannot.
+            var key = typeof(T).FullName;
+            if (key != null) _factories[key] = () => new T();
             Register(typeof(T));
         }
 
@@ -180,6 +194,34 @@ namespace RTMPE.Rpc
         /// </summary>
         public static bool IsRegistered(string fullName)
             => !string.IsNullOrEmpty(fullName) && _byName.ContainsKey(fullName);
+
+        /// <summary>
+        /// Instantiate the registered type identified by
+        /// <paramref name="fullName"/> without reflection.
+        /// Types registered via <see cref="Register{T}"/> return a factory-
+        /// constructed instance (IL2CPP-safe).  Types registered via
+        /// <see cref="Register(Type)"/> fall back to
+        /// <c>Activator.CreateInstance</c> (Mono-only; use <c>Register&lt;T&gt;</c>
+        /// in IL2CPP builds and add a <c>link.xml</c> preserve entry otherwise).
+        /// Returns <see langword="null"/> when <paramref name="fullName"/> is
+        /// not registered.
+        /// </summary>
+        internal static object CreateInstance(string fullName)
+        {
+            if (string.IsNullOrEmpty(fullName)) return null;
+            if (_factories.TryGetValue(fullName, out var factory))
+                return factory();
+            if (_byName.ContainsKey(fullName))
+            {
+                // Type was registered via Register(Type) without the generic overload,
+                // so no AOT-safe factory exists. Under IL2CPP the parameterless ctor
+                // may be stripped — the caller gets null and a warning to use Register<T>().
+                UnityEngine.Debug.LogWarning(
+                    $"[RTMPE] RpcTypeRegistry: no IL2CPP-safe factory for '{fullName}'. " +
+                    "Use Register<T>() instead of Register(Type) to support IL2CPP builds.");
+            }
+            return null;
+        }
 
         /// <summary>
         /// Snapshot the currently registered type names.  Returned list is

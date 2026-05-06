@@ -200,9 +200,9 @@ namespace RTMPE.Rpc
         /// <paramref name="fullName"/> without reflection.
         /// Types registered via <see cref="Register{T}"/> return a factory-
         /// constructed instance (IL2CPP-safe).  Types registered via
-        /// <see cref="Register(Type)"/> fall back to
-        /// <c>Activator.CreateInstance</c> (Mono-only; use <c>Register&lt;T&gt;</c>
-        /// in IL2CPP builds and add a <c>link.xml</c> preserve entry otherwise).
+        /// <see cref="Register(Type)"/> have no AOT-safe factory; this method
+        /// logs a warning and returns <see langword="null"/> — use
+        /// <c>Register&lt;T&gt;</c> for IL2CPP builds.
         /// Returns <see langword="null"/> when <paramref name="fullName"/> is
         /// not registered.
         /// </summary>
@@ -247,6 +247,7 @@ namespace RTMPE.Rpc
         internal static void ResetForTests()
         {
             _byName.Clear();
+            _factories.Clear();
             System.Threading.Interlocked.Exchange(ref _scanState, 0);
             _allowAppDomainScan = false;
         }

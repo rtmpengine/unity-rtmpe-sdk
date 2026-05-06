@@ -408,27 +408,17 @@ namespace RTMPE.Rpc
                         return null;
                     }
 
-                    // Preserve type identity even on failure so the eventual
-                    // MethodInfo.Invoke does not throw a value-type-binding
-                    // error on a null argument when the receiver's parameter
-                    // is a struct.  For reference types we still return a
-                    // default-constructed instance — the caller can detect
-                    // that the deserialize was partial via the warning log.
-                    object instance;
-                    try
-                    {
-                        // IL2CPP-safe path: Register<T>() stores () => new T().
-                        // Falls back to Activator only for types registered via
-                        // Register(Type) without a factory (Mono-only path).
-                        instance = RpcTypeRegistry.CreateInstance(typeName);
-                    }
-                    catch (Exception ex)
+                    // CreateInstance returns null (never throws) when no factory
+                    // exists.  The null check below surfaces the failure with a
+                    // warning; the try/catch around NetworkDeserialize (below)
+                    // handles deserialization exceptions separately.
+                    var instance = RpcTypeRegistry.CreateInstance(typeName);
+                    if (instance == null)
                     {
                         Debug.LogWarning(
-                            $"[RTMPE] RpcSerializer: failed to instantiate '{typeName}' " +
-                            $"({ex.GetType().Name}: {ex.Message}).  Returning null parameter — " +
-                            "RPC dispatch may fail if the receiver's parameter is a value type. " +
-                            "Ensure the type has a public parameterless constructor.");
+                            $"[RTMPE] RpcSerializer: no IL2CPP-safe factory for '{typeName}'. " +
+                            "Use Register<T>() instead of Register(Type) to support IL2CPP builds. " +
+                            "Returning null parameter — RPC dispatch will reject non-nullable bindings.");
                         return null;
                     }
 

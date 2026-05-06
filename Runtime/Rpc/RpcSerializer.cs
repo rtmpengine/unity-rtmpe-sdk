@@ -417,7 +417,10 @@ namespace RTMPE.Rpc
                     object instance;
                     try
                     {
-                        instance = Activator.CreateInstance(concrete);
+                        // IL2CPP-safe path: Register<T>() stores () => new T().
+                        // Falls back to Activator only for types registered via
+                        // Register(Type) without a factory (Mono-only path).
+                        instance = RpcTypeRegistry.CreateInstance(typeName);
                     }
                     catch (Exception ex)
                     {

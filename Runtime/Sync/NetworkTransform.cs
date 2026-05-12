@@ -690,11 +690,20 @@ namespace RTMPE.Sync
             // quantized builder writes 25 B into the same buffer when
             // enabled.  ArrayPool.Rent may return a buffer larger than the
             // requested size, so we always pass the *exact* written length
-            // (PAYLOAD_SIZE or QUANTIZED_PAYLOAD_SIZE) to SendData so the
-            // wire frame's payload_len matches the bytes we actually wrote.
-            // Renting always at the larger size keeps the rent path
+            // (PAYLOAD_SIZE or QUANTIZED_PAYLOAD_SIZE) to SendStateSync so
+            // the wire frame's payload_len matches the bytes we actually
+            // wrote.  Renting always at the larger size keeps the rent path
             // single-bucket and lets the quantized fallback path reuse the
             // same buffer without a second rent.
+            //
+            // The send target is PacketType.StateSync (0x40), not
+            // PacketType.Data (0x10): the gateway routes StateSync through
+            // the NATS state-forward path so the Sync Service can ingest the
+            // transform into the authoritative tick engine and broadcast it
+            // to every peer in the room.  PacketType.Data was the legacy
+            // wiring; the gateway echoes Data packets back to the sender, so
+            // a transform sent under that type would never reach other
+            // clients and would produce a self-feedback loop on the owner.
             var pool   = ArrayPool<byte>.Shared;
             var buffer = pool.Rent(TransformPacketBuilder.PAYLOAD_SIZE);
             try
@@ -715,7 +724,7 @@ namespace RTMPE.Sync
                         buffer, 0, NetworkObjectId, state);
                 }
 
-                manager.SendData(buffer, written);
+                manager.SendStateSync(buffer, written);
             }
             finally
             {

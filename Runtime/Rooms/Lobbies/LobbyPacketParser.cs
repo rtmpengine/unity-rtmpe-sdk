@@ -1,11 +1,28 @@
 // RTMPE SDK — Runtime/Rooms/Lobbies/LobbyPacketParser.cs
 //
 // Parses the server reply for LobbyJoin (0x27), LobbyList (0x29), and
-// LobbyRoomListUpdate (0x2A).  All three carry the same payload shape:
-// a JSON array of room-summary objects wrapped inside a NatsReply.Data field.
+// LobbyRoomListUpdate (0x2A).  All three carry the same payload — the
+// canonical shape is a versioned JSON envelope of room summaries, with a
+// legacy bare-array fallback retained for rolling-upgrade compatibility:
+//
+//   • Canonical (Room Service v2026-05-10+):
+//       {"version": 1, "rooms": [ {...}, {...} ]}
+//   • Legacy (pre-versioning):
+//       [ {...}, {...} ]
 //
 // The gateway strips the outer NatsReply envelope before forwarding the raw
-// payload to the client, so the client receives the inner JSON array directly.
+// payload to the client, so the client receives the inner shape directly.
+//
+// ── Schema-version guard ─────────────────────────────────────────────────────
+//
+// The `version` field encodes the wire-schema generation:
+//   • 0 / absent  — legacy bare-array shape; treated as v1 semantics.
+//   • 1           — current envelope, parsed as documented.
+//   • > 1         — unknown future shape; the parser MUST refuse rather
+//                   than read v1 fields under v2 semantics (a silent
+//                   misread would surface as bogus rooms in the lobby UI
+//                   that no operator dashboard could correlate to a wire
+//                   format change).
 //
 // ── Hardening (2026-04-27) ────────────────────────────────────────────────────
 // The parser is hand-rolled (no external JSON dependency) but has been
@@ -36,6 +53,21 @@ namespace RTMPE.Rooms
         private const int FallbackMaxEntries     = 256;
         private const int FallbackMaxStringBytes = 256;
         private const int MaxNestingDepth        = 32;
+
+        /// <summary>
+        /// Highest wire-schema version this consumer understands.  Payloads
+        /// declaring a version above this value are dropped rather than
+        /// parsed under v1 semantics — a silent misread would surface as
+        /// bogus rooms in the lobby UI with no operator-visible failure
+        /// signal.
+        ///
+        /// <para>Coordinated with the publisher constant
+        /// <c>LobbyRoomListEnvelopeVersion</c> in
+        /// <c>modules/room/infrastructure/messaging/nats_handler.go</c>.
+        /// Bumping this constant is a two-side change and should be made
+        /// in lock-step with the Go publisher.</para>
+        /// </summary>
+        internal const int MaxKnownEnvelopeVersion = 1;
 
         // Strict UTF-8 codec.  The lax decoder silently substitutes U+FFFD
         // for malformed bytes, which lets a hostile or compromised server
@@ -86,13 +118,61 @@ namespace RTMPE.Rooms
                 // exactly as a parser-throw would.  No new failure shape on
                 // the call site contract.
                 var json = StrictUtf8.GetString(payload);
-                ParseJsonArray(json, rooms, maxEntries, maxStringBytes);
+
+                // Wire-shape dispatch:
+                //   • leading '['  →  legacy bare-array shape (pre-versioning).
+                //   • leading '{'  →  versioned envelope; require the declared
+                //                     version is at or below this consumer's
+                //                     `MaxKnownEnvelopeVersion`, then parse the
+                //                     `rooms` array within.  Higher versions
+                //                     drop the payload outright — silently
+                //                     reading v1 fields under v2 semantics
+                //                     would surface as inconsistent UI state
+                //                     with no operator-visible failure signal.
+                //   • anything else → unrecognised; treat as empty.
+                int firstNonWs = SkipWhitespace(json, 0);
+                if (firstNonWs >= json.Length) return rooms;
+                char first = json[firstNonWs];
+                if (first == '[')
+                {
+                    ParseJsonArray(json, rooms, maxEntries, maxStringBytes);
+                }
+                else if (first == '{')
+                {
+                    int declaredVersion = ReadIntField(json, "version");
+                    if (declaredVersion > MaxKnownEnvelopeVersion)
+                    {
+                        // Future-version envelope from a Room Service build
+                        // ahead of this consumer — drop without raising the
+                        // partial list, mirroring the GatewayEnvelope
+                        // versioning policy on the Sync side.
+                        return rooms;
+                    }
+                    // Locate the rooms array.  `IndexOf` after the version
+                    // marker is sufficient because the canonical envelope
+                    // shape places `rooms` as the only top-level array.
+                    ParseJsonArray(json, rooms, maxEntries, maxStringBytes);
+                }
             }
             catch
             {
                 // Silently return empty list — caller logs if needed.
             }
             return rooms;
+        }
+
+        // Skip ASCII whitespace (space, tab, CR, LF) starting from `pos`.
+        // Used by the version-shape dispatcher to tolerate compact-formatted
+        // and pretty-printed payloads symmetrically.
+        private static int SkipWhitespace(string json, int pos)
+        {
+            while (pos < json.Length)
+            {
+                char c = json[pos];
+                if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+                pos++;
+            }
+            return pos;
         }
 
         // ── Minimal JSON array parser ────────────────────────────────────────

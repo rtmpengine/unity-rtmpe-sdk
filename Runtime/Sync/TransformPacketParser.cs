@@ -117,11 +117,55 @@ namespace RTMPE.Sync
             changedMask = 0;
             state       = default;
 
-            // Guard: null or too short to hold ObjectID + ChangedMask.
-            if (payload == null || payload.Length < DELTA_MIN_SIZE)
+            if (payload == null) return false;
+            int offset = 0;
+            if (!TryParseStateDeltaAt(
+                    payload, ref offset,
+                    out objectId, out changedMask, out state))
                 return false;
 
-            int off = 0;
+            // The single-record overload preserves its strict contract: a
+            // well-formed StateDelta must end exactly where the last selected
+            // field's bytes end.  Surplus bytes here indicate either an
+            // ambiguous concatenated payload (handled by the iteration
+            // overload elsewhere) or a protocol-drift / smuggling signal
+            // that this overload's callers must reject.
+            return offset == payload.Length;
+        }
+
+        /// <summary>
+        /// Parse a single <c>StateDelta</c> record from <paramref name="payload"/>
+        /// starting at <paramref name="offset"/>, advancing <paramref name="offset"/>
+        /// past the consumed bytes on success.
+        ///
+        /// <para>Used by the receive iteration in <c>NetworkManager.HandleStateSyncPacket</c>
+        /// to decode multi-delta packets emitted by the Sync Service's
+        /// <c>BroadcastSyncFrame</c> (`.delta` subject), which concatenates one
+        /// serialised <c>StateDelta</c> per changed object into a single
+        /// <c>PacketType.StateSync</c> frame.</para>
+        ///
+        /// <para>Unlike <see cref="TryParseStateDelta"/> this method does NOT
+        /// reject trailing bytes — the iteration's outer loop is responsible
+        /// for resuming at the new <paramref name="offset"/> until the buffer
+        /// is exhausted.  Truncation, unknown mask bits, non-finite floats,
+        /// and non-unit quaternions are still rejected so a malformed record
+        /// cannot corrupt the receiver's transform.</para>
+        /// </summary>
+        public static bool TryParseStateDeltaAt(
+            byte[] payload,
+            ref int offset,
+            out ulong objectId,
+            out byte changedMask,
+            out TransformState state)
+        {
+            objectId    = 0;
+            changedMask = 0;
+            state       = default;
+
+            if (payload == null || offset < 0 || offset > payload.Length - DELTA_MIN_SIZE)
+                return false;
+
+            int off = offset;
 
             // ObjectID (u64 LE)
             objectId = ReadU64LE(payload, off);
@@ -193,13 +237,8 @@ namespace RTMPE.Sync
                 if (!IsFinite(scale.x) || !IsFinite(scale.y) || !IsFinite(scale.z)) return false;
             }
 
-            // Reject trailing residue.  A well-formed StateDelta ends exactly
-            // where the last selected field's bytes end; surplus bytes are a
-            // protocol-drift / smuggling signal that the higher-level decoder
-            // would otherwise carry forward without observing.
-            if (off != payload.Length) return false;
-
             state = new TransformState { Position = pos, Rotation = rot, Scale = scale };
+            offset = off;
             return true;
         }
 

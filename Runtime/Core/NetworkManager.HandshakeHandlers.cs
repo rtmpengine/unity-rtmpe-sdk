@@ -453,6 +453,16 @@ namespace RTMPE.Core
             // SessionAck is the bootstrap that delivers crypto_id, which the
             // session-AEAD nonce depends on.  Route SessionAck through a
             // dedicated decrypt before the generic AEAD branch runs.
+            //
+            // The wire-truth `wasEncrypted` flag is the input to the
+            // `requiresEnc` gate further down — it must reflect the FLAG_ENCRYPTED
+            // bit observed on the wire and never be mutated locally.  A separate
+            // `alreadyDecrypted` flag tracks whether plaintext has already been
+            // produced by the SessionAck-specific path, so the generic AEAD branch
+            // can be skipped without losing the original wire signal.  Conflating
+            // the two would cause a successfully-decrypted SessionAck to fail the
+            // ExpectEncryptedSessionAck gate and be silently dropped.
+            bool alreadyDecrypted = false;
             if (wasEncrypted
                 && packetType == PacketType.SessionAck
                 && _settings != null
@@ -469,9 +479,9 @@ namespace RTMPE.Core
                     return;
                 }
                 packetLength = data.Length;
-                wasEncrypted = false; // already decrypted; skip generic branch
+                alreadyDecrypted = true;
             }
-            if (wasEncrypted)
+            if (wasEncrypted && !alreadyDecrypted)
             {
                 // DecryptInboundPacket returns an exact-sized plaintext byte[]
                 // (header + decrypted payload), severing the dependency on
@@ -624,10 +634,30 @@ namespace RTMPE.Core
                 case PacketType.Data:
                 case PacketType.StateSync:        SafeRaise(OnDataReceived, data, nameof(OnDataReceived)); break;
 
-                // DataAck is a legitimate server acknowledgement; expose it as an event.
+                // DataAck carries the gateway-acknowledged ARQ sequence as a
+                // 4-byte little-endian payload.  Drain the matching entry
+                // from the outbound retransmit table BEFORE firing the
+                // public event so subscribers observe the post-ack state.
+                // A truncated payload (legacy gateway that pre-dates the
+                // arq_seq wire extension) skips the ledger update but still
+                // raises the event, preserving back-compat semantics.
                 case PacketType.DataAck:
-                    SafeRaise(OnDataAcknowledged, nameof(OnDataAcknowledged));
-                    LogDebug("DataAck received.");
+                    {
+                        var ackPayload = PacketParser.ExtractPayload(data);
+                        if (ackPayload != null && ackPayload.Length >= 4)
+                        {
+                            uint ackedSeq = (uint)(
+                                  ackPayload[0]
+                                | (ackPayload[1] << 8)
+                                | (ackPayload[2] << 16)
+                                | (ackPayload[3] << 24));
+                            int cleared = _outboundReliableChannel.AcknowledgeUpTo(ackedSeq);
+                            if (cleared > 0 && IsDebugLogEnabled)
+                                LogDebug($"DataAck arq_seq={ackedSeq} cleared {cleared} retransmit entries.");
+                        }
+                        SafeRaise(OnDataAcknowledged, nameof(OnDataAcknowledged));
+                        LogDebug("DataAck received.");
+                    }
                     break;
 
                 // ── Networked object lifecycle ─────────────────────

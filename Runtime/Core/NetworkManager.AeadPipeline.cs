@@ -493,6 +493,28 @@ namespace RTMPE.Core
         /// </list>
         /// </summary>
         private void EncryptAndSend(byte[] packet)
+            => EncryptAndSendInternal(packet, hasFixedArqSeq: false, fixedArqSeq: 0u);
+
+        /// <summary>
+        /// Internal AEAD send that lets the caller pin the ARQ sequence emitted
+        /// in the wire sub-header instead of allocating a fresh one from the
+        /// outbound counter.
+        ///
+        /// <para>Used by <see cref="ReliableChannel"/>-driven retransmits so a
+        /// resend reuses the same `arq_seq` the receiver may already have
+        /// observed (and acknowledged) — the client cumulatively-clears its
+        /// retransmit table on any ack with `seq &gt;= entry.Sequence`, so a
+        /// late-arriving ACK for the original seq still drains the entry on
+        /// retransmit.  A fresh allocation per retry would let the receiver
+        /// see the same payload under two different sequences and would fail
+        /// the cumulative-ACK clearing logic.</para>
+        ///
+        /// <para>When <paramref name="hasFixedArqSeq"/> is `false` the routine
+        /// behaves exactly like the historical <see cref="EncryptAndSend"/>:
+        /// allocates a fresh sequence under the
+        /// <see cref="NetworkSettings.EmitArqSequence"/> gate.</para>
+        /// </summary>
+        private void EncryptAndSendInternal(byte[] packet, bool hasFixedArqSeq, uint fixedArqSeq)
         {
             if (packet == null || packet.Length < PacketProtocol.HEADER_SIZE)
                 return;
@@ -656,13 +678,17 @@ namespace RTMPE.Core
             uint arqSeqForWire = 0u;
             if (emitArq)
             {
-                // Allocate from the channel's outbound counter without
-                // registering a retransmit entry — the on-the-wire emission
-                // is intentionally decoupled from the retransmit table until
-                // gateway-side ACK plumbing lands.  When the full ARQ loop is
-                // wired, the registration will move to the caller of
-                // EncryptAndSend.
-                arqSeqForWire = _outboundReliableChannel.AllocateOutboundSequence();
+                // When the caller has already registered a retransmit entry
+                // (Send(reliable: true) → TryRegisterOutbound), it passes the
+                // assigned sequence here so retransmits reuse the same
+                // value — the receiver's cumulative-ACK clearing logic
+                // depends on `arq_seq` being stable across retries.
+                // Untracked sends (no caller-side registration) fall back to
+                // a fresh allocation off the channel's outbound counter, the
+                // historical pre-ACK behaviour.
+                arqSeqForWire = hasFixedArqSeq
+                    ? fixedArqSeq
+                    : _outboundReliableChannel.AllocateOutboundSequence();
             }
             uint gameplaySeqForWire = 0u;
             if (emitGameplay)

@@ -104,92 +104,139 @@ namespace RTMPE.Core
                 return;
             }
 
-            // ── 1. Try transform parse ─────────────────────────────────────────
-            if (TransformPacketParser.TryParseStateDelta(
-                    payload, out ulong objectId, out byte changedMask, out TransformState state))
-            {
-                var nb = _spawnManager.Registry.Get(objectId);
-                if (nb == null) return;
-
-                // ── Receive-side interest filter ──────────────────────────────
-                // When an InterestManager is active with a non-zero radius,
-                // discard state updates for objects outside that radius.
-                // The owning client's objects are always processed regardless of
-                // distance (the owner needs reconciliation data).
-                // This is a secondary client-side guard; the gateway already
-                // performs the primary spatial cull before sending the packet.
-                //
-               // Filter against the INCOMING position when the packet carries
-                // one — falling back to the live transform only when the delta
-                // omits a position field.  Filtering against transform.position
-                // alone would lag one tick behind: a fast-moving object entering
-                // the radius would be discarded for one tick before we accept it.
-                if (!nb.IsOwner && InterestManager.IsReceiveFilterActive)
-                {
-                    var (lh1, lh2)  = InterestManager.LocalPosition;
-                    Vector3 objPos;
-                    if ((changedMask & TransformPacketParser.ChangedPosition) != 0)
-                        objPos = state.Position;
-                    else
-                        objPos = nb.transform.position;
-                    // Pick the matching horizontal axis: XZ for 3-D games
-                    // (default), XY for 2-D / top-down games.  Without this
-                    // dispatch the filter compares an XY-stored local position
-                    // against the unused vertical axis of the remote object
-                    // and silently rejects every packet for top-down games.
-                    float dx = objPos.x - lh1;
-                    float dh2 = (InterestManager.LocalUsesXzPlane ? objPos.z : objPos.y) - lh2;
-                    if (!InterestManager.ShouldDeliver(objectId, dx * dx + dh2 * dh2)) return;
-                }
-
-                // Build a blended state: merge only the fields present in the delta.
-                // Fields absent from the delta keep zero-initialised values in `state`
-                // which would clobber the current transform — fall back to the live
-                // transform for those axes.
-                //
-                // Resolve the cached NetworkTransform once so both the
-                // delta-merge below and the owner reconciliation branch
-                // share a single field load.
-                var cachedNetTransform = nb.CachedNetworkTransform;
-                var current = cachedNetTransform != null
-                    ? cachedNetTransform.GetState()
-                    : new TransformState { Position = nb.transform.position,
-                                           Rotation = nb.transform.rotation,
-                                           Scale    = nb.transform.localScale };
-                var blended = new TransformState
-                {
-                    Position = (changedMask & TransformPacketParser.ChangedPosition) != 0
-                                   ? state.Position : current.Position,
-                    Rotation = (changedMask & TransformPacketParser.ChangedRotation) != 0
-                                   ? state.Rotation : current.Rotation,
-                    Scale    = (changedMask & TransformPacketParser.ChangedScale) != 0
-                                   ? state.Scale : current.Scale,
-                };
-
-                if (nb.IsOwner)
-                {
-                    cachedNetTransform?.ApplyReconciliation(blended);
-                    return;
-                }
-
-                var interp = nb.CachedNetworkTransformInterpolator;
-                if (interp == null) return;
-                interp.AddState(blended, UnityEngine.Time.timeAsDouble);
-                return;
-            }
-
-            // ── 2. Try 2-D physics parse (bit 0x80 discriminates from 3-D) ────
+            // ── 1b. Physics dispatch (mutually exclusive with StateDelta) ────
+            // Physics frames set discriminator bits in byte 8 (bit 0x80 for
+            // 2-D, bit 0x40 for 3-D) outside the StateDelta KnownMask of 0x07.
+            // Dispatching them BEFORE the StateDelta iteration removes the
+            // ambiguity that would otherwise arise on the very first parse
+            // attempt — the StateDelta parser would reject a physics frame on
+            // the unknown-bit guard, but that rejection would also abort the
+            // remainder of any concatenated batch even when the inputs were
+            // legitimate.  The discriminator byte is the same token both
+            // sides peek at, so the dispatch agrees with `IsPhysics2D` /
+            // `IsPhysics3D` by construction.
             if (PhysicsPacketParser.IsPhysics2D(payload))
             {
                 HandlePhysicsSync2DPacket(payload);
                 return;
             }
-
-            // ── 3. Try 3-D physics parse (bit 0x40 set, bit 0x80 clear) ────────
             if (PhysicsPacketParser.IsPhysics3D(payload))
             {
                 HandlePhysicsSyncPacket(payload);
+                return;
             }
+
+            // ── 2. StateDelta iteration (single record OR concatenated batch) ─
+            // The Sync Service's `BroadcastSyncFrame` (`.delta` subject)
+            // concatenates one serialised `StateDelta` per changed object into
+            // a single `PacketType.StateSync` frame; one-object rooms produce
+            // a single record, multi-object rooms produce N records back to
+            // back.  The loop below dispatches each record to its registered
+            // NetworkObject, advancing through the buffer until exhausted.  A
+            // single malformed record terminates the loop so the remainder
+            // of a poisoned batch cannot drift into a misaligned read of a
+            // later well-formed record.
+            int cursor = 0;
+            int recordsApplied = 0;
+            while (cursor < payload.Length)
+            {
+                if (!TransformPacketParser.TryParseStateDeltaAt(
+                        payload, ref cursor,
+                        out ulong objectId,
+                        out byte changedMask,
+                        out TransformState state))
+                {
+                    if (recordsApplied == 0 && IsDebugLogEnabled)
+                        LogDebug("StateSync: no StateDelta record could be parsed from payload.");
+                    return;
+                }
+                ApplyStateDeltaToObject(objectId, changedMask, state);
+                recordsApplied++;
+            }
+        }
+
+        /// <summary>
+        /// Apply a single decoded <c>StateDelta</c> to its target
+        /// <see cref="NetworkObjectRegistry"/> entry.  Encapsulates the
+        /// per-record interest filter, blended-state construction, and
+        /// owner-vs-remote dispatch so the multi-delta iteration in
+        /// <see cref="HandleStateSyncPacket"/> stays linear.
+        /// </summary>
+        private void ApplyStateDeltaToObject(
+            ulong objectId,
+            byte changedMask,
+            TransformState state)
+        {
+            var nb = _spawnManager.Registry.Get(objectId);
+            if (nb == null) return;
+
+            // ── Receive-side interest filter ──────────────────────────────
+            // When an InterestManager is active with a non-zero radius,
+            // discard state updates for objects outside that radius.
+            // The owning client's objects are always processed regardless of
+            // distance (the owner needs reconciliation data).
+            // This is a secondary client-side guard; the gateway already
+            // performs the primary spatial cull before sending the packet.
+            //
+            // Filter against the INCOMING position when the packet carries
+            // one — falling back to the live transform only when the delta
+            // omits a position field.  Filtering against transform.position
+            // alone would lag one tick behind: a fast-moving object entering
+            // the radius would be discarded for one tick before we accept it.
+            if (!nb.IsOwner && InterestManager.IsReceiveFilterActive)
+            {
+                var (lh1, lh2) = InterestManager.LocalPosition;
+                Vector3 objPos;
+                if ((changedMask & TransformPacketParser.ChangedPosition) != 0)
+                    objPos = state.Position;
+                else
+                    objPos = nb.transform.position;
+                // Pick the matching horizontal axis: XZ for 3-D games
+                // (default), XY for 2-D / top-down games.  Without this
+                // dispatch the filter compares an XY-stored local position
+                // against the unused vertical axis of the remote object
+                // and silently rejects every packet for top-down games.
+                float dx = objPos.x - lh1;
+                float dh2 = (InterestManager.LocalUsesXzPlane ? objPos.z : objPos.y) - lh2;
+                if (!InterestManager.ShouldDeliver(objectId, dx * dx + dh2 * dh2)) return;
+            }
+
+            // Build a blended state: merge only the fields present in the delta.
+            // Fields absent from the delta keep zero-initialised values in `state`
+            // which would clobber the current transform — fall back to the live
+            // transform for those axes.
+            //
+            // Resolve the cached NetworkTransform once so both the
+            // delta-merge below and the owner reconciliation branch
+            // share a single field load.
+            var cachedNetTransform = nb.CachedNetworkTransform;
+            var current = cachedNetTransform != null
+                ? cachedNetTransform.GetState()
+                : new TransformState
+                {
+                    Position = nb.transform.position,
+                    Rotation = nb.transform.rotation,
+                    Scale    = nb.transform.localScale,
+                };
+            var blended = new TransformState
+            {
+                Position = (changedMask & TransformPacketParser.ChangedPosition) != 0
+                               ? state.Position : current.Position,
+                Rotation = (changedMask & TransformPacketParser.ChangedRotation) != 0
+                               ? state.Rotation : current.Rotation,
+                Scale    = (changedMask & TransformPacketParser.ChangedScale) != 0
+                               ? state.Scale : current.Scale,
+            };
+
+            if (nb.IsOwner)
+            {
+                cachedNetTransform?.ApplyReconciliation(blended);
+                return;
+            }
+
+            var interp = nb.CachedNetworkTransformInterpolator;
+            if (interp == null) return;
+            interp.AddState(blended, UnityEngine.Time.timeAsDouble);
         }
 
         /// <summary>

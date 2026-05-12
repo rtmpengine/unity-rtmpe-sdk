@@ -625,6 +625,24 @@ namespace RTMPE.Core
         /// Enqueue a raw packet for transmission. Thread-safe.
         /// The packet is AEAD-encrypted when the session is established.
         /// A defensive copy is made internally so the caller can safely reuse its buffer.
+        ///
+        /// <para>When <paramref name="reliable"/> is `true` and the deployment
+        /// has opted into <see cref="NetworkSettings.EmitArqSequence"/>, the
+        /// packet is registered with the outbound
+        /// <see cref="ReliableChannel"/>: an ARQ sequence is allocated, the
+        /// packet bytes are kept in a retransmit table, and any unacknowledged
+        /// entry is re-emitted on the configured RTO schedule until either a
+        /// matching <see cref="PacketType.DataAck"/> arrives or
+        /// <see cref="ReliableChannel.MaxAttempts"/> is exhausted.  The
+        /// retransmit driver is the per-frame <see cref="Update"/> tick on the
+        /// Unity main thread, so retransmits are interleaved with regular
+        /// sends without a dedicated worker thread.</para>
+        ///
+        /// <para>When <paramref name="reliable"/> is `false`, or
+        /// <see cref="NetworkSettings.EmitArqSequence"/> is `false`, the
+        /// packet is sent unreliably (no retransmit, no ACK) — the historical
+        /// behaviour for legacy callers and projects that have not opted into
+        /// the ARQ wire extension.</para>
         /// </summary>
         public void Send(byte[] data, bool reliable = false)
         {
@@ -636,10 +654,39 @@ namespace RTMPE.Core
 
             if (data == null || data.Length == 0) return;
 
-            // Copy so the caller can safely reuse or discard its buffer after this call,
-            // which matches the original NetworkThread.Send(copy) contract.
+            // Copy so the caller can safely reuse or discard its buffer after
+            // this call, which matches the original NetworkThread.Send(copy)
+            // contract.  When reliable=true the same copy is parked in the
+            // retransmit table for re-emission on RTO expiry.
             var copy = new byte[data.Length];
             Buffer.BlockCopy(data, 0, copy, 0, data.Length);
+
+            // The reliable wire extension requires both the caller-supplied
+            // intent (`reliable: true`) AND the deployment-level opt-in
+            // (`NetworkSettings.EmitArqSequence`) — without the latter the
+            // gateway cannot tell which sub-header bytes to expect, so the
+            // ARQ sequence would be misread as application payload.
+            bool reliableEnabled = reliable
+                && _settings != null
+                && _settings.EmitArqSequence;
+
+            if (reliableEnabled
+                && _outboundReliableChannel.TryRegisterOutbound(
+                    copy,
+                    (float)UnityEngine.Time.unscaledTimeAsDouble,
+                    out uint arqSeq))
+            {
+                // The retransmit table holds the original packet bytes; a
+                // resend re-runs EncryptAndSendInternal with the same arqSeq
+                // so the receiver observes a stable sequence across retries.
+                EncryptAndSendInternal(copy, hasFixedArqSeq: true, fixedArqSeq: arqSeq);
+                return;
+            }
+
+            // Unreliable path (or saturated retransmit table) — caller has
+            // already accepted "best effort" semantics.  When the table is
+            // saturated the caller is implicitly back-pressured: the packet
+            // still goes out once, but no retry will happen if it is lost.
             EncryptAndSend(copy);
         }
 

@@ -78,13 +78,53 @@ namespace RTMPE.Protocol
 
         /// <summary>
         /// Build a <c>HandshakeResponse</c> packet (type 0x07).
-        /// Payload is exactly 32 bytes: the client's X25519 ephemeral public key.
+        ///
+        /// <para>Payload layout (33 bytes when wire-format negotiation is
+        /// active, 32 bytes otherwise):</para>
+        /// <list type="bullet">
+        /// <item>bytes 0..31 — client's X25519 ephemeral public key.</item>
+        /// <item>byte 32 (optional) — preferred state-sync wire-format
+        /// version (<see cref="WireFormatVersion"/> as `byte`).  When omitted
+        /// the gateway pins the session to <see cref="WireFormat.LegacyDefault"/>
+        /// (V2) for byte-compatibility with deployed clients that pre-date the
+        /// negotiation byte.</item>
+        /// </list>
+        ///
+        /// <para>Backwards compatibility:</para>
+        /// <list type="bullet">
+        /// <item><b>Old gateway + new SDK:</b> the 33rd byte falls outside the
+        /// gateway's public-key slice (`payload[..32]`) and is silently
+        /// ignored — the session pins to V2 just as it does today.</item>
+        /// <item><b>New gateway + old SDK:</b> the 33rd byte is absent; the
+        /// gateway sees `payload.len() == 32` and pins to V2 (the legacy
+        /// default).</item>
+        /// <item><b>New gateway + new SDK:</b> both sides agree on
+        /// `min(client_pref, gateway_max)` and the session is pinned to the
+        /// negotiated version.</item>
+        /// </list>
         /// </summary>
         public byte[] BuildHandshakeResponse(byte[] clientPublicKey)
+            => BuildHandshakeResponse(clientPublicKey, WireFormat.Default);
+
+        /// <summary>
+        /// Build a <c>HandshakeResponse</c> packet (type 0x07) with an
+        /// explicit wire-format preference.  See the parameterless overload
+        /// for the wire layout and back-compat semantics.
+        /// </summary>
+        public byte[] BuildHandshakeResponse(
+            byte[] clientPublicKey,
+            WireFormatVersion preferredWireFormat)
         {
             if (clientPublicKey == null || clientPublicKey.Length != 32)
                 throw new ArgumentException("clientPublicKey must be exactly 32 bytes.", nameof(clientPublicKey));
-            return Build(PacketType.HandshakeResponse, PacketFlags.None, clientPublicKey);
+
+            // 32-byte public key + 1-byte wire-format preference.  Allocating
+            // a fresh buffer keeps the caller's `clientPublicKey` slice
+            // untouched (zeroising is the consumer's responsibility upstream).
+            var payload = new byte[33];
+            Buffer.BlockCopy(clientPublicKey, 0, payload, 0, 32);
+            payload[32] = (byte)preferredWireFormat;
+            return Build(PacketType.HandshakeResponse, PacketFlags.None, payload);
         }
 
         /// <summary>

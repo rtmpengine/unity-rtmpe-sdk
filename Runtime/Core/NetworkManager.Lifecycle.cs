@@ -124,6 +124,26 @@ namespace RTMPE.Core
             // Drive the heartbeat tick each frame using the pre-cached callback.
             _heartbeatManager?.Tick(_sendPacketCallback);
 
+            // Drive the outbound ARQ retransmit ladder once per frame.  The
+            // resend callback re-runs the AEAD pipeline with the same
+            // arq_seq the entry was registered under so the receiver's
+            // cumulative-ACK clearing logic stays coherent across retries.
+            // `onDropped` keeps the cap-exhaustion event observable in the
+            // Unity console without coupling production callers to the
+            // ReliableChannel API surface.
+            if (_settings != null && _settings.EmitArqSequence)
+            {
+                _outboundReliableChannel.Tick(
+                    (float)Time.unscaledTimeAsDouble,
+                    resend: (seq, payload) =>
+                        EncryptAndSendInternal(payload, hasFixedArqSeq: true, fixedArqSeq: seq),
+                    onDropped: seq =>
+                    {
+                        if (IsDebugLogEnabled)
+                            LogDebug($"ReliableChannel: arq_seq={seq} dropped after MaxAttempts.");
+                    });
+            }
+
             // Drive matchmaking timeout/cancel state machine in main-thread time
             // so callers don't need to wire app-level Tick plumbing.
             _matchmakingManager?.Tick(Time.unscaledTimeAsDouble);

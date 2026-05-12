@@ -427,13 +427,128 @@ namespace RTMPE.Tests
                 rx: 0f, ry: 0f, rz: s, rw: s);
 
             bool ok = TransformPacketParser.TryParseStateDelta(
-                payload, out _, out TransformState state, out _);
+                payload, out _, out _, out TransformState state);
             Assert.IsTrue(ok);
 
             Assert.That(state.Rotation.x, Is.EqualTo(0f).Within(1e-6f));
             Assert.That(state.Rotation.y, Is.EqualTo(0f).Within(1e-6f));
             Assert.That(state.Rotation.z, Is.EqualTo(s).Within(1e-6f));
             Assert.That(state.Rotation.w, Is.EqualTo(s).Within(1e-6f));
+        }
+
+        // ── Multi-delta iteration (TryParseStateDeltaAt) ──────────────────────
+        //
+        // Pin the wire contract for the receive-side path that consumes the
+        // Sync Service's `BroadcastSyncFrame` (`.delta` subject), which
+        // concatenates one serialised StateDelta per changed object into a
+        // single PacketType.StateSync frame.  A regression in the iterator
+        // would silently drop every record after the first, leaving a
+        // multi-object room visually frozen for every non-owner peer.
+
+        [Test]
+        [Description("Multi-delta iteration: two concatenated StateDeltas decode in order.")]
+        public void TryParseStateDeltaAt_TwoConcatenatedDeltas_ParsesBoth()
+        {
+            var first = BuildStateDeltaPayload(
+                objectId: 11UL, changedMask: TransformPacketParser.ChangedPosition,
+                px: 1f, py: 2f, pz: 3f);
+            var second = BuildStateDeltaPayload(
+                objectId: 22UL, changedMask: TransformPacketParser.ChangedScale,
+                sx: 4f, sy: 5f, sz: 6f);
+
+            var concat = new byte[first.Length + second.Length];
+            Buffer.BlockCopy(first,  0, concat, 0,            first.Length);
+            Buffer.BlockCopy(second, 0, concat, first.Length, second.Length);
+
+            int cursor = 0;
+
+            bool ok1 = TransformPacketParser.TryParseStateDeltaAt(
+                concat, ref cursor,
+                out ulong id1, out byte mask1, out TransformState s1);
+            Assert.IsTrue(ok1);
+            Assert.AreEqual(11UL, id1);
+            Assert.AreEqual(TransformPacketParser.ChangedPosition, mask1);
+            Assert.AreEqual(new Vector3(1f, 2f, 3f), s1.Position);
+            Assert.AreEqual(first.Length, cursor,
+                "cursor must advance past the first record exactly");
+
+            bool ok2 = TransformPacketParser.TryParseStateDeltaAt(
+                concat, ref cursor,
+                out ulong id2, out byte mask2, out TransformState s2);
+            Assert.IsTrue(ok2);
+            Assert.AreEqual(22UL, id2);
+            Assert.AreEqual(TransformPacketParser.ChangedScale, mask2);
+            Assert.AreEqual(new Vector3(4f, 5f, 6f), s2.Scale);
+            Assert.AreEqual(concat.Length, cursor,
+                "cursor must reach the buffer end after the second record");
+        }
+
+        [Test]
+        [Description("Multi-delta iteration: cursor at buffer end signals exhaustion (false return).")]
+        public void TryParseStateDeltaAt_CursorAtEnd_ReturnsFalse()
+        {
+            var payload = BuildStateDeltaPayload(
+                objectId: 1UL, changedMask: TransformPacketParser.ChangedPosition,
+                px: 0f, py: 0f, pz: 0f);
+
+            int cursor = payload.Length;
+            bool ok = TransformPacketParser.TryParseStateDeltaAt(
+                payload, ref cursor,
+                out _, out _, out _);
+            Assert.IsFalse(ok, "no bytes left → must return false to terminate the iteration loop");
+        }
+
+        [Test]
+        [Description("Multi-delta iteration: first record valid, second record truncated → only the first is dispatched.")]
+        public void TryParseStateDeltaAt_TruncatedSecondRecord_StopsAtFirst()
+        {
+            var first = BuildStateDeltaPayload(
+                objectId: 1UL, changedMask: TransformPacketParser.ChangedPosition,
+                px: 1f, py: 1f, pz: 1f);
+            // Append a deliberately-short prefix of a "second" record so the
+            // iterator sees a parseable header but a truncated body.
+            var second = BuildStateDeltaPayload(
+                objectId: 2UL, changedMask: TransformPacketParser.ChangedScale,
+                sx: 1f, sy: 1f, sz: 1f);
+            var truncated = new byte[first.Length + 5]; // 5 bytes of the second
+            Buffer.BlockCopy(first,  0, truncated, 0,            first.Length);
+            Buffer.BlockCopy(second, 0, truncated, first.Length, 5);
+
+            int cursor = 0;
+
+            bool ok1 = TransformPacketParser.TryParseStateDeltaAt(
+                truncated, ref cursor,
+                out ulong id1, out _, out _);
+            Assert.IsTrue(ok1);
+            Assert.AreEqual(1UL, id1);
+
+            bool ok2 = TransformPacketParser.TryParseStateDeltaAt(
+                truncated, ref cursor,
+                out _, out _, out _);
+            Assert.IsFalse(ok2, "truncated trailing record must be rejected, not partially decoded");
+        }
+
+        [Test]
+        [Description("TryParseStateDelta retains its strict trailing-bytes rejection so single-record callers stay safe.")]
+        public void TryParseStateDelta_TrailingBytesRejectedBySingleRecordOverload()
+        {
+            var first = BuildStateDeltaPayload(
+                objectId: 7UL, changedMask: TransformPacketParser.ChangedPosition,
+                px: 1f, py: 2f, pz: 3f);
+            var withTrailer = new byte[first.Length + 4];
+            Buffer.BlockCopy(first, 0, withTrailer, 0, first.Length);
+            // Trailing 4 bytes look like another length prefix — the strict
+            // single-record overload must still reject this rather than
+            // half-decode the next record.
+            withTrailer[first.Length + 0] = 0xAA;
+            withTrailer[first.Length + 1] = 0xBB;
+            withTrailer[first.Length + 2] = 0xCC;
+            withTrailer[first.Length + 3] = 0xDD;
+
+            bool ok = TransformPacketParser.TryParseStateDelta(
+                withTrailer, out _, out _, out _);
+            Assert.IsFalse(ok,
+                "TryParseStateDelta must reject trailing bytes; multi-delta iteration belongs in TryParseStateDeltaAt");
         }
     }
 }

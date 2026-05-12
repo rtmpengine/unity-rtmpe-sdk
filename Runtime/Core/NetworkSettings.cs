@@ -400,6 +400,18 @@ namespace RTMPE.Core
         /// from the same offset; if only one side opts in, AEAD AAD will not
         /// match and packets will be dropped at the receiver.
         /// </summary>
+        /// <remarks>
+        /// The sub-header is independent of any reliability guarantee the
+        /// underlying transport (KCP, WebSocket) already provides: KCP
+        /// retransmits at the segment level and WebSocket runs over TCP, so
+        /// neither needs this field to deliver bytes.  The ARQ sub-header
+        /// instead carries the application-layer reliable sequence value
+        /// the gateway uses to authenticate per-packet ordering inside the
+        /// AEAD AAD and to feed the duplicate-detection window.  Leaving
+        /// this flag <c>false</c> keeps both endpoints on the legacy wire
+        /// shape that omits the field; flipping it on requires the gateway
+        /// to be running a build that consumes the sub-header.
+        /// </remarks>
         public bool EmitArqSequence => _emitArqSequence;
 
         [SerializeField]

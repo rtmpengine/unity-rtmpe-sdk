@@ -305,6 +305,128 @@ namespace RTMPE.Tests
             Assert.AreEqual(1, result.Count);
             Assert.IsFalse(result[0].IsPublic);
         }
+
+        // ── Versioned envelope (Audit Issue I) ─────────────────────────────
+        //
+        // The Room Service emits `{"version":1,"rooms":[...]}` for every
+        // lobby room-list flow (LobbyJoin reply, LobbyList reply,
+        // LobbyRoomListUpdate push).  These tests cover the four
+        // wire-shape branches the parser must handle:
+        //
+        //   • legacy bare array `[...]`     — accepted (back-compat with
+        //                                     pre-Issue-I Room builds)
+        //   • current envelope `{v=1,...}`  — accepted, rooms parsed
+        //   • future envelope  `{v=999,...}` — dropped to empty list
+        //   • envelope shape, no version    — treated as v0, accepted as v1
+        //
+        // The "future envelope" rejection is the security-critical path:
+        // silently parsing v999 fields under v1 semantics would surface as
+        // inconsistent UI state with no operator-visible failure signal.
+
+        [Test]
+        public void ParseRoomList_VersionedEnvelopeV1_ParsesRooms()
+        {
+            var json = @"{""version"":1,""rooms"":[{""room_id"":""r1"",""room_code"":""A1"",""name"":""R1"",""player_count"":1,""max_players"":4,""is_public"":true,""lobby_name"":""ranked""}]}";
+            var result = LobbyPacketParser.ParseRoomList(Utf8(json));
+
+            Assert.AreEqual(1, result.Count);
+            Assert.AreEqual("r1", result[0].RoomId);
+            Assert.AreEqual("ranked", result[0].LobbyName);
+        }
+
+        [Test]
+        public void ParseRoomList_VersionedEnvelopeV1_EmptyRooms()
+        {
+            var json = @"{""version"":1,""rooms"":[]}";
+            var result = LobbyPacketParser.ParseRoomList(Utf8(json));
+
+            Assert.IsNotNull(result);
+            Assert.AreEqual(0, result.Count);
+        }
+
+        [Test]
+        public void ParseRoomList_VersionedEnvelopeV1_TwoRooms()
+        {
+            var json = @"{""version"":1,""rooms"":[
+                {""room_id"":""r1"",""room_code"":""A1"",""name"":""R1"",""player_count"":1,""max_players"":4,""is_public"":true,""lobby_name"":""""},
+                {""room_id"":""r2"",""room_code"":""B2"",""name"":""R2"",""player_count"":2,""max_players"":8,""is_public"":false,""lobby_name"":""ranked""}
+            ]}";
+            var result = LobbyPacketParser.ParseRoomList(Utf8(json));
+
+            Assert.AreEqual(2, result.Count);
+            Assert.AreEqual("r1", result[0].RoomId);
+            Assert.AreEqual("r2", result[1].RoomId);
+            Assert.AreEqual("ranked", result[1].LobbyName);
+        }
+
+        [Test]
+        public void ParseRoomList_FutureEnvelopeVersion_DroppedToEmpty()
+        {
+            // v999 — the Room Service of some future deploy could publish
+            // this shape with new fields the SDK does not understand.  The
+            // contract is to drop the payload entirely rather than parse
+            // recognised fields under v1 semantics.
+            var json = @"{""version"":999,""rooms"":[{""room_id"":""r-future"",""room_code"":""F0"",""name"":""Future"",""player_count"":1,""max_players"":4,""is_public"":true,""lobby_name"":""""}]}";
+            var result = LobbyPacketParser.ParseRoomList(Utf8(json));
+
+            Assert.IsNotNull(result, "drop must produce an empty list, not null");
+            Assert.AreEqual(0, result.Count,
+                "an envelope newer than MaxKnownEnvelopeVersion must drop every entry");
+        }
+
+        [Test]
+        public void ParseRoomList_EnvelopeShapeWithoutVersionField_TreatedAsV1()
+        {
+            // A Room Service build that emits the envelope shape without
+            // setting `version` (e.g. an in-progress migration or a
+            // hand-crafted test payload) is treated as v0, which the
+            // dispatcher coerces to v1 — the original schema.  Same
+            // policy as GatewayStateEnvelope on the Sync side.
+            var json = @"{""rooms"":[{""room_id"":""r1"",""room_code"":""A1"",""name"":""R1"",""player_count"":0,""max_players"":4,""is_public"":true,""lobby_name"":""""}]}";
+            var result = LobbyPacketParser.ParseRoomList(Utf8(json));
+
+            Assert.AreEqual(1, result.Count);
+            Assert.AreEqual("r1", result[0].RoomId);
+        }
+
+        [Test]
+        public void ParseRoomList_EnvelopeWithLeadingWhitespace_StillDispatched()
+        {
+            // The dispatcher must skip ASCII whitespace before classifying
+            // the leading character so a pretty-printed payload (CR/LF/TAB
+            // produced by a development tool) still resolves to the
+            // envelope branch rather than the "unrecognised" empty drop.
+            var json = "  \t\r\n{\"version\":1,\"rooms\":[]}";
+            var result = LobbyPacketParser.ParseRoomList(Utf8(json));
+
+            Assert.IsNotNull(result);
+            Assert.AreEqual(0, result.Count);
+        }
+
+        [Test]
+        public void ParseRoomList_LegacyBareArrayWithLeadingWhitespace_StillParsed()
+        {
+            // Symmetric whitespace handling for the legacy bare-array path.
+            var json = "  \t\r\n[{\"room_id\":\"r1\",\"room_code\":\"A1\",\"name\":\"R1\",\"player_count\":0,\"max_players\":4,\"is_public\":true,\"lobby_name\":\"\"}]";
+            var result = LobbyPacketParser.ParseRoomList(Utf8(json));
+
+            Assert.AreEqual(1, result.Count);
+            Assert.AreEqual("r1", result[0].RoomId);
+        }
+
+        [Test]
+        public void ParseRoomList_UnknownLeadingChar_ReturnsEmpty()
+        {
+            // A payload that is neither `[` nor `{` after whitespace —
+            // e.g. a string literal or a number — is treated as
+            // unrecognised and produces an empty list, the same shape as
+            // a malformed JSON payload.
+            var json = "\"not an array\"";
+            var result = LobbyPacketParser.ParseRoomList(Utf8(json));
+
+            Assert.IsNotNull(result);
+            Assert.AreEqual(0, result.Count);
+        }
     }
 
     // ── LobbyQueryOptions / LobbyFilter ──────────────────────────────────────

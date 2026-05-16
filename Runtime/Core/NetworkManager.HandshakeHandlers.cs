@@ -829,7 +829,24 @@ namespace RTMPE.Core
             // Send the client's X25519 ephemeral public key to the server.
             // Use SendOwned — response is a freshly allocated array that
             // will not be reused, so the extra copy inside Send() is unnecessary.
-            var response = _packetBuilder.BuildHandshakeResponse(_handshakeHandler.ClientPublicKey);
+            //
+            // The cap advertisement carries every optional feature the SDK
+            // is willing to honour for this session.  ARQ_ACK is the only
+            // bit defined today; mirroring it onto
+            // `NetworkSettings.EmitArqSequence` keeps the on-wire promise
+            // honest — the SDK cannot consume the gateway's DataAck unless
+            // the local opt-in is also active.  A gateway that does not
+            // understand the cap field tolerates the trailing bytes
+            // (`payload[..32]` semantics are unchanged), so emitting the
+            // advertisement is safe against legacy gateways.
+            RTMPE.Core.Protocol.CapabilityFlags clientCaps =
+                _settings != null && _settings.EmitArqSequence
+                    ? RTMPE.Core.Protocol.CapabilityFlags.ArqAck
+                    : RTMPE.Core.Protocol.CapabilityFlags.None;
+            var response = _packetBuilder.BuildHandshakeResponse(
+                _handshakeHandler.ClientPublicKey,
+                RTMPE.Protocol.WireFormat.Default,
+                clientCaps);
             SendToWire(response);
             LogDebug("Sent HandshakeResponse — awaiting SessionAck.");
         }
@@ -854,11 +871,29 @@ namespace RTMPE.Core
             if (!PacketParser.ParseSessionAck(payload,
                     out uint   cryptoId,
                     out string jwtToken,
-                    out string reconnectToken))
+                    out string reconnectToken,
+                    out RTMPE.Core.Protocol.CapabilityFlags gatewayCaps))
             {
                 Debug.LogError("[RTMPE] SessionAck parse failed — malformed payload. Disconnecting.");
                 return;
             }
+
+            // Negotiate the session-effective capability set as the bitwise
+            // intersection of what the SDK advertised in HandshakeResponse
+            // and what the gateway returned in SessionAck.  ARQ_ACK is the
+            // only bit the SDK advertises today (mirroring
+            // `EmitArqSequence`); the intersection captured here gates the
+            // Send / AeadPipeline / retransmit-tick paths for the rest of
+            // the session.  A legacy gateway that does not understand the
+            // SessionAck tail yields `gatewayCaps == None`, which makes the
+            // intersection empty and falls back to the pre-capability
+            // behaviour — exactly what the back-compat contract requires.
+            RTMPE.Core.Protocol.CapabilityFlags localCaps =
+                _settings != null && _settings.EmitArqSequence
+                    ? RTMPE.Core.Protocol.CapabilityFlags.ArqAck
+                    : RTMPE.Core.Protocol.CapabilityFlags.None;
+            _negotiatedPeerCaps =
+                RTMPE.Core.Protocol.CapabilityFlagsWire.Negotiate(localCaps, gatewayCaps);
 
             // Validate the JWT before we trust the sub claim that becomes the
             // local session identifier.  Signature verification requires a

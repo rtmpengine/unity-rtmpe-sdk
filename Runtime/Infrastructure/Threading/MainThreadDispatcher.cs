@@ -748,5 +748,28 @@ namespace RTMPE.Threading
         // for every queued rental.  Must remain internal — production code
         // never invokes drain directly; the lifetime hook is authoritative.
         internal void DrainAndDisposeForTest() => DrainPendingBuffers();
+
+        /// <summary>
+        /// Discards all callbacks queued by the background network thread and
+        /// returns any rented buffers to the pool.  Call at session-boundary
+        /// teardown — on the Unity main thread — to prevent closures captured
+        /// during a now-defunct session from executing against the reconnected
+        /// session's state.
+        /// </summary>
+        /// <remarks>
+        /// Every <c>BufferAction</c> work item has its rented <c>byte[]</c>
+        /// routed through the installed <see cref="BufferReturnHandler"/> so
+        /// the pool retains accurate accounting.  Plain <c>Action</c> and
+        /// <c>Action&lt;object&gt;</c> items are silently dropped — their
+        /// callbacks are stale session-bound closures the caller has decided
+        /// to suppress.
+        /// </remarks>
+        public void DiscardPendingCallbacks()
+        {
+            Debug.Assert(
+                IsMainThread,
+                "[RTMPE] MainThreadDispatcher.DiscardPendingCallbacks must be called from the Unity main thread.");
+            DrainPendingBuffers();
+        }
     }
 }

@@ -654,6 +654,16 @@ namespace RTMPE.Core
 
             if (data == null || data.Length == 0) return;
 
+            // _negotiatedPeerCaps is read below without synchronisation — the
+            // field is written only on the main thread (inside OnSessionAck,
+            // dispatched by MainThreadDispatcher) and all callers of Send are
+            // expected to be main-thread code.  This assertion catches
+            // accidental cross-thread use before it produces a data race.
+            Debug.Assert(
+                RTMPE.Threading.MainThreadDispatcher.IsMainThread,
+                "[RTMPE] NetworkManager.Send must be called from the Unity main thread — " +
+                "_negotiatedPeerCaps is read without synchronisation.");
+
             // Copy so the caller can safely reuse or discard its buffer after
             // this call, which matches the original NetworkThread.Send(copy)
             // contract.  When reliable=true the same copy is parked in the
@@ -661,14 +671,43 @@ namespace RTMPE.Core
             var copy = new byte[data.Length];
             Buffer.BlockCopy(data, 0, copy, 0, data.Length);
 
-            // The reliable wire extension requires both the caller-supplied
-            // intent (`reliable: true`) AND the deployment-level opt-in
-            // (`NetworkSettings.EmitArqSequence`) — without the latter the
-            // gateway cannot tell which sub-header bytes to expect, so the
-            // ARQ sequence would be misread as application payload.
-            bool reliableEnabled = reliable
-                && _settings != null
-                && _settings.EmitArqSequence;
+            // Application-layer ARQ requires three predicates to line up:
+            //   • caller intent (`reliable: true`)
+            //   • deployment opt-in (`NetworkSettings.EmitArqSequence`) —
+            //     instructs the SDK to emit the 4-byte ARQ sub-header on
+            //     the wire so the gateway can address its DataAck
+            //   • negotiated peer capability (`CapabilityFlags.ArqAck` in
+            //     `_negotiatedPeerCaps`) — the gateway has promised to
+            //     emit DataAck for reliable frames
+            // Each predicate has its own actionable when missing, so the
+            // two deployment-level causes route to dedicated warn-once
+            // advisories below.
+            bool emitArqSequence = _settings != null && _settings.EmitArqSequence;
+            bool peerSupportsArqAck =
+                (_negotiatedPeerCaps & RTMPE.Core.Protocol.CapabilityFlags.ArqAck) != 0;
+
+            // Local-side advisory: caller asked for reliability but the
+            // SDK is configured not to emit the ARQ sub-header.  Fires
+            // once regardless of peer cap state — fixing the local opt-in
+            // is the prerequisite either way.
+            RTMPE.Core.Diagnostics.ReliableSendAdvisory.NotifyIfDowngrading(
+                emitArqSequence:   emitArqSequence,
+                reliableRequested: reliable);
+
+            // Peer-side advisory: local opt-in is on but the session's
+            // negotiated cap set excludes ArqAck (legacy gateway, or
+            // operator left RTMPE_ADVERTISE_ARQ_CAP off, or the active
+            // transport's gateway path intentionally suppresses the cap
+            // — KCP / WebSocket).  The advisory's internal predicate
+            // requires `emitArqSequence == true`, so the two advisories
+            // are mutually exclusive on first emission for a given root
+            // cause.
+            RTMPE.Core.Diagnostics.PeerCapabilityAdvisory.NotifyIfArqUnavailable(
+                emitArqSequence:    emitArqSequence,
+                peerSupportsArqAck: peerSupportsArqAck,
+                reliableRequested:  reliable);
+
+            bool reliableEnabled = reliable && emitArqSequence && peerSupportsArqAck;
 
             if (reliableEnabled
                 && _outboundReliableChannel.TryRegisterOutbound(

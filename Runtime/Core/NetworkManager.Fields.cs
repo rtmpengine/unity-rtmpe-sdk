@@ -69,6 +69,35 @@ namespace RTMPE.Core
         /// lands; until then this instance only services sequence allocation.
         /// </summary>
         private readonly ReliableChannel _outboundReliableChannel = new ReliableChannel();
+
+        /// <summary>
+        /// Session-effective capability bitmask negotiated against the
+        /// gateway during the handshake.  Equal to
+        /// <c>client_caps &amp; gateway_caps</c> where <c>client_caps</c>
+        /// is the SDK's advertisement (currently mirrors
+        /// <see cref="NetworkSettings.EmitArqSequence"/>) and
+        /// <c>gateway_caps</c> is parsed from the <c>SessionAck</c> tail.
+        /// Reset to <see cref="RTMPE.Core.Protocol.CapabilityFlags.None"/>
+        /// alongside the rest of the session-bound AEAD state in
+        /// <c>ClearSessionData</c>.
+        /// </summary>
+        /// <remarks>
+        /// Single-threaded access by construction.  The write happens in
+        /// <c>OnSessionAck</c>, which is dispatched onto the Unity main
+        /// thread by <see cref="Infrastructure.Threading.MainThreadDispatcher"/>
+        /// before any handler runs.  The three read sites — <c>Send</c>
+        /// (<c>NetworkManager.Connection.cs</c>), the AEAD emit
+        /// gate (<c>NetworkManager.AeadPipeline.cs</c>), and the
+        /// retransmit tick (<c>NetworkManager.Lifecycle.cs</c>) —
+        /// also run on the main thread (caller code, <c>Update</c>, and
+        /// <c>Update</c> respectively), so no atomic / volatile read is
+        /// required.  Mirrors the access pattern of the other
+        /// session-installed fields (<c>_jwtToken</c>,
+        /// <c>_reconnectToken</c>, <c>_localPlayerId</c>).
+        /// </remarks>
+        private RTMPE.Core.Protocol.CapabilityFlags _negotiatedPeerCaps =
+            RTMPE.Core.Protocol.CapabilityFlags.None;
+
         private ulong  _localPlayerId;
         private ulong  _currentRoomId;
 

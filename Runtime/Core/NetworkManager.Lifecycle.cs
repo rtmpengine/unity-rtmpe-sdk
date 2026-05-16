@@ -131,7 +131,22 @@ namespace RTMPE.Core
             // `onDropped` keeps the cap-exhaustion event observable in the
             // Unity console without coupling production callers to the
             // ReliableChannel API surface.
-            if (_settings != null && _settings.EmitArqSequence)
+            //
+            // The tick is also gated on the negotiated peer capability:
+            // ticking against a gateway that never advertised ArqAck
+            // would let the table keep accumulating retransmit entries
+            // (registered by Send) without any way to drain them
+            // (DataAck never arrives), so the loop is a no-op when the
+            // negotiation excluded the cap.  In practice Send() refuses
+            // to register entries under those conditions today, but the
+            // belt-and-braces gate keeps the invariant readable at the
+            // tick site too.
+            bool peerSupportsArqAckForTick =
+                (_negotiatedPeerCaps
+                    & RTMPE.Core.Protocol.CapabilityFlags.ArqAck) != 0;
+            if (_settings != null
+                && _settings.EmitArqSequence
+                && peerSupportsArqAckForTick)
             {
                 _outboundReliableChannel.Tick(
                     (float)Time.unscaledTimeAsDouble,

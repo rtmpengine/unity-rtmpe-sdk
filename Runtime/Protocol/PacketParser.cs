@@ -188,40 +188,102 @@ namespace RTMPE.Protocol
         // ── SessionAck (0x08) ─────────────────────────────────────────────────
 
         /// <summary>
-        /// Parse the <c>SessionAck</c> payload.
+        /// Parse the <c>SessionAck</c> payload.  Preserved for callers that
+        /// have not opted into capability negotiation; see the five-argument
+        /// overload to also extract the optional <c>gateway_caps</c> tail.
         ///
-        /// Layout: [crypto_id:4 LE][jwt_len:2 LE][jwt:N][reconnect_len:2 LE][reconnect:R]
+        /// Layout: <c>[crypto_id:4 LE][jwt_len:2 LE][jwt:N][reconnect_len:2 LE][reconnect:R][gateway_caps:4 LE?]</c>
         /// </summary>
+        [System.Obsolete(
+            "Use the five-argument overload that surfaces gatewayCaps — " +
+            "this overload silently discards the capability-negotiation tail " +
+            "and will be removed in a future SDK version.")]
         public static bool ParseSessionAck(
             byte[] payload,
             out uint   cryptoId,
             out string jwtToken,
             out string reconnectToken)
+            => ParseSessionAck(
+                payload,
+                out cryptoId,
+                out jwtToken,
+                out reconnectToken,
+                out _);
+
+        /// <summary>
+        /// Parse the <c>SessionAck</c> payload and also extract the
+        /// optional <c>gateway_caps</c> tail introduced by the capability-
+        /// negotiation extension.  Missing tail yields
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.None"/>, preserving
+        /// the legacy-gateway contract.
+        ///
+        /// Layout: <c>[crypto_id:4 LE][jwt_len:2 LE][jwt:N][reconnect_len:2 LE][reconnect:R][gateway_caps:4 LE?]</c>
+        /// </summary>
+        public static bool ParseSessionAck(
+            byte[] payload,
+            out uint   cryptoId,
+            out string jwtToken,
+            out string reconnectToken,
+            out RTMPE.Core.Protocol.CapabilityFlags gatewayCaps)
         {
             cryptoId       = 0;
             jwtToken       = null;
             reconnectToken = null;
+            gatewayCaps    = RTMPE.Core.Protocol.CapabilityFlags.None;
 
             if (payload == null) return false;
             return ParseSessionAck(new ReadOnlySpan<byte>(payload),
                                    out cryptoId,
                                    out jwtToken,
-                                   out reconnectToken);
+                                   out reconnectToken,
+                                   out gatewayCaps);
         }
 
         /// <summary>
-        /// Span-based parse of <c>SessionAck</c>.  String fields are decoded
-        /// directly from the source span — no intermediate byte[] is allocated.
+        /// Span-based parse of <c>SessionAck</c> with the legacy three-out
+        /// shape.  String fields are decoded directly from the source span —
+        /// no intermediate byte[] is allocated.  Discards the optional
+        /// <c>gateway_caps</c> tail; callers that need it use the
+        /// five-argument overload.
         /// </summary>
+        [System.Obsolete(
+            "Use the five-argument Span overload that surfaces gatewayCaps — " +
+            "this overload silently discards the capability-negotiation tail " +
+            "and will be removed in a future SDK version.")]
         public static bool ParseSessionAck(
             ReadOnlySpan<byte> payload,
             out uint   cryptoId,
             out string jwtToken,
             out string reconnectToken)
+            => ParseSessionAck(
+                payload,
+                out cryptoId,
+                out jwtToken,
+                out reconnectToken,
+                out _);
+
+        /// <summary>
+        /// Span-based parse of <c>SessionAck</c>.  String fields are decoded
+        /// directly from the source span — no intermediate byte[] is allocated.
+        /// The optional <c>gateway_caps</c> tail is surfaced through
+        /// <paramref name="gatewayCaps"/>; when the payload ends before the
+        /// tail (a legacy gateway response) the output is set to
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.None"/>.  Bytes
+        /// trailing the cap field are ignored by design — future protocol
+        /// extensions may append further sub-fields without breaking this
+        /// parser.
+        /// </summary>
+        public static bool ParseSessionAck(
+            ReadOnlySpan<byte> payload,
+            out uint   cryptoId,
+            out string jwtToken,
+            out string reconnectToken,
+            out RTMPE.Core.Protocol.CapabilityFlags gatewayCaps)
         {
             cryptoId       = 0;
             jwtToken       = null;
             reconnectToken = null;
+            gatewayCaps    = RTMPE.Core.Protocol.CapabilityFlags.None;
 
             if (payload.Length < 8) return false; // 4 + 2 + 0 + 2 minimum
 
@@ -257,6 +319,7 @@ namespace RTMPE.Protocol
                 reconnectToken = rcLen > 0
                     ? DecodeUtf8(payload.Slice(offset, rcLen))
                     : string.Empty;
+                offset += rcLen;
             }
             catch (System.Text.DecoderFallbackException)
             {
@@ -267,6 +330,15 @@ namespace RTMPE.Protocol
                 reconnectToken = null;
                 return false;
             }
+
+            // Optional `gateway_caps:4 LE` tail.  Absent on legacy gateways
+            // that pre-date capability negotiation — the parser treats the
+            // missing field as `CapabilityFlags.None`, which the negotiator
+            // intersects with the SDK's advertised caps to disable every
+            // optional feature for the session.  Any bytes beyond the cap
+            // field are ignored so the wire stays forward-extensible.
+            RTMPE.Core.Protocol.CapabilityFlagsWire.TryReadLittleEndian(
+                payload, offset, out gatewayCaps);
 
             return true;
         }

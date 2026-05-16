@@ -79,8 +79,7 @@ namespace RTMPE.Protocol
         /// <summary>
         /// Build a <c>HandshakeResponse</c> packet (type 0x07).
         ///
-        /// <para>Payload layout (33 bytes when wire-format negotiation is
-        /// active, 32 bytes otherwise):</para>
+        /// <para>Payload layout:</para>
         /// <list type="bullet">
         /// <item>bytes 0..31 — client's X25519 ephemeral public key.</item>
         /// <item>byte 32 (optional) — preferred state-sync wire-format
@@ -88,42 +87,91 @@ namespace RTMPE.Protocol
         /// the gateway pins the session to <see cref="WireFormat.LegacyDefault"/>
         /// (V2) for byte-compatibility with deployed clients that pre-date the
         /// negotiation byte.</item>
+        /// <item>bytes 33..36 (optional) — <c>client_caps:4 LE</c>, the
+        /// SDK's advertised <see cref="RTMPE.Core.Protocol.CapabilityFlags"/>
+        /// bitmask.  Each bit names an optional protocol feature the SDK
+        /// is willing to honour for the session.  The gateway's response
+        /// returns its own bitmask in the <c>SessionAck</c> tail; the
+        /// session-effective set is the bitwise AND of the two.  Omitting
+        /// the field is equivalent to advertising
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.None"/>.</item>
         /// </list>
         ///
         /// <para>Backwards compatibility:</para>
         /// <list type="bullet">
-        /// <item><b>Old gateway + new SDK:</b> the 33rd byte falls outside the
-        /// gateway's public-key slice (`payload[..32]`) and is silently
-        /// ignored — the session pins to V2 just as it does today.</item>
-        /// <item><b>New gateway + old SDK:</b> the 33rd byte is absent; the
-        /// gateway sees `payload.len() == 32` and pins to V2 (the legacy
-        /// default).</item>
+        /// <item><b>Old gateway + new SDK:</b> the trailing bytes fall
+        /// outside the gateway's public-key slice (`payload[..32]`) and
+        /// are silently ignored — the session pins to V2 with no
+        /// negotiated caps just as it does today.</item>
+        /// <item><b>New gateway + old SDK:</b> trailing bytes are absent;
+        /// the gateway defaults the missing cap field to
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.None"/>.</item>
         /// <item><b>New gateway + new SDK:</b> both sides agree on
-        /// `min(client_pref, gateway_max)` and the session is pinned to the
-        /// negotiated version.</item>
+        /// `min(client_pref, gateway_max)` for the wire format and on the
+        /// intersection of the advertised cap sets.</item>
         /// </list>
         /// </summary>
         public byte[] BuildHandshakeResponse(byte[] clientPublicKey)
-            => BuildHandshakeResponse(clientPublicKey, WireFormat.Default);
+            => BuildHandshakeResponse(
+                clientPublicKey,
+                WireFormat.Default,
+                RTMPE.Core.Protocol.CapabilityFlags.None);
 
         /// <summary>
         /// Build a <c>HandshakeResponse</c> packet (type 0x07) with an
-        /// explicit wire-format preference.  See the parameterless overload
-        /// for the wire layout and back-compat semantics.
+        /// explicit wire-format preference and no advertised caps.
+        /// Preserved for callers that have not opted into capability
+        /// negotiation; see the three-argument overload for the cap-aware
+        /// wire layout and back-compat semantics.
         /// </summary>
         public byte[] BuildHandshakeResponse(
             byte[] clientPublicKey,
             WireFormatVersion preferredWireFormat)
+            => BuildHandshakeResponse(
+                clientPublicKey,
+                preferredWireFormat,
+                RTMPE.Core.Protocol.CapabilityFlags.None);
+
+        /// <summary>
+        /// Build a <c>HandshakeResponse</c> packet (type 0x07) with an
+        /// explicit wire-format preference and a capability advertisement.
+        /// When <paramref name="clientCaps"/> is
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.None"/> the
+        /// trailing four bytes are omitted entirely so the on-wire size
+        /// stays compatible with the pre-capability gateway.
+        /// </summary>
+        public byte[] BuildHandshakeResponse(
+            byte[] clientPublicKey,
+            WireFormatVersion preferredWireFormat,
+            RTMPE.Core.Protocol.CapabilityFlags clientCaps)
         {
             if (clientPublicKey == null || clientPublicKey.Length != 32)
                 throw new ArgumentException("clientPublicKey must be exactly 32 bytes.", nameof(clientPublicKey));
 
-            // 32-byte public key + 1-byte wire-format preference.  Allocating
-            // a fresh buffer keeps the caller's `clientPublicKey` slice
-            // untouched (zeroising is the consumer's responsibility upstream).
-            var payload = new byte[33];
+            // Omit the cap tail when nothing is advertised so the on-wire
+            // packet stays byte-identical to the pre-cap shape that the
+            // legacy gateway parser accepts.  New gateways treat an
+            // absent tail as `CapabilityFlags.None` per the parser
+            // contract, so the two encodings of "no caps" are observably
+            // equivalent — emitting the shorter form keeps the bytes the
+            // operator sees in packet captures unchanged for the common
+            // case.
+            bool emitCaps = clientCaps != RTMPE.Core.Protocol.CapabilityFlags.None;
+            int payloadLen = emitCaps
+                ? 33 + RTMPE.Core.Protocol.CapabilityFlagsWire.WireSize
+                : 33;
+
+            // Allocating a fresh buffer keeps the caller's
+            // `clientPublicKey` slice untouched (zeroising is the
+            // consumer's responsibility upstream).
+            var payload = new byte[payloadLen];
             Buffer.BlockCopy(clientPublicKey, 0, payload, 0, 32);
             payload[32] = (byte)preferredWireFormat;
+            if (emitCaps)
+            {
+                RTMPE.Core.Protocol.CapabilityFlagsWire.WriteLittleEndian(
+                    payload, offset: 33, clientCaps);
+            }
             return Build(PacketType.HandshakeResponse, PacketFlags.None, payload);
         }
 

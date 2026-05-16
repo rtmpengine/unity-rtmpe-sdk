@@ -636,6 +636,16 @@ namespace RTMPE.Core
                 return;
             }
 
+            // Awaiters registered via SendEnhancedRpcAsync take precedence
+            // over the per-method dispatch table: a response with a known
+            // request_id corresponds to a server-targeted Enhanced RPC, and
+            // the awaiter consumes the structured result regardless of
+            // method id.  Returns false when no awaiter is bound, in which
+            // case the method-id switch below handles legacy SDK-internal
+            // flows (e.g. TransferOwnership grant frames).
+            if (TryCompleteServerRpc(response))
+                return;
+
             switch (response.MethodId)
             {
                 case RpcMethodId.TransferOwnership:

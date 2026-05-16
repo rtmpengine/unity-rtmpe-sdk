@@ -296,7 +296,7 @@ namespace RTMPE.Core
                 try { _transport?.Disconnect(); }
                 catch (Exception ex)
                 {
-                    RtmpeLog.Warn($"[NM] Transport disconnect on timeout teardown threw: {ex.Message}");
+                    RtmpeLog.Warning($"[NM] Transport disconnect on timeout teardown threw: {ex.Message}");
                 }
                 if (_connectCoroutine != null)
                 {
@@ -397,6 +397,14 @@ namespace RTMPE.Core
             System.Threading.Interlocked.Exchange(ref _peerAdmissionAdvisoryEmitted, 0);
             _handshakeHandler?.Dispose();  // Zero key material before GC can observe it
             _handshakeHandler = null;
+            // Drop the negotiated capability bitmask alongside the rest of
+            // the per-session AEAD state.  A subsequent connect re-runs
+            // the handshake and re-derives the intersection from a fresh
+            // SessionAck; leaving the old value behind would let a
+            // reconnect that lands against a downgraded gateway keep
+            // emitting ARQ retransmits as though the prior session's caps
+            // were still in force.
+            _negotiatedPeerCaps = RTMPE.Core.Protocol.CapabilityFlags.None;
             // Reset every per-session AEAD field as a single bundled
             // operation so the all-valid-or-all-reset invariant declared
             // by SessionKeyStore is enforced from one reviewable site.
@@ -428,7 +436,19 @@ namespace RTMPE.Core
             try { Rpc.RequestIdAllocator.DropPending(); }
             catch (Exception ex)
             {
-                RtmpeLog.Warn($"[NM] RequestIdAllocator.DropPending threw on session boundary: {ex.Message}");
+                RtmpeLog.Warning($"[NM] RequestIdAllocator.DropPending threw on session boundary: {ex.Message}");
+            }
+            // Backstop for SendEnhancedRpcAsync awaiters: the cancellation
+            // path above runs through the timeout callback wired in
+            // SendEnhancedRpcAsync, but a future change that re-routes
+            // registration must not silently leak awaiters.  Calling
+            // DrainPendingServerRpcs here is idempotent — returns zero when
+            // the timeout-callback path already cleared the dictionary, and
+            // surfaces a positive count when something slipped past it.
+            try { _ = DrainPendingServerRpcs(); }
+            catch (Exception ex)
+            {
+                RtmpeLog.Warning($"[NM] DrainPendingServerRpcs threw on session boundary: {ex.Message}");
             }
             // Drain the VariableBatchManager's pending queue so a reconnect
             // does not flush stale variable updates onto the new session's
@@ -440,6 +460,13 @@ namespace RTMPE.Core
             // a future Challenge be verified against an unrelated transcript.
             _lastHandshakeInitCiphertext = null;
             LastRttMs         = -1f;
+            // Purge queued main-thread callbacks enqueued by the background
+            // receive path.  Session-bound closures (e.g. OnPacketReceived
+            // continuations, buffer-return actions) captured during the
+            // now-defunct session must not execute against the reconstituted
+            // session's state.  The dispatcher returns any rented buffers to
+            // the pool during the drain — no ArrayPool accounting leak.
+            RTMPE.Threading.MainThreadDispatcher.Instance?.DiscardPendingCallbacks();
         }
 
         // ── AEAD outbound / inbound pipeline ──────────────────────────────────
@@ -643,9 +670,19 @@ namespace RTMPE.Core
             {
                 flags |= (byte)PacketFlags.AppSequence;
             }
+            // ARQ sub-header emission requires both the local opt-in AND
+            // the gateway-advertised `CapabilityFlags.ArqAck` from the
+            // SessionAck.  Stamping the sub-header on the wire without the
+            // gateway acknowledging it would burn 4 bytes per reliable
+            // packet against no downstream consumer.  Gating both at this
+            // single decision site keeps the AAD construction below in
+            // exact lockstep with the on-wire frame.
+            bool peerSupportsArqAckForEmit =
+                (_negotiatedPeerCaps & RTMPE.Core.Protocol.CapabilityFlags.ArqAck) != 0;
             bool emitArq =
                 _settings != null
                 && _settings.EmitArqSequence
+                && peerSupportsArqAckForEmit
                 && (flags & (byte)PacketFlags.Reliable) != 0;
             bool emitGameplay =
                 _settings != null

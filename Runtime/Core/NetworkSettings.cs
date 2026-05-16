@@ -387,9 +387,24 @@ namespace RTMPE.Core
         /// </summary>
         public bool ExpectEncryptedSessionAck => _expectEncryptedSessionAck;
 
+        [Header("Reliable Delivery")]
         [SerializeField]
-        [Tooltip("If true, the SDK emits the 4-byte ARQ sequence sub-header when " +
-                 "FLAG_RELIABLE is set. Requires gateway support; activate together.")]
+        [Tooltip(
+            "If true, the SDK emits the 4-byte ARQ sequence sub-header when " +
+            "FLAG_RELIABLE is set. Requires a matching gateway build that consumes " +
+            "the sub-header — flip both sides together.\n\n" +
+            "When this setting is FALSE and a caller invokes " +
+            "NetworkManager.Send(reliable: true), the SDK silently downgrades to " +
+            "best-effort delivery (no application-layer retransmit, no DataAck). " +
+            "Lost packets on raw UDP are not recovered. A one-time Debug.LogWarning " +
+            "names the silent downgrade the first time it happens per process; " +
+            "subsequent reliable sends continue to downgrade without further " +
+            "logging.\n\n" +
+            "On KCP and WebSocket transports the underlying stream already provides " +
+            "reliability at the segment/stream layer, so leaving this setting FALSE " +
+            "is the expected configuration there — the application-layer ARQ would " +
+            "duplicate work the transport already performs. The setting matters " +
+            "most for raw-UDP deployments.")]
         private bool _emitArqSequence;
 
         /// <summary>
@@ -401,6 +416,7 @@ namespace RTMPE.Core
         /// match and packets will be dropped at the receiver.
         /// </summary>
         /// <remarks>
+        /// <para>
         /// The sub-header is independent of any reliability guarantee the
         /// underlying transport (KCP, WebSocket) already provides: KCP
         /// retransmits at the segment level and WebSocket runs over TCP, so
@@ -411,6 +427,20 @@ namespace RTMPE.Core
         /// this flag <c>false</c> keeps both endpoints on the legacy wire
         /// shape that omits the field; flipping it on requires the gateway
         /// to be running a build that consumes the sub-header.
+        /// </para>
+        /// <para>
+        /// When the flag is <c>false</c> and an application calls
+        /// <see cref="NetworkManager.Send"/> with <c>reliable: true</c>, the
+        /// SDK silently routes the packet through the best-effort path: no
+        /// retransmit entry is registered, no DataAck is expected, and a
+        /// loss on the wire is not recovered.  A one-time
+        /// <see cref="UnityEngine.Debug.LogWarning"/> surfaces this
+        /// configuration mismatch the first time it occurs per process;
+        /// the silent downgrade then continues for subsequent sends without
+        /// further log spam.  Routing the advisory through warn-once keeps
+        /// it actionable for the integrator who flipped (or forgot to flip)
+        /// the setting, while letting steady-state traffic stay quiet.
+        /// </para>
         /// </remarks>
         public bool EmitArqSequence => _emitArqSequence;
 
@@ -684,6 +714,40 @@ namespace RTMPE.Core
             // numeric scalars; the world-bounds Vector3 fields have no
             // Range support, so the finiteness guard runs here.
             EnsureFiniteWorldBoundsForRuntime();
+
+            // Pinning declared but no key supplied — every connection will fail
+            // at runtime because the SDK has nowhere to compare the server's
+            // key against.  Surface the conflict at edit time so it is
+            // caught before a device build.
+            if (requirePinnedServerPublicKey
+                && string.IsNullOrWhiteSpace(pinnedServerPublicKeyHex))
+            {
+                UnityEngine.Debug.LogError(
+                    $"[RTMPE] {name}: requirePinnedServerPublicKey is true but " +
+                    "pinnedServerPublicKeyHex is empty — every connection attempt " +
+                    "will be rejected.  Supply the 64-char hex key or disable pinning.",
+                    this);
+            }
+
+            // Ordering buffer below the architectural minimum: a single-slot
+            // buffer cannot resolve a two-packet reorder and will stall delivery.
+            if (enableGameplayOrdering && gameplayOrderingBufferSize < 2)
+            {
+                UnityEngine.Debug.LogError(
+                    $"[RTMPE] {name}: enableGameplayOrdering requires " +
+                    $"gameplayOrderingBufferSize ≥ 2 (current: {gameplayOrderingBufferSize}).",
+                    this);
+            }
+
+            // Variable batching requires at least one variable per batch;
+            // zero or negative values would produce malformed wire packets.
+            if (enableVariableBatching && maxVariablesPerBatch < 1)
+            {
+                UnityEngine.Debug.LogError(
+                    $"[RTMPE] {name}: enableVariableBatching requires " +
+                    $"maxVariablesPerBatch ≥ 1 (current: {maxVariablesPerBatch}).",
+                    this);
+            }
         }
 #endif
     }

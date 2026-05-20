@@ -366,15 +366,20 @@ namespace RTMPE.Rooms
             _configuredMaxStringBytes = maxStringBytes;
         }
 
+#if UNITY_INCLUDE_TESTS
         /// <summary>
         /// Reset the per-parser string-length cap to the package default.
         /// Test seam used by <c>[TearDown]</c> hooks that want a clean
-        /// starting state between fixtures.
+        /// starting state between fixtures.  Compiled only when
+        /// <c>UNITY_INCLUDE_TESTS</c> is defined so the shipped Player
+        /// assembly does not expose a public mutator on the parser's
+        /// process-wide string-length cap.
         /// </summary>
         public static void ResetMaxStringBytesForTests()
         {
             _configuredMaxStringBytes = DefaultMaxStringBytes;
         }
+#endif // UNITY_INCLUDE_TESTS
 
         // Strict UTF-8 decoder.  The default <see cref="Encoding.UTF8"/>
         // silently replaces malformed sequences with U+FFFD, which lets a

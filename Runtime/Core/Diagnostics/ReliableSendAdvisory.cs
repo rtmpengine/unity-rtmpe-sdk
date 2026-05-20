@@ -128,15 +128,19 @@ namespace RTMPE.Core.Diagnostics
         internal static bool WasEmitted =>
             Volatile.Read(ref _emitted) != 0;
 
+#if UNITY_INCLUDE_TESTS
         /// <summary>
         /// Resets the latch so the next <see cref="NotifyIfDowngrading"/>
         /// call that meets the downgrade predicate emits again.  Exists
         /// exclusively to let unit tests observe the first-emission code
         /// path from a clean precondition; production code must not call
-        /// this.  Not exposed through any public API surface.
+        /// this.  Compiled only when <c>UNITY_INCLUDE_TESTS</c> is defined
+        /// so the shipped Player assembly does not expose a mutator on the
+        /// process-wide emission latch.
         /// </summary>
         internal static void ResetForTests() =>
             Interlocked.Exchange(ref _emitted, 0);
+#endif // UNITY_INCLUDE_TESTS
     }
 
     /// <summary>
@@ -230,15 +234,19 @@ namespace RTMPE.Core.Diagnostics
         internal static bool WasEmitted =>
             Volatile.Read(ref _emitted) != 0;
 
+#if UNITY_INCLUDE_TESTS
         /// <summary>
         /// Resets the latch so the next
         /// <see cref="NotifyIfArqUnavailable"/> call that meets the
         /// downgrade predicate emits again.  Exists exclusively to let
         /// unit tests observe the first-emission code path from a clean
-        /// precondition; production code must not call this.  Not exposed
-        /// through any public API surface.
+        /// precondition; production code must not call this.  Compiled
+        /// only when <c>UNITY_INCLUDE_TESTS</c> is defined so the shipped
+        /// Player assembly does not expose a mutator on the process-wide
+        /// emission latch.
         /// </summary>
         internal static void ResetForTests() =>
             Interlocked.Exchange(ref _emitted, 0);
+#endif // UNITY_INCLUDE_TESTS
     }
 }

@@ -555,9 +555,11 @@ namespace RTMPE.Sync
        // ConfigureForTest allows unit tests to set the buffer parameters without
         // going through Unity serialisation.  Accessible via InternalsVisibleTo.
 
+#if UNITY_INCLUDE_TESTS
         /// <summary>
         /// Set buffer configuration without Unity Inspector serialisation.
-        /// <b>For unit tests only.</b>
+        /// <b>For unit tests only.</b>  Compiled only when
+        /// <c>UNITY_INCLUDE_TESTS</c> is defined.
         /// </summary>
         /// <param name="bufferSize">Maximum number of buffered states.</param>
         /// <param name="interpolationDelay">Seconds behind real-time to render.</param>
@@ -592,6 +594,7 @@ namespace RTMPE.Sync
                 _clockOffset     = 0.0;
             }
         }
+#endif // UNITY_INCLUDE_TESTS
 
         // Componentwise IsFinite over the position, rotation, and (when
         // enabled) scale of an inbound TransformState.  Spelled with

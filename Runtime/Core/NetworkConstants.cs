@@ -68,19 +68,20 @@ namespace RTMPE.Core
         HandshakeInit     = 0x05,   // Client → Server: [api_key_len:2 LE][api_key:N]
         Challenge         = 0x06,   // Server → Client: [ephemeral_pub:32][static_pub:32][ed25519_sig:64] = 128 B
         HandshakeResponse = 0x07,   // Client → Server: [client_pub_key:32]
-        SessionAck        = 0x08,   // Server → Client: [crypto_id:4 LE][jwt_len:2 LE][jwt:N][reconnect_len:2 LE][reconnect:N]
+        SessionAck        = 0x08,   // Server → Client: [crypto_id:4 LE][jwt_len:2 LE][jwt:N][reconnect_len:2 LE][reconnect:N][gateway_caps:4 LE?]
 
         // ── N-1: Reconnect flow ───────────────────────────────────────────────
         // Client presents a previously-issued reconnect token to resume a
-        // session without a full PSK re-authentication.  Server replies with a
-        // normal Challenge (0x06) and the rest of the flow continues as usual.
+        // session without a full PSK re-authentication.  The gateway responds
+        // with a normal Challenge (0x06) and the standard 4-step ECDH flow
+        // continues from there.
         //
-       // ReconnectInit payload: [token_len:2 LE][token:N]
+        // ReconnectInit payload: [token_len:2 LE][token:N][proof:32 optional]
         //
-       // MUST stay in sync with modules/gateway/src/packet/header.rs
+        // MUST stay in sync with modules/gateway/src/packet/header.rs
         // (PacketType::ReconnectInit = 0x09, ReconnectAck = 0x0A).
         ReconnectInit     = 0x09,   // Client → Server: resume previous session via reconnect token
-        ReconnectAck      = 0x0A,   // Reserved for future single-round-trip variant (unused today)
+        ReconnectAck      = 0x0A,   // Reserved — gateway responds with Challenge (0x06), not this opcode
 
         // ── Keep-alive ────────────────────────────────────────────────────────
         Heartbeat         = 0x03,   // Client → Server: periodic keepalive

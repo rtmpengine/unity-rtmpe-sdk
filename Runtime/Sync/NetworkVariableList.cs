@@ -528,10 +528,14 @@ namespace RTMPE.Sync
         // Test seam: per-instance override of the FullSync size cap so unit
         // tests can exercise the gate without standing up a full
         // NetworkManager + NetworkSettings asset.  Negative leaves the
-        // setting-driven default in effect.
+        // setting-driven default in effect.  The field is always present so
+        // ResolveMaxListSize stays branch-stable across builds; only the
+        // mutator is excluded from the shipped Player assembly.
         private int _testMaxListSize = -1;
 
+#if UNITY_INCLUDE_TESTS
         internal void SetMaxListSizeForTest(int max) => _testMaxListSize = max;
+#endif // UNITY_INCLUDE_TESTS
 
         private int ResolveMaxListSize()
         {

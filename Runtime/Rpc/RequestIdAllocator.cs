@@ -256,12 +256,15 @@ namespace RTMPE.Rpc
             return dropped;
         }
 
+#if UNITY_INCLUDE_TESTS
         /// <summary>
         /// Test seam: clear all pending entries without firing callbacks.
+        /// Compiled only when <c>UNITY_INCLUDE_TESTS</c> is defined.
         /// </summary>
         internal static void ResetForTest()
         {
             lock (Lock) Pending.Clear();
         }
+#endif // UNITY_INCLUDE_TESTS
     }
 }

@@ -743,11 +743,15 @@ namespace RTMPE.Threading
             }
         }
 
+#if UNITY_INCLUDE_TESTS
         // Test seam: drives the same drain path the OnDestroy hook uses so
         // edit-mode tests can assert the buffer-return handler is invoked
-        // for every queued rental.  Must remain internal — production code
-        // never invokes drain directly; the lifetime hook is authoritative.
+        // for every queued rental.  Compiled only when
+        // UNITY_INCLUDE_TESTS is defined so the shipped Player assembly
+        // exposes only the OnDestroy lifetime path, never a manual drain
+        // entry point.
         internal void DrainAndDisposeForTest() => DrainPendingBuffers();
+#endif // UNITY_INCLUDE_TESTS
 
         /// <summary>
         /// Discards all callbacks queued by the background network thread and

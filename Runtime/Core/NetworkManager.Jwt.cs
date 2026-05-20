@@ -37,12 +37,17 @@ namespace RTMPE.Core
                 .TryValidate(jwt, expectedIssuer, expectedAudience, out subject, out error);
         }
 
+#if UNITY_INCLUDE_TESTS
         // ── Test reset passthroughs ─────────────────────────────────────
+        // Wrapped in UNITY_INCLUDE_TESTS so the published runtime assembly
+        // does not carry public entry points whose only purpose is mutating
+        // the JwtValidator one-shot warning latches.
 
         internal static void ResetJwtSignatureUnverifiedWarningForTests()
             => JwtValidator.ResetSignatureUnverifiedWarningForTests();
 
         internal static void ResetJwtIssuerUnconfiguredWarningForTests()
             => JwtValidator.ResetIssuerUnconfiguredWarningForTests();
+#endif // UNITY_INCLUDE_TESTS
     }
 }

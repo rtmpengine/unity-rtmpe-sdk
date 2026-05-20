@@ -812,13 +812,18 @@ namespace RTMPE.Core
         // share the SpawnManager's monotonic clock without duplicating it.
         internal long PendingDespawnNowMillis() => NowMillis();
 
+#if UNITY_INCLUDE_TESTS
         // Test seam: lets the SpawnManagerTests force the counter to a
         // value just below the u32 ceiling so the wrap-detection branch
         // in GenerateObjectId can be exercised without 4 billion spawns.
+        // Compiled only when UNITY_INCLUDE_TESTS is defined so the
+        // shipped Player assembly carries no entry point capable of
+        // colliding the global object-id counter.
         internal void DangerousSetNextLocalIdForTest(long value)
         {
             Interlocked.Exchange(ref _nextLocalId, value);
         }
+#endif // UNITY_INCLUDE_TESTS
 
         internal bool LocalIdSpaceExhausted => _localIdSpaceExhausted;
 

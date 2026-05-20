@@ -133,16 +133,20 @@ namespace RTMPE.Core
             }
         }
 
+#if UNITY_INCLUDE_TESTS
         /// <summary>
         /// Test-only: clear the one-shot missing-instance warning latch so each
         /// test that exercises the no-manager path can assert exactly one
         /// warning regardless of preceding fixtures in the same Play Mode run.
-        /// Accessible to <c>RTMPE.SDK.Tests</c> via <c>InternalsVisibleTo</c>.
+        /// Compiled only when <c>UNITY_INCLUDE_TESTS</c> is defined so the
+        /// shipped Player assembly does not expose a mutator on a
+        /// process-wide warning latch.
         /// </summary>
         internal static void ResetMissingInstanceWarningForTests()
         {
             System.Threading.Interlocked.Exchange(ref _missingInstanceWarned, 0);
         }
+#endif // UNITY_INCLUDE_TESTS
 
         /// <summary>
         /// Non-throwing accessor for callers that want to probe for a manager

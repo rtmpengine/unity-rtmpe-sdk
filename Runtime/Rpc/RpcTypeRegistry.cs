@@ -238,11 +238,13 @@ namespace RTMPE.Rpc
             return copy;
         }
 
+#if UNITY_INCLUDE_TESTS
         /// <summary>
         /// Test-only: clear every registration and reset the scan-state
         /// flag.  NOT exposed to game code — incorrect use here would
-        /// reopen the reflection-attack surface.  Reachable from the
-        /// SDK test assembly via InternalsVisibleTo.
+        /// reopen the reflection-attack surface.  Compiled only when
+        /// <c>UNITY_INCLUDE_TESTS</c> is defined so the shipped Player
+        /// assembly cannot reach this entry point via reflection.
         /// </summary>
         internal static void ResetForTests()
         {
@@ -251,6 +253,7 @@ namespace RTMPE.Rpc
             System.Threading.Interlocked.Exchange(ref _scanState, 0);
             _allowAppDomainScan = false;
         }
+#endif // UNITY_INCLUDE_TESTS
 
         /// <summary>
         /// Look up the concrete <see cref="Type"/> previously registered

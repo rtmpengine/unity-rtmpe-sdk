@@ -3,6 +3,22 @@
 // Internal test seams + SafeRaise event multicast helpers.
 // Part of the NetworkManager partial class — see NetworkManager.cs for the
 // canonical class declaration, base type, and Unity attributes.
+//
+// Compilation gate:
+//   The internal `*ForTests` methods below are wrapped in
+//   `#if UNITY_INCLUDE_TESTS` so they compile only inside test-runner builds
+//   (Editor + Test Framework) and are STRIPPED from Player builds shipped to
+//   subscribers.  This keeps the production assembly free of any code path
+//   that exists solely to reach internal state from a fixture — reflection
+//   probes against the shipped DLL cannot land on a seam that does not exist
+//   in the published IL.
+//
+//   The Test Framework defines `UNITY_INCLUDE_TESTS` whenever the Test Runner
+//   compiles the runtime assembly to satisfy a test assembly that references
+//   it.  The test asmdef at Tests/Runtime/RTMPE.SDK.Tests.asmdef already
+//   carries the matching `defineConstraints` entry, so the symbol is set
+//   atomically with the test assembly compilation — there is no scenario in
+//   which the tests load while the seams are absent.
 
 using System;
 using System.Collections;
@@ -22,6 +38,7 @@ namespace RTMPE.Core
 {
     public sealed partial class NetworkManager
     {
+#if UNITY_INCLUDE_TESTS
         // ── Protocol-error rejection test seam ────────────────────────────────
 
         /// <summary>
@@ -141,16 +158,19 @@ namespace RTMPE.Core
                 System.Buffer.BlockCopy(payload, 0, wire, PacketProtocol.HEADER_SIZE, payload.Length);
             return wire;
         }
+#endif // UNITY_INCLUDE_TESTS
 
         // JWT signature and base64url decoding route through JwtValidator;
         // see Runtime/Core/JwtValidator.cs for the full verification surface.
 
         /// <summary>
-        /// Test-visible passthrough onto <see cref="RTMPE.Core.Protocol.PacketGates.RequiresEncryption"/>.
-        /// Existing security fixtures (Tier0SecurityTests) call this through
-        /// <c>NetworkManager.RequiresEncryption</c>; preserving the signature
-        /// keeps the test surface stable while the canonical decision table
-        /// lives in the dedicated <c>PacketGates</c> static class.
+        /// Convenience accessor onto <see cref="RTMPE.Core.Protocol.PacketGates.RequiresEncryption"/>.
+        /// Production call sites (for example
+        /// <see cref="NetworkManager.HandshakeHandlers"/>) reach the gate
+        /// through this member; the canonical decision table itself lives in
+        /// the dedicated <c>PacketGates</c> static class.  Existing security
+        /// fixtures depend on this signature, so it is retained as a stable
+        /// surface even though the body is a one-line delegation.
         /// </summary>
         internal static bool RequiresEncryption(PacketType type)
             => RTMPE.Core.Protocol.PacketGates.RequiresEncryption(type);

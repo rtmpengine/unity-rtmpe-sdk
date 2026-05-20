@@ -313,8 +313,10 @@ namespace RTMPE.Core
             return ticks * 1000L / System.Diagnostics.Stopwatch.Frequency;
         }
 
+#if UNITY_INCLUDE_TESTS
         /// <summary>
         /// Test seam: clear the outstanding set without firing callbacks.
+        /// Compiled only when <c>UNITY_INCLUDE_TESTS</c> is defined.
         /// </summary>
         internal void ResetOutstandingForTest()
         {
@@ -322,6 +324,7 @@ namespace RTMPE.Core
             _outstandingDeadlineMs.Clear();
             _outstandingExpectations.Clear();
         }
+#endif // UNITY_INCLUDE_TESTS
 
         /// <summary>
         /// Returns true when the local SDK has an outstanding ownership-

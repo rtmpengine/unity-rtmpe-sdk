@@ -45,11 +45,16 @@ namespace RTMPE.Core
             return unchecked((uint)Interlocked.Increment(ref _counter));
         }
 
-        /// <summary>Reset the counter (test-only seam).</summary>
+#if UNITY_INCLUDE_TESTS
+        /// <summary>Reset the counter (test-only seam).  Compiled only when
+        /// <c>UNITY_INCLUDE_TESTS</c> is defined so the shipped Player
+        /// assembly carries no public mutator on the gameplay-ordering
+        /// counter.</summary>
         public static void ResetForTest()
         {
             Interlocked.Exchange(ref _counter, 0);
         }
+#endif // UNITY_INCLUDE_TESTS
 
         /// <summary>
         /// Wrap <paramref name="payload"/> with the supplied gameplay sequence

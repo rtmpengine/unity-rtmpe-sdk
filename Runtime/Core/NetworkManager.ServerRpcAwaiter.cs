@@ -40,7 +40,9 @@ using RTMPE.Rpc;
 
 namespace RTMPE
 {
-    public partial class NetworkManager
+    // All partial declarations of a sealed class must carry the sealed modifier;
+    // the C# compiler enforces consistency across translation units.
+    public sealed partial class NetworkManager
     {
         /// <summary>
         /// Default deadline applied to <see cref="SendEnhancedRpcAsync"/>

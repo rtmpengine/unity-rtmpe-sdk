@@ -497,10 +497,12 @@ namespace RTMPE.Sync
             _resolvedSnapThreshold = snap;
         }
 
+#if UNITY_INCLUDE_TESTS
         /// <summary>
         /// Test seam — re-resolve the thresholds without re-spawning.  Lets a
         /// fixture mutate <see cref="NetworkSettings"/> after the component is
         /// constructed and exercise both the inherit and override paths.
+        /// Compiled only when <c>UNITY_INCLUDE_TESTS</c> is defined.
         /// </summary>
         internal void ConfigureReconcileForTest(float lerpThreshold, float snapThreshold)
         {
@@ -514,6 +516,7 @@ namespace RTMPE.Sync
 
         /// <summary>Resolved snap threshold (test seam).</summary>
         internal float ResolvedSnapThreshold => _resolvedSnapThreshold;
+#endif // UNITY_INCLUDE_TESTS
 
         /// <summary>
         /// Per-tick CSP work, driven by NetworkManager's fixed-cadence tick
@@ -800,16 +803,20 @@ namespace RTMPE.Sync
             MarkClean();
         }
 
-        /// <summary>Test seam — exposes the velocity-clamp helper without an Update tick.</summary>
+#if UNITY_INCLUDE_TESTS
+        /// <summary>Test seam — exposes the velocity-clamp helper without an Update tick.
+        /// Compiled only when <c>UNITY_INCLUDE_TESTS</c> is defined.</summary>
         internal Vector3 ClampOwnerVelocityForTest(Vector3 candidate) => ClampOwnerVelocity(candidate);
 
-        /// <summary>Test seam — primes the velocity-cap baseline.</summary>
+        /// <summary>Test seam — primes the velocity-cap baseline.
+        /// Compiled only when <c>UNITY_INCLUDE_TESTS</c> is defined.</summary>
         internal void PrimeVelocityBaselineForTest(Vector3 position, double timeUnscaled)
         {
             _lastSentPosition     = position;
             _lastSentTimeUnscaled = timeUnscaled;
             _hasLastSent          = true;
         }
+#endif // UNITY_INCLUDE_TESTS
 
         /// <summary>
         /// Phase 2.x (2026-04-25) — server-authoritative input send.

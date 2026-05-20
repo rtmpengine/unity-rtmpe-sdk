@@ -567,9 +567,13 @@ namespace RTMPE.Core
             }
         }
 
+#if UNITY_INCLUDE_TESTS
         // ── Test seams (internal) ──────────────────────────────────────────
         // Reset the AppDomain-scoped one-shot latches so a fixture can
-        // re-observe the warning. Production code never calls these.
+        // re-observe the warning.  The UNITY_INCLUDE_TESTS gate keeps these
+        // entry points out of Player builds: Production code never calls
+        // them, and a shipped DLL has no reason to expose mutators on
+        // process-wide warning state.
         internal static void ResetSignatureUnverifiedWarningForTests()
             => Interlocked.Exchange(ref s_signatureUnverifiedWarned, 0);
 
@@ -578,5 +582,6 @@ namespace RTMPE.Core
 
         internal static void ResetAudienceUnconfiguredWarningForTests()
             => Interlocked.Exchange(ref s_audienceUnconfiguredWarned, 0);
+#endif // UNITY_INCLUDE_TESTS
     }
 }

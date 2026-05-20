@@ -257,10 +257,12 @@ namespace RTMPE.Rooms
             self._visible.Remove(objectId);
         }
 
+#if UNITY_INCLUDE_TESTS
         /// <summary>
         /// Test-only seam: clear all per-object hysteresis state on the
         /// active manager so a unit test can stage deterministic enter/leave
-        /// sequences without disposing the component.
+        /// sequences without disposing the component.  Compiled only when
+        /// <c>UNITY_INCLUDE_TESTS</c> is defined.
         /// </summary>
         internal static void ResetHysteresisStateForTests()
         {
@@ -276,6 +278,7 @@ namespace RTMPE.Rooms
         /// updates in <see cref="SendCurrentPosition"/>.  Production code
         /// MUST NOT call this — it bypasses the SendPositionUpdate side
         /// effect that keeps the gateway's interest zone in sync.
+        /// Compiled only when <c>UNITY_INCLUDE_TESTS</c> is defined.
         /// </summary>
         internal void PrimeForTests(float worldX, float worldY,
                                     float receiveRadius, float hysteresisMargin)
@@ -287,6 +290,7 @@ namespace RTMPE.Rooms
             HysteresisMargin    = hysteresisMargin;
             _visible.Clear();
         }
+#endif // UNITY_INCLUDE_TESTS
 
         // ── Private state ──────────────────────────────────────────────────────
 

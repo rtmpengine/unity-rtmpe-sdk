@@ -37,25 +37,32 @@ namespace RTMPE.Sync
         public const int MaxEntries = byte.MaxValue;
 
         /// <summary>
-        /// Hard ceiling on a single legacy 0x41 entry payload inside a
-        /// batch.  The wire-format length prefix permits up to 65 535 bytes
-        /// per entry, but the SDK's largest legitimate per-object update
-        /// (16 NetworkVariableString objects each at the 65 535-byte wire
-        /// cap) sits an order of magnitude below the 16 KiB working ceiling,
-        /// and a single batch packet must in any case fit within the local
-        /// MTU + per-packet AEAD overhead.  Capping here rejects an entry
-        /// whose declared size, while structurally legal, is an
-        /// allocation-amplification surface — a 255-entry batch each
-        /// claiming 65 535 bytes would otherwise force ~16 MiB of
-        /// per-entry allocation BEFORE any inner-payload validation runs.
+        /// Working ceiling on a single legacy 0x41 entry payload inside a
+        /// batch, enforced symmetrically on both the build and parse paths.
+        /// The wire-format length prefix permits up to 65 535 bytes per
+        /// entry, but the SDK's largest legitimate per-object update sits an
+        /// order of magnitude below this 16 KiB ceiling, and a batch packet
+        /// must in any case fit within the local MTU plus per-packet AEAD
+        /// overhead.
+        ///
+        /// <para>On the parse path the cap rejects an entry whose declared
+        /// size, while structurally legal, is an allocation-amplification
+        /// surface — a 255-entry batch each claiming 65 535 bytes would
+        /// otherwise force ~16 MiB of per-entry allocation before any
+        /// inner-payload validation runs.</para>
+        ///
+        /// <para>On the build path the same cap keeps the producer from
+        /// emitting a batch that a conformant receiver would reject in
+        /// full: an over-ceiling entry is the caller's signal to send that
+        /// object's update as a standalone VariableUpdate instead.</para>
         /// </summary>
         public const int MaxEntryPayloadBytes = 16 * 1024;
 
         /// <summary>
         /// Build a batch payload over <paramref name="count"/> entries from
-        /// <paramref name="payloads"/>.  Returns the batch bytes.  Throws when
-        /// any entry exceeds <see cref="ushort.MaxValue"/> bytes (the per-
-        /// entry length prefix limit).
+        /// <paramref name="payloads"/>.  Returns the batch bytes.  Throws
+        /// <see cref="ArgumentException"/> when any entry exceeds
+        /// <see cref="MaxEntryPayloadBytes"/>.
         /// </summary>
         public static byte[] Build(byte[][] payloads, int count)
         {
@@ -85,10 +92,12 @@ namespace RTMPE.Sync
             for (int i = 0; i < count; i++)
             {
                 int len = payloads[i] != null ? payloads[i].Length : 0;
-                if (len > ushort.MaxValue)
+                if (len > MaxEntryPayloadBytes)
                     throw new ArgumentException(
-                        $"variable batch entry {i} is {len} bytes — wire-format " +
-                        "supports up to 65535 per entry.",
+                        $"variable batch entry {i} is {len} bytes — a batched entry " +
+                        $"is capped at the {MaxEntryPayloadBytes}-byte working ceiling " +
+                        "(see MaxEntryPayloadBytes); an entry above the ceiling must " +
+                        "be sent as a standalone VariableUpdate.",
                         nameof(payloads));
                 total += 2 + len; // length prefix + payload
             }

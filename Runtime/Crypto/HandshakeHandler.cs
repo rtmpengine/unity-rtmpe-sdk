@@ -338,9 +338,9 @@ namespace RTMPE.Crypto
         /// Variant of <see cref="DeriveSessionKeys(out byte[])"/> that additionally
         /// returns a 32-byte bootstrap AEAD key derived with HKDF info suffix
         /// <c>\x03</c>.  This key is used exclusively to decrypt the
-        /// <c>SessionAck</c> payload when the gateway is configured with
-        /// <c>RTMPE_ENCRYPT_SESSION_ACK=true</c> and the SDK opts in via
-        /// <see cref="Core.NetworkSettings.ExpectEncryptedSessionAck"/>.  The
+        /// <c>SessionAck</c> payload when the handshake negotiated
+        /// <see cref="Core.Protocol.CapabilityFlags.EncryptedSessionAck"/> and
+        /// the SessionAck therefore arrives sealed.  The
         /// SessionAck nonce is twelve zero bytes and the AAD is exactly
         /// <c>[0x08, 0x02]</c> (<see cref="Core.PacketType.SessionAck"/>,
         /// <see cref="Core.PacketFlags.Encrypted"/>) — see the gateway's
@@ -410,8 +410,8 @@ namespace RTMPE.Crypto
                 ipMigrationKey = HkdfSha256.Expand(prk, infoMig, 32);
 
                 // info+\x03 → SessionAck bootstrap AEAD key.  Used exclusively
-                // to decrypt the SessionAck payload when the gateway is
-                // configured with RTMPE_ENCRYPT_SESSION_ACK=true; never used
+                // to decrypt the SessionAck payload when the handshake
+                // negotiated CapabilityFlags.EncryptedSessionAck; never used
                 // for normal session traffic, so it is independent of the
                 // directional encrypt/decrypt assignment above.
                 infoAck = new byte[info.Length + 1];

@@ -78,6 +78,43 @@ namespace RTMPE.Core.Protocol
         /// expected.
         /// </summary>
         ArqAck = 1u << 0,
+
+        /// <summary>
+        /// Bit 1 — Encrypted bootstrap <see cref="PacketType.SessionAck"/>.
+        /// When the SDK advertises this bit the gateway seals the
+        /// SessionAck (0x08) payload under the ECDH-derived bootstrap key
+        /// and stamps <see cref="PacketFlags.Encrypted"/> on the header;
+        /// the SDK decrypts it with the same key before parsing
+        /// <c>crypto_id</c>, the JWT, and the reconnect token.  The
+        /// gateway advertises this bit unconditionally, so the feature
+        /// engages whenever the SDK opts in.  A peer that does not
+        /// advertise the bit receives the plaintext SessionAck,
+        /// preserving the pre-capability wire shape for legacy gateways.
+        /// </summary>
+        EncryptedSessionAck = 1u << 1,
+
+        /// <summary>
+        /// Bit 2 — Session JWT signed by the gateway's Ed25519 static
+        /// identity key.  The gateway advertises this bit when the
+        /// SessionAck JWT is signed with the same key that signs the
+        /// <see cref="PacketType.Challenge"/> transcript — the static
+        /// identity key the SDK verifies before completing ECDH.  An SDK
+        /// that observes the bit verifies the JWT's signature against that
+        /// key with no out-of-band key distribution.  How much independent
+        /// trust the check adds is bounded by the SDK's server-key pinning
+        /// mode: under strict pinning the key is an operator-pinned anchor
+        /// and the check is a genuinely independent integrity check on the
+        /// token; under trust-on-first-use or no-pinning it is only as
+        /// strong as that mode's guarantee about the Challenge key.  It is
+        /// always greater than or equal to the prior structural-only
+        /// validation.  This is a one-way gateway assertion carried in the
+        /// SessionAck <c>gateway_caps</c> tail: the SDK reads it directly and
+        /// does not advertise it back.  A gateway running an HMAC JWT keyring
+        /// does not advertise the bit, and an SDK that does not see it falls
+        /// back to structural/temporal JWT validation only — so the bit never
+        /// regresses a legacy deployment.
+        /// </summary>
+        IdentitySignedJwt = 1u << 2,
     }
 
     /// <summary>

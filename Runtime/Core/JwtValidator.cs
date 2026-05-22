@@ -17,9 +17,11 @@
 //     surface and makes the test reset hooks discoverable next to the warning
 //     emit sites they pair with.
 //   • The DTOs (JwtHeaderDto / JwtClaimsDto) and pure helpers
-//     (NormaliseAudClaim / TryDecodeBase64Url / SanitiseUntrustedForLog) move
-//     with the validator so a future audit only has to read this file to
-//     understand SessionAck token acceptance.
+//     (NormaliseAudClaim / TryDecodeBase64Url) move with the validator so a
+//     future audit only has to read this file to understand SessionAck
+//     token acceptance.  Untrusted claim values folded into a rejection
+//     message are scrubbed through the shared Diagnostics.UntrustedLogText
+//     helper.
 //
 // Threading model:
 //   • TryValidate runs on the Unity main thread (called from OnSessionAck
@@ -66,14 +68,38 @@ namespace RTMPE.Core
 
         private readonly NetworkSettings _settings;
 
-        public JwtValidator(NetworkSettings settings)
+        // When non-null, the 32-byte Ed25519 public key the JWT signature is
+        // verified against, overriding the NetworkSettings algorithm/key.
+        // Supplied by the SessionAck handler when the gateway advertised
+        // CapabilityFlags.IdentitySignedJwt: the key is the server's static
+        // identity key, already verified during the handshake Challenge.  Its
+        // value as an independent trust anchor is bounded by the server-key
+        // pinning mode (operator-pinned under strict pinning; otherwise as
+        // strong as that mode's own guarantee).
+        private readonly byte[] _identityVerificationKey;
+
+        public JwtValidator(NetworkSettings settings, byte[] identityVerificationKey = null)
         {
-            // Null is a supported configuration: a NetworkManager that has
-            // not had a NetworkSettings asset attached falls through to the
-            // secure-by-default Ed25519 algorithm and the 120-second default
-            // clock skew. Null is accepted so a minimal inspector configuration
-            // still validates tokens with secure defaults.
+            // Null `settings` is a supported configuration: a NetworkManager
+            // that has not had a NetworkSettings asset attached falls through
+            // to the secure-by-default Ed25519 algorithm and the 120-second
+            // default clock skew, so a minimal inspector configuration still
+            // validates tokens with secure defaults.
             _settings = settings;
+            _identityVerificationKey = identityVerificationKey;
+        }
+
+        /// <summary>
+        /// Lowercase-hex encoding of <paramref name="bytes"/>.  Used to feed
+        /// the identity verification key to <see cref="JwtSignatureVerifier"/>,
+        /// whose Ed25519 path accepts the key as a hex string.
+        /// </summary>
+        private static string ToHex(byte[] bytes)
+        {
+            var sb = new StringBuilder(bytes.Length * 2);
+            foreach (byte b in bytes)
+                sb.Append(b.ToString("x2"));
+            return sb.ToString();
         }
 
         // ── DTOs (private — JsonUtility binds to public fields by name) ────
@@ -165,9 +191,20 @@ namespace RTMPE.Core
             // attached we still demand a signed token.  Ed25519 mirrors the
             // serialised default on NetworkSettings so a missing settings
             // asset cannot silently downgrade verification to "None".
-            var algMode = _settings != null
-                ? _settings.jwtSignatureAlgorithm
-                : NetworkSettings.JwtSignatureAlgorithm.Ed25519;
+            // The SessionAck handler supplies the server's verified identity
+            // key when the gateway advertised CapabilityFlags.IdentitySignedJwt
+            // (the same key the SDK verified on the Challenge).  It overrides
+            // the NetworkSettings algorithm/key and forces Ed25519
+            // verification, so a deployment left at the default unverified
+            // setting is upgraded — never downgraded — once the gateway
+            // advertises identity-signed JWTs.
+            bool useIdentityKey =
+                _identityVerificationKey != null && _identityVerificationKey.Length > 0;
+            var algMode = useIdentityKey
+                ? NetworkSettings.JwtSignatureAlgorithm.Ed25519
+                : (_settings != null
+                    ? _settings.jwtSignatureAlgorithm
+                    : NetworkSettings.JwtSignatureAlgorithm.Ed25519);
 
             // RFC 8725 §3.1: reject `alg=none` (and missing alg) unconditionally,
             // regardless of pin configuration, so a misconfigured verifier cannot
@@ -207,8 +244,10 @@ namespace RTMPE.Core
                         header.alg,
                         sig,
                         signedInput,
-                        _settings?.jwtSigningKeyHex,
-                        _settings?.jwtSigningKeyPem,
+                        useIdentityKey
+                            ? ToHex(_identityVerificationKey)
+                            : _settings?.jwtSigningKeyHex,
+                        useIdentityKey ? null : _settings?.jwtSigningKeyPem,
                         out _);
                 }
                 catch (Exception)
@@ -312,7 +351,7 @@ namespace RTMPE.Core
             }
             else if (!string.Equals(dto.iss, expectedIssuer, StringComparison.Ordinal))
             {
-                error = $"JWT iss '{SanitiseUntrustedForLog(dto.iss)}' does not match expected issuer";
+                error = $"JWT iss '{Diagnostics.UntrustedLogText.Sanitise(dto.iss)}' does not match expected issuer";
                 return false;
             }
 
@@ -347,7 +386,7 @@ namespace RTMPE.Core
                     // Sanitise the untrusted aud value before embedding it in
                     // a log line: an attacker-supplied JWT could otherwise
                     // inject ANSI escape sequences or forged log delimiters.
-                    error = $"JWT aud '{SanitiseUntrustedForLog(dto.aud)}' does not match expected audience";
+                    error = $"JWT aud '{Diagnostics.UntrustedLogText.Sanitise(dto.aud)}' does not match expected audience";
                     return false;
                 }
             }
@@ -476,49 +515,6 @@ namespace RTMPE.Core
             }
         }
 
-        /// <summary>
-        /// Sanitise an attacker-controlled string before it is folded into a
-        /// log line.  JWT <c>iss</c> / <c>aud</c> claims arrive across the
-        /// wire and are echoed verbatim into the SessionAck rejection message,
-        /// which in turn lands in <see cref="UnityEngine.Debug.LogError"/>
-        /// and any downstream log aggregator (Sentry, CloudWatch, etc.).
-        /// Without scrubbing, a hostile token could embed ANSI escape sequences
-        /// to hijack a developer's terminal, line breaks to spoof log entries,
-        /// or arbitrarily large payloads to DoS the log pipeline.
-        ///
-        /// <para>The transformation is intentionally conservative:</para>
-        /// <list type="bullet">
-        ///  <item>C0 / C1 control characters (<c>\x00</c>–<c>\x1F</c>, <c>\x7F</c>) and
-        ///        the ANSI CSI introducer (<c>\x1B</c>) are replaced with
-        ///        <c>'?'</c> — the byte-for-byte original is irrecoverable but
-        ///        the visible length is preserved for debugging.</item>
-        ///  <item>The result is truncated to 128 bytes (the longest realistic
-        ///        OIDC issuer URL fits comfortably; pathological tokens that
-        ///        attempt to flood the log are clipped with a trailing
-        ///        <c>"…"</c>).</item>
-        /// </list>
-        /// </summary>
-        private static string SanitiseUntrustedForLog(string raw)
-        {
-            if (string.IsNullOrEmpty(raw)) return string.Empty;
-            const int MaxBytes = 128;
-            int copyLen = raw.Length > MaxBytes ? MaxBytes : raw.Length;
-            var sb = new StringBuilder(copyLen + 1);
-            for (int i = 0; i < copyLen; i++)
-            {
-                char c = raw[i];
-                // \x1B (ESC) is the ANSI CSI introducer; treat it the same as
-                // any other control char so a crafted iss/aud cannot rewrite
-                // the developer's terminal via colour / cursor escapes.
-                if (c < 0x20 || c == 0x7F)
-                    sb.Append('?');
-                else
-                    sb.Append(c);
-            }
-            if (raw.Length > MaxBytes) sb.Append('…');
-            return sb.ToString();
-        }
-
         // ── One-shot misconfiguration advisories ──────────────────────────
         private static void WarnSignatureUnverifiedOnce()
         {
@@ -546,9 +542,9 @@ namespace RTMPE.Core
             if (Interlocked.CompareExchange(ref s_issuerUnconfiguredWarned, 1, 0) == 0)
             {
                 Debug.LogError(
-                    "[RTMPE] NetworkSettings.jwtExpectedIssuer is empty — " +
+                    "[RTMPE] NetworkSettings.expectedJwtIssuer is empty — " +
                     "SessionAck JWT 'iss' claim is NOT being validated. " +
-                    "Production deployments MUST configure jwtExpectedIssuer " +
+                    "Production deployments MUST configure expectedJwtIssuer " +
                     "so a token minted for a different tenant cannot be " +
                     "accepted by this client.");
             }
@@ -559,9 +555,9 @@ namespace RTMPE.Core
             if (Interlocked.CompareExchange(ref s_audienceUnconfiguredWarned, 1, 0) == 0)
             {
                 Debug.LogError(
-                    "[RTMPE] NetworkSettings.jwtExpectedAudience is empty — " +
+                    "[RTMPE] NetworkSettings.expectedJwtAudience is empty — " +
                     "SessionAck JWT 'aud' claim is NOT being validated. " +
-                    "Production deployments MUST configure jwtExpectedAudience " +
+                    "Production deployments MUST configure expectedJwtAudience " +
                     "so a token minted for a different relying party cannot " +
                     "be accepted by this client.");
             }

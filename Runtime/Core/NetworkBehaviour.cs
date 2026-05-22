@@ -203,7 +203,13 @@ namespace RTMPE.Core
         /// with the matching method ID.  Called by <c>NetworkManager</c> after it
         /// resolves the target object from the registry.
         /// </summary>
-        internal void DispatchEnhancedRpc(uint methodId, object[] args)
+        /// <param name="methodId">FNV-1a method ID of the resolved RPC.</param>
+        /// <param name="wireTarget">
+        /// The <see cref="RTMPE.Rpc.RpcTarget"/> audience decoded from the
+        /// packet; checked against the method's declared audience.
+        /// </param>
+        /// <param name="args">Deserialized argument vector.</param>
+        internal void DispatchEnhancedRpc(uint methodId, RTMPE.Rpc.RpcTarget wireTarget, object[] args)
         {
             // Lifecycle gate: an RPC that lands after OnNetworkDespawn or
             // before OnNetworkSpawn has no business mutating component state.
@@ -219,17 +225,24 @@ namespace RTMPE.Core
                 return;
             }
 
-            // Future hook: when [RtmpeRpc] gains an OwnerOnly flag, gate the
-            // dispatch with `if (attr.OwnerOnly && !IsOwner) return;` here so
-            // server-replicated owner-side calls cannot be re-broadcast onto
-            // non-owner clients.  No such flag exists today; the comment is a
-            // navigation aid for the next protocol revision.
-
-            if (!RpcRegistry.TryFindMethod(GetType(), methodId, out MethodInfo method, out _))
+            if (!RpcRegistry.TryFindMethod(
+                    GetType(), methodId, out MethodInfo method, out RtmpeRpcAttribute attr))
             {
                 Debug.LogWarning(
                     $"[RTMPE] NetworkBehaviour: no [RtmpeRpc] method with id 0x{methodId:X8} " +
                     $"on {GetType().Name}. Check that the method exists and is decorated with [RtmpeRpc].");
+                return;
+            }
+
+            // Audience contract: the [RtmpeRpc] declaration is authoritative.
+            // An inbound call whose wire audience diverges from the declared
+            // audience — or that targets the server, which a client must never
+            // execute locally — is refused before any argument is bound.
+            if (!RTMPE.Rpc.EnhancedRpcVerifier.IsDispatchPermitted(attr.Target, wireTarget))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] RPC '{GetType().Name}.{method.Name}' refused: wire target " +
+                    $"{wireTarget} is not permitted for a method declared {attr.Target}.");
                 return;
             }
 

@@ -51,6 +51,24 @@ namespace RTMPE.Core
         internal const int OFFSET_FLAGS       = 4;   // 1 byte
         internal const int OFFSET_SEQUENCE    = 5;   // 4 bytes LE
         internal const int OFFSET_PAYLOAD_LEN = 9;   // 4 bytes LE
+
+        // ── Flag-bit hygiene ───────────────────────────────────────────────────
+        /// <summary>
+        /// Bitwise union of every defined <see cref="PacketFlags"/> bit.
+        /// Mirrors the gateway's <c>PacketHeader::KNOWN_FLAGS</c> in
+        /// <c>modules/gateway/src/packet/header.rs</c>: a header whose flags
+        /// byte carries any bit outside this mask is not a frame this protocol
+        /// version defines.  Must be kept in lockstep with both the
+        /// <see cref="PacketFlags"/> enum and the gateway constant whenever a
+        /// flag bit is introduced.
+        /// </summary>
+        public const byte KNOWN_FLAGS = (byte)(
+              PacketFlags.Compressed
+            | PacketFlags.Encrypted
+            | PacketFlags.Reliable
+            | PacketFlags.EnhancedRpc
+            | PacketFlags.GameplayOrdered
+            | PacketFlags.AppSequence);
     }
 
     /// <summary>

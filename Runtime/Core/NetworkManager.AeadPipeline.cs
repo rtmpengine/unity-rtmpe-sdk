@@ -523,23 +523,22 @@ namespace RTMPE.Core
             => EncryptAndSendInternal(packet, hasFixedArqSeq: false, fixedArqSeq: 0u);
 
         /// <summary>
-        /// Internal AEAD send that lets the caller pin the ARQ sequence emitted
-        /// in the wire sub-header instead of allocating a fresh one from the
-        /// outbound counter.
+        /// Internal AEAD send.  The caller pins the ARQ sequence emitted in the
+        /// wire sub-header via <paramref name="fixedArqSeq"/>.
         ///
-        /// <para>Used by <see cref="ReliableChannel"/>-driven retransmits so a
-        /// resend reuses the same `arq_seq` the receiver may already have
-        /// observed (and acknowledged) — the client cumulatively-clears its
-        /// retransmit table on any ack with `seq &gt;= entry.Sequence`, so a
-        /// late-arriving ACK for the original seq still drains the entry on
-        /// retransmit.  A fresh allocation per retry would let the receiver
-        /// see the same payload under two different sequences and would fail
-        /// the cumulative-ACK clearing logic.</para>
+        /// <para>Used both by <see cref="Send"/> for a freshly registered
+        /// reliable packet and by <see cref="ReliableChannel"/>-driven
+        /// retransmits.  A retransmit re-emits the same `arq_seq` the entry was
+        /// registered under so the receiver's cumulative-ACK clearing — which
+        /// drains every retransmit entry with `seq &lt;= ackedSeq` — recognises
+        /// a late ACK for the original sequence even after a resend.</para>
         ///
-        /// <para>When <paramref name="hasFixedArqSeq"/> is `false` the routine
-        /// behaves exactly like the historical <see cref="EncryptAndSend"/>:
-        /// allocates a fresh sequence under the
-        /// <see cref="NetworkSettings.EmitArqSequence"/> gate.</para>
+        /// <para>The ARQ sub-header is emitted only when
+        /// <paramref name="hasFixedArqSeq"/> is `true`, i.e. the packet is
+        /// registered in the retransmit table.  When it is `false` the routine
+        /// sends a single best-effort transmission and clears any FLAG_RELIABLE
+        /// bit from the wire frame, so an `arq_seq` appears on the wire exactly
+        /// when a retransmit entry backs it.</para>
         /// </summary>
         private void EncryptAndSendInternal(byte[] packet, bool hasFixedArqSeq, uint fixedArqSeq)
         {
@@ -670,20 +669,34 @@ namespace RTMPE.Core
             {
                 flags |= (byte)PacketFlags.AppSequence;
             }
-            // ARQ sub-header emission requires both the local opt-in AND
-            // the gateway-advertised `CapabilityFlags.ArqAck` from the
-            // SessionAck.  Stamping the sub-header on the wire without the
-            // gateway acknowledging it would burn 4 bytes per reliable
-            // packet against no downstream consumer.  Gating both at this
-            // single decision site keeps the AAD construction below in
-            // exact lockstep with the on-wire frame.
+            // ARQ sub-header emission is gated on four predicates that must
+            // all hold:
+            //   • the local opt-in (`NetworkSettings.EmitArqSequence`);
+            //   • the gateway-advertised `CapabilityFlags.ArqAck` from the
+            //     SessionAck — stamping the sub-header without the gateway
+            //     acknowledging it would burn 4 bytes per packet against no
+            //     downstream consumer;
+            //   • the caller-set FLAG_RELIABLE bit;
+            //   • a caller-assigned sequence (`hasFixedArqSeq`), i.e. the
+            //     packet is registered in the ReliableChannel retransmit
+            //     table.  An unregistered reliable-flagged packet has no
+            //     retransmit entry, so emitting an arq_seq for it would let
+            //     the gateway's DataAck for that sequence cumulatively clear
+            //     unrelated registered entries.  Restricting emission to
+            //     registered packets preserves the wire invariant "an
+            //     arq_seq is present exactly when a retransmit entry backs
+            //     it"; an unregistered reliable packet degrades to a single
+            //     best-effort transmission below.
+            // Gating every predicate at this single decision site keeps the
+            // AAD construction below in exact lockstep with the on-wire frame.
             bool peerSupportsArqAckForEmit =
                 (_negotiatedPeerCaps & RTMPE.Core.Protocol.CapabilityFlags.ArqAck) != 0;
             bool emitArq =
                 _settings != null
                 && _settings.EmitArqSequence
                 && peerSupportsArqAckForEmit
-                && (flags & (byte)PacketFlags.Reliable) != 0;
+                && (flags & (byte)PacketFlags.Reliable) != 0
+                && hasFixedArqSeq;
             bool emitGameplay =
                 _settings != null
                 && _settings.EmitGameplaySequencePrefix
@@ -715,17 +728,13 @@ namespace RTMPE.Core
             uint arqSeqForWire = 0u;
             if (emitArq)
             {
-                // When the caller has already registered a retransmit entry
-                // (Send(reliable: true) → TryRegisterOutbound), it passes the
-                // assigned sequence here so retransmits reuse the same
-                // value — the receiver's cumulative-ACK clearing logic
-                // depends on `arq_seq` being stable across retries.
-                // Untracked sends (no caller-side registration) fall back to
-                // a fresh allocation off the channel's outbound counter, the
-                // historical pre-ACK behaviour.
-                arqSeqForWire = hasFixedArqSeq
-                    ? fixedArqSeq
-                    : _outboundReliableChannel.AllocateOutboundSequence();
+                // emitArq implies hasFixedArqSeq (see the gate above), so the
+                // sequence is always the value ReliableChannel assigned at
+                // TryRegisterOutbound time.  A Tick-driven retransmit re-enters
+                // this path with the same fixedArqSeq, so the receiver observes
+                // a stable arq_seq across retries — its cumulative-ACK clearing
+                // relies on that stability.
+                arqSeqForWire = fixedArqSeq;
             }
             uint gameplaySeqForWire = 0u;
             if (emitGameplay)
@@ -1019,7 +1028,7 @@ namespace RTMPE.Core
             // Reassemble: header (with FLAG_ENCRYPTED stripped, payload_len
             // adjusted) followed by the decrypted plaintext.  Downstream
             // dispatch then runs as if the packet had arrived in plaintext —
-            // identical to the path taken when ExpectEncryptedSessionAck=false.
+            // identical to the path taken for an unsealed SessionAck.
             var result = new byte[PacketProtocol.HEADER_SIZE + plaintext.Length];
             Buffer.BlockCopy(data, 0, result, 0, PacketProtocol.HEADER_SIZE);
             result[PacketProtocol.OFFSET_FLAGS] =
@@ -1041,6 +1050,14 @@ namespace RTMPE.Core
             // Minimum valid encrypted packet:
             //  header(13) + SEQ_prefix(4) + Poly1305_tag(16) = 33 bytes.
             if (data == null || length < PacketProtocol.HEADER_SIZE + 4 + 16)
+                return null;
+
+            // The header's payload_len must agree with the datagram the
+            // transport delivered.  The ciphertext below is framed from
+            // `length`; a header whose declared length disagrees indicates a
+            // corrupt or mis-framed packet, and is refused here before any
+            // sub-header offset arithmetic consumes it.
+            if (!RTMPE.Protocol.PacketParser.HeaderPayloadLengthMatchesFrame(data, length))
                 return null;
 
             // ── 1. Read nonce counter from header.sequence ───────────────────────

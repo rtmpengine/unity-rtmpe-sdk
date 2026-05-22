@@ -360,32 +360,17 @@ namespace RTMPE.Core
 
         // ── Forward-compat protocol toggles ────────────────────────────────────
         //
-        // The three toggles below gate features whose gateway counterpart is
-        // either in flight or behind an environment variable.  Each toggle is
-        // OFF by default so existing deployments are unaffected; enabling any
-        // of them on the SDK without the matching gateway support causes
-        // handshake failure or AEAD authentication failure (a hostile or
-        // mismatched gateway cannot abuse a customer who has not opted in).
+        // The two toggles below gate the ARQ sub-header features whose gateway
+        // counterpart is behind an environment variable / capability bit.
+        // Each toggle is OFF by default so existing deployments are
+        // unaffected.  The SDK mirrors the active toggles onto its
+        // CapabilityFlags advertisement during the handshake, so the
+        // negotiated session set never claims a feature the local side will
+        // not honour.
         //
-        // Customers MUST flip these in lock-step with the gateway operator —
-        // there is no negotiation handshake; the wire format diverges silently
-        // when only one side opts in.
-
-        [Header("Forward-compat Protocol")]
-        [SerializeField]
-        [Tooltip("If true, the SDK expects the gateway to encrypt SessionAck under " +
-                 "the ECDH-derived key. Must match the gateway's RTMPE_ENCRYPT_SESSION_ACK " +
-                 "setting; mismatched configurations cause handshake failure.")]
-        private bool _expectEncryptedSessionAck;
-
-        /// <summary>
-        /// When true, the SDK decrypts the inbound SessionAck payload under the
-        /// ECDH-derived bootstrap key (HKDF info suffix <c>\x03</c>).  Must be
-        /// flipped together with the gateway's <c>RTMPE_ENCRYPT_SESSION_ACK</c>
-        /// environment variable; otherwise the handshake terminates with an
-        /// AEAD-authentication failure.
-        /// </summary>
-        public bool ExpectEncryptedSessionAck => _expectEncryptedSessionAck;
+        // SessionAck bootstrap encryption is NOT a toggle here: it is
+        // negotiated automatically via CapabilityFlags.EncryptedSessionAck,
+        // which the SDK always advertises and the gateway always offers.
 
         [Header("Reliable Delivery")]
         [SerializeField]
@@ -604,23 +589,28 @@ namespace RTMPE.Core
             RsaPkcs1Sha256 = 2,
         }
 
-        [Header("PRODUCTION SECURITY — set this to a real algorithm before shipping")]
+        [Header("Server JWT signature verification")]
         [Tooltip(
-            "JWS signing algorithm of the pinned key. The default value of None " +
-            "is preserved for backwards compatibility with existing projects, but " +
-            "production deployments MUST configure a real algorithm — leaving this " +
-            "at None means the SessionAck JWT is accepted on structure + temporal + " +
-            "iss/aud checks alone, which lets a hostile gateway install attacker-" +
-            "chosen session_id / reconnect_token / crypto_id values into the client. " +
-            "A LogError (not just a warning) is emitted at the first SessionAck so " +
-            "the gap is visible in CI logs. Ed25519 (EdDSA) is recommended for new " +
-            "deployments — 32-byte hex key, no PKI ceremony. RS256 is supported for " +
-            "compatibility with existing IdP infrastructure.")]
-        // Default value preserves backwards compatibility; production deployments
-        // must set this to a real signature algorithm or accept the documented
-        // risk.  The escalated LogError at first use makes the gap impossible to
-        // miss in CI logs while keeping the field's serialised default unchanged.
-        public JwtSignatureAlgorithm jwtSignatureAlgorithm = JwtSignatureAlgorithm.None;
+            "JWS algorithm the SessionAck JWT signature is verified against. " +
+            "Ed25519 (EdDSA) is the default and matches the algorithm the gateway " +
+            "uses to sign tokens with its identity key: a gateway that advertises " +
+            "the IdentitySignedJwt capability delivers that key during the " +
+            "handshake, so the standard deployment verifies signatures with no key " +
+            "configuration. Set jwtSigningKeyHex when verifying against a gateway " +
+            "that does not advertise the capability. RS256 is available for " +
+            "integration with existing IdP infrastructure. None disables signature " +
+            "verification — the SessionAck JWT is then accepted on structure, " +
+            "temporal, and iss/aud checks alone, which lets a hostile gateway " +
+            "install attacker-chosen session_id / reconnect_token / crypto_id " +
+            "values; selecting None emits a LogError at the first SessionAck so the " +
+            "choice is visible in CI logs.")]
+        // Ed25519 is the secure default: the gateway signs SessionAck JWTs with its
+        // Ed25519 identity key, and the IdentitySignedJwt capability delivers that
+        // key to the client during the handshake, so the standard deployment
+        // verifies signatures without any key configuration. None stays available
+        // as an explicit opt-out for integrators who accept the documented risk;
+        // JwtValidator escalates a LogError when it is selected.
+        public JwtSignatureAlgorithm jwtSignatureAlgorithm = JwtSignatureAlgorithm.Ed25519;
 
         [Tooltip(
             "64-character lowercase hex string of the 32-byte Ed25519 public key " +
@@ -715,17 +705,21 @@ namespace RTMPE.Core
             // Range support, so the finiteness guard runs here.
             EnsureFiniteWorldBoundsForRuntime();
 
-            // Pinning declared but no key supplied — every connection will fail
-            // at runtime because the SDK has nowhere to compare the server's
-            // key against.  Surface the conflict at edit time so it is
-            // caught before a device build.
-            if (requirePinnedServerPublicKey
-                && string.IsNullOrWhiteSpace(pinnedServerPublicKeyHex))
+            // Strict pinning declared but no key supplied — every connection
+            // will fail at runtime because the SDK has nowhere to compare the
+            // server's key against.  EffectivePinningMode folds the legacy
+            // requirePinnedServerPublicKey flag into the enum, so this single
+            // check covers both the enum default (Strict) and the legacy
+            // boolean.  Surface the conflict at edit time so it is caught
+            // before a device build.
+            if (ServerKeyPinning.StrictModeRequiresPinButNoneConfigured(
+                    EffectivePinningMode, pinnedServerPublicKeyHex))
             {
                 UnityEngine.Debug.LogError(
-                    $"[RTMPE] {name}: requirePinnedServerPublicKey is true but " +
+                    $"[RTMPE] {name}: server pinning is Strict but " +
                     "pinnedServerPublicKeyHex is empty — every connection attempt " +
-                    "will be rejected.  Supply the 64-char hex key or disable pinning.",
+                    "will be rejected.  Supply the 64-char hex key, or select a " +
+                    "non-Strict ServerPinningMode.",
                     this);
             }
 

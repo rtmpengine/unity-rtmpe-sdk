@@ -44,6 +44,8 @@ namespace RTMPE.Core.Protocol
         BadMagic,
         /// <summary>Version byte at <see cref="PacketProtocol.OFFSET_VERSION"/> does not equal <see cref="PacketProtocol.VERSION"/>.</summary>
         UnsupportedVersion,
+        /// <summary>Flags byte at <see cref="PacketProtocol.OFFSET_FLAGS"/> carries a bit outside <see cref="PacketProtocol.KNOWN_FLAGS"/>.</summary>
+        MalformedFlags,
     }
 
     internal static class PacketGates
@@ -58,11 +60,13 @@ namespace RTMPE.Core.Protocol
         /// derived ChaCha20-Poly1305 key or it could be forged by an
         /// off-path attacker who only sees the wire.
         ///
-        /// <para><c>SessionAck</c> is a special case — its bootstrap
-        /// encryption is opt-in via <c>NetworkSettings.ExpectEncryptedSessionAck</c>,
-        /// so the live caller must override this verdict against the runtime
-        /// setting.  This function reflects the static, settings-blind
-        /// answer.</para>
+        /// <para><c>SessionAck</c> is excluded from the mandatory-encryption
+        /// set: it is the bootstrap envelope and never travels under the
+        /// session AEAD key (it carries the <c>crypto_id</c> that key
+        /// depends on).  Its confidentiality is instead a negotiated
+        /// property of the handshake — <see cref="CapabilityFlags.EncryptedSessionAck"/>
+        /// — sealed under a one-time ECDH-derived key and verified by the
+        /// SessionAck handler against the gateway's advertised caps.</para>
         /// </summary>
         public static bool RequiresEncryption(PacketType type)
         {
@@ -76,6 +80,9 @@ namespace RTMPE.Core.Protocol
                 case PacketType.HandshakeResponse:
                 case PacketType.ReconnectInit:
                 case PacketType.ReconnectAck:
+                // SessionAck — bootstrap envelope; negotiated encryption,
+                // never the session AEAD key.
+                case PacketType.SessionAck:
                     return false;
 
                 // Everything else carries session-bound semantics.
@@ -147,6 +154,14 @@ namespace RTMPE.Core.Protocol
 
             if (data[PacketProtocol.OFFSET_VERSION] != PacketProtocol.VERSION)
                 return HeaderValidationResult.UnsupportedVersion;
+
+            // Refuse a header whose flags byte carries an undefined bit.  The
+            // gateway only ever emits bits within KNOWN_FLAGS, so a frame with
+            // an out-of-set bit is corrupt, tampered, or from a protocol
+            // version this build does not implement — rejecting it before
+            // dispatch keeps an undefined bit from steering any later branch.
+            if ((data[PacketProtocol.OFFSET_FLAGS] & ~PacketProtocol.KNOWN_FLAGS) != 0)
+                return HeaderValidationResult.MalformedFlags;
 
             type         = (PacketType)data[PacketProtocol.OFFSET_TYPE];
             wasEncrypted = (data[PacketProtocol.OFFSET_FLAGS]

@@ -1,7 +1,9 @@
 // RTMPE SDK — Runtime/Infrastructure/Transport/NetworkTransport.cs
 //
 // Abstract base for all network transports.
-// Current implementations: UdpTransport, KcpTransport.
+// The concrete transport shipped with this package is UdpTransport.  KCP,
+// WebSocket, and WebGL transports are integrator-supplied and registered
+// through NetworkManager.SetTransportFactory.
 //
 // All methods are invoked from the RTMPE background network thread and must
 // be internally thread-safe. Do NOT call Unity APIs from implementations.
@@ -11,8 +13,11 @@ using System;
 namespace RTMPE.Transport
 {
     /// <summary>
-    /// Abstract base class for RTMPE network transports.
-    /// Provides a unified socket interface across UDP and KCP transports.
+    /// Abstract base class for RTMPE network transports.  Defines the unified
+    /// socket interface the background network thread drives.
+    /// <see cref="UdpTransport"/> is the concrete implementation shipped with
+    /// this package; integrators may register an alternative transport (KCP,
+    /// WebSocket, WebGL) through <c>NetworkManager.SetTransportFactory</c>.
     /// </summary>
     public abstract class NetworkTransport : IDisposable
     {

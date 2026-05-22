@@ -78,6 +78,16 @@ namespace RTMPE.Sync
                  "NetworkTransform._syncScale = false.")]
         [SerializeField] private bool _interpolateScale = false;
 
+        [Tooltip("Speed ceiling (world units / second) for an inbound non-owner " +
+                 "snapshot.  A snapshot whose position jumps further than this " +
+                 "ceiling allows over the interval since the previous snapshot " +
+                 "is pulled back along the line to the previous position, so a " +
+                 "peer streaming teleported coordinates is walked toward the " +
+                 "claimed point at the ceiling instead of snapping there on " +
+                 "every observer's screen.  Set to 0 to disable the gate for " +
+                 "projects whose remote objects legitimately exceed the ceiling.")]
+        [SerializeField] private float _maxInterpolatedSpeed = 100f;
+
         [Tooltip("Maximum accepted skew (seconds) into the future relative to " +
                  "the local clock.  Defends the interpolator against a hostile " +
                  "or buggy sender that puts double.MaxValue (or any far-future " +
@@ -113,6 +123,28 @@ namespace RTMPE.Sync
         // smaller timestamp are discarded to maintain chronological buffer order
         // despite out-of-order UDP delivery or duplicate packets.
         private double _latestTimestamp = double.MinValue;
+
+        // Position and receive-domain timestamp of the most recently buffered
+        // snapshot, retained as the reference point for the per-update
+        // displacement gate (see GateMotion / RemoteMotionGate).  _hasGateState
+        // is false until the first snapshot is buffered, because the first
+        // snapshot has no predecessor to measure a step against.
+        private Vector3 _lastGatePosition;
+        private double  _lastGateTimestamp;
+        private bool    _hasGateState;
+
+        // Minimum permitted per-update displacement (world units), independent
+        // of the elapsed interval.  Absorbs transform-quantization noise and
+        // the degenerate two-snapshots-one-timestamp case so the gate never
+        // clamps a legitimately stationary or near-stationary object.
+        private const float MotionGateStepFloorUnits = 0.5f;
+
+        // Upper bound on the inter-snapshot interval that feeds the
+        // displacement budget.  Beyond a gap this long the object's true
+        // position cannot be recovered by interpolation regardless; capping
+        // the interval here stops a peer from withholding snapshots to bank
+        // an arbitrarily large budget and then cashing it in for one jump.
+        private const double MotionGateMaxIntervalSeconds = 0.5;
 
         // ── Sender-clock alignment ─────────────────────────────────────────────
         //
@@ -252,6 +284,13 @@ namespace RTMPE.Sync
                 // Discard out-of-order and duplicate states — only strictly newer
                 // timestamps advance the ring buffer.
                 if (timestamp <= _latestTimestamp) return;
+
+                // Bound an implausible position jump before the snapshot enters
+                // the buffer: a peer streaming teleported coordinates is walked
+                // toward the claimed position at the configured speed ceiling
+                // rather than snapping there on every observer's screen.
+                state = GateMotion(state, timestamp);
+
                 _latestTimestamp = timestamp;
 
                 // Fill the backing list to capacity on initial population, then
@@ -277,7 +316,39 @@ namespace RTMPE.Sync
                         _bracketCursor = _bracketCursor > 0 ? _bracketCursor - 1 : 0;
                     }
                 }
+
+                // Record the accepted (post-gate) position as the reference
+                // point for the next snapshot's displacement check.
+                _lastGatePosition  = state.Position;
+                _lastGateTimestamp = timestamp;
+                _hasGateState      = true;
             }
+        }
+
+        // Clamp the candidate snapshot's position against an implausible
+        // per-update jump, measured from the most recently buffered snapshot.
+        // A non-positive _maxInterpolatedSpeed disables the gate; the first
+        // snapshot has no predecessor and is accepted verbatim.  The caller
+        // holds _syncRoot.
+        private TransformState GateMotion(TransformState candidate, double timestamp)
+        {
+            if (_maxInterpolatedSpeed <= 0f || !_hasGateState)
+                return candidate;
+
+            // Cap the interval feeding the displacement budget.  Without the
+            // cap, a peer that withholds snapshots accrues an unbounded budget
+            // (budget grows with the gap) and can then cash it in for a single
+            // long jump; the cap bounds the budget to one MaxInterval window.
+            double dt = timestamp - _lastGateTimestamp;
+            if (dt > MotionGateMaxIntervalSeconds) dt = MotionGateMaxIntervalSeconds;
+
+            candidate.Position = RemoteMotionGate.ClampPositionStep(
+                _lastGatePosition,
+                candidate.Position,
+                dt,
+                _maxInterpolatedSpeed,
+                MotionGateStepFloorUnits);
+            return candidate;
         }
 
         /// <summary>
@@ -371,6 +442,11 @@ namespace RTMPE.Sync
                     || timestamp - UnityEngine.Time.timeAsDouble > _maxFutureSkewSeconds)
                     return;
 
+                // Bound an implausible position jump before the snapshot
+                // enters the buffer — identical displacement gate as the
+                // receiver-clock AddState path.
+                state = GateMotion(state, timestamp);
+
                 // Track the highest stored timestamp so a later receiver-clock
                 // AddState() call (mixed-mode integration) cannot insert an
                 // older state in front of the sender-tick ordering.
@@ -389,6 +465,12 @@ namespace RTMPE.Sync
                         _bracketCursor = _bracketCursor > 0 ? _bracketCursor - 1 : 0;
                     }
                 }
+
+                // Record the accepted (post-gate) position as the reference
+                // point for the next snapshot's displacement check.
+                _lastGatePosition  = state.Position;
+                _lastGateTimestamp = timestamp;
+                _hasGateState      = true;
             }
         }
 
@@ -568,7 +650,8 @@ namespace RTMPE.Sync
             int    bufferSize             = 10,
             float  interpolationDelay     = 0.1f,
             bool   interpolateScale       = false,
-            double maxFutureSkewSeconds   = 10.0)
+            double maxFutureSkewSeconds   = 10.0,
+            float  maxInterpolatedSpeed   = 100f)
         {
             lock (_syncRoot)
             {
@@ -576,9 +659,16 @@ namespace RTMPE.Sync
                 _interpolationDelay     = interpolationDelay;
                 _interpolateScale       = interpolateScale;
                 _maxFutureSkewSeconds   = maxFutureSkewSeconds;
+                _maxInterpolatedSpeed   = maxInterpolatedSpeed;
                 // Reset ring-buffer state for a consistent starting condition.
                 _buffer.Clear();
                 _head = 0;
+                // Displacement-gate reference state: a fresh fixture must start
+                // without an inherited previous position so the first snapshot
+                // is accepted verbatim.
+                _lastGatePosition  = default;
+                _lastGateTimestamp = 0.0;
+                _hasGateState      = false;
                 // Reset the high-water timestamp so subsequent AddState calls
                 // with small timestamps (test vectors) are not silently dropped.
                 _latestTimestamp = double.MinValue;

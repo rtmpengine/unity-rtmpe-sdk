@@ -9,7 +9,6 @@
 using System;
 using System.Text;
 using UnityEngine;
-using RTMPE.Infrastructure.Serialization;
 
 namespace RTMPE.Core
 {
@@ -92,7 +91,7 @@ namespace RTMPE.Core
             {
                 try
                 {
-                    owner = SafeFlatBufferAccessors.DecodeStrictUtf8(payload, o, ownerLen);
+                    owner = DecodeStrictUtf8(payload, o, ownerLen);
                 }
                 catch (Exception)
                 {
@@ -223,6 +222,30 @@ namespace RTMPE.Core
                      | (buf[offset + 3] << 24);
             offset += 4;
             return BitConverter.Int32BitsToSingle(bits);
+        }
+
+        // Strict UTF-8 codec — the default Encoding.UTF8 silently substitutes
+        // U+FFFD for a malformed byte sequence, which would turn an
+        // attacker-corruptible owner identifier into a string that compares
+        // unequal to a legitimate UUID yet still passes a non-empty check.
+        private static readonly UTF8Encoding StrictUtf8 =
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+        // Decode a slice of <paramref name="bytes"/> as UTF-8 with strict
+        // validation.  Throws DecoderFallbackException for any malformed byte
+        // sequence and InvalidOperationException for an embedded NUL — the
+        // caller treats either as a malformed payload.
+        private static string DecodeStrictUtf8(byte[] bytes, int offset, int length)
+        {
+            if (bytes == null) throw new ArgumentNullException(nameof(bytes));
+            if (offset < 0 || length < 0 || offset > bytes.Length - length)
+                throw new ArgumentOutOfRangeException(nameof(offset));
+            for (int i = 0; i < length; i++)
+            {
+                if (bytes[offset + i] == 0)
+                    throw new InvalidOperationException("string contains embedded NUL");
+            }
+            return StrictUtf8.GetString(bytes, offset, length);
         }
     }
 }

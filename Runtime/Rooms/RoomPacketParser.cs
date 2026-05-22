@@ -94,12 +94,35 @@ namespace RTMPE.Rooms
             out string    localPlayerId,
             out string    error)
         {
-            ok            = false;
-            roomId        = null;
-            roomCode      = null;
-            maxPlayers    = 0;
-            localPlayerId = string.Empty;
-            error         = null;
+            return ParseCreateRoomResponse(
+                payload, out ok, out roomId, out roomCode, out maxPlayers,
+                out localPlayerId, out _, out error);
+        }
+
+        /// <summary>
+        /// Parse a <c>RoomCreate</c> (0x20) response payload, extracting the
+        /// local player UUID (v3.1+) and the echoed correlation id (v4.0+).
+        /// Both fields are optional — old gateways that omit them leave
+        /// <paramref name="localPlayerId"/> empty and
+        /// <paramref name="echoedRequestId"/> null.
+        /// </summary>
+        internal static bool ParseCreateRoomResponse(
+            byte[] payload,
+            out bool      ok,
+            out string    roomId,
+            out string    roomCode,
+            out int       maxPlayers,
+            out string    localPlayerId,
+            out Guid?     echoedRequestId,
+            out string    error)
+        {
+            ok              = false;
+            roomId          = null;
+            roomCode        = null;
+            maxPlayers      = 0;
+            localPlayerId   = string.Empty;
+            echoedRequestId = null;
+            error           = null;
 
             if (payload == null || payload.Length < 1) return false;
 
@@ -115,9 +138,27 @@ namespace RTMPE.Rooms
                 maxPlayers = payload[offset++];
 
                 // [local_player_id_len:2][local_player_id:N]  — v3.1+ optional field
-                // Gracefully omit when server doesn't send it (old gateway).
                 if (offset < payload.Length)
                     TryReadString(payload, ref offset, out localPlayerId);
+
+                // [echoed_request_id_len:2][echoed_request_id:32 hex]  — v4.0+ optional echo
+                // Exactly 32 hex chars (GUID "N" format) is the expected form.
+                // Roll back the offset on any parse anomaly so trailing garbage
+                // does not cause the overall parse to fail.
+                if (offset < payload.Length)
+                {
+                    int savedOffset = offset;
+                    if (TryReadString(payload, ref offset, out string reqIdStr)
+                        && reqIdStr != null && reqIdStr.Length == 32
+                        && Guid.TryParseExact(reqIdStr, "N", out Guid parsed))
+                    {
+                        echoedRequestId = parsed;
+                    }
+                    else
+                    {
+                        offset = savedOffset;
+                    }
+                }
 
                 return true;
             }

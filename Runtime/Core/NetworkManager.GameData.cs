@@ -467,10 +467,15 @@ namespace RTMPE.Core
 
             var packet = _packetBuilder.Build(
                 PacketType.VariableUpdate,
-                PacketFlags.Reliable,  // variable updates need guaranteed delivery
+                PacketFlags.Reliable,
                 payload, payloadLength);
 
-            EncryptAndSend(packet);
+            // Hand the packet to the reliable send path so it is registered
+            // in the ReliableChannel retransmit table and re-emitted on RTO
+            // expiry until the gateway acknowledges it.  When the ARQ wire
+            // extension is not negotiated the same call degrades to a single
+            // best-effort transmission, matching the historical semantics.
+            Send(packet, reliable: true);
         }
 
         /// <summary>
@@ -495,7 +500,11 @@ namespace RTMPE.Core
                 PacketFlags.Reliable,
                 payload, payloadLength);
 
-            EncryptAndSend(packet);
+            // Coalesced variable batches share the per-object update's
+            // delivery contract: route through the reliable send path for
+            // retransmit-table registration, degrading to best-effort when
+            // the ARQ wire extension is not negotiated.
+            Send(packet, reliable: true);
         }
 
         // ── Position update send path (Feature #6 — Interest Management) ───

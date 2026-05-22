@@ -61,6 +61,44 @@ namespace RTMPE.Protocol
             System.Threading.Interlocked.Read(ref _droppedHeaderInvalidCount);
 
         /// <summary>
+        /// Verify that the 13-byte header's <c>payload_len</c> field agrees
+        /// with the physical frame size the transport delivered.
+        ///
+        /// <para>By the wire convention a packet carries
+        /// <c>payload_len = frameLength − HEADER_SIZE</c> — the gateway's
+        /// serializer sets it to the sub-header region plus the ciphertext.
+        /// The encrypted receive path frames the ciphertext from the
+        /// transport-supplied length; cross-checking the header field rejects
+        /// a frame whose declared length disagrees with the bytes actually
+        /// delivered, before that length drives any slice arithmetic.</para>
+        /// </summary>
+        /// <param name="packet">The full wire packet (header + payload).</param>
+        /// <param name="frameLength">
+        /// Meaningful byte count of <paramref name="packet"/> as reported by
+        /// the transport.  May be shorter than <c>packet.Length</c> when the
+        /// buffer is rented from a pool.
+        /// </param>
+        /// <returns>
+        /// <see langword="true"/> when the header's declared length matches the
+        /// frame; <see langword="false"/> for a null, short, or inconsistent packet.
+        /// </returns>
+        public static bool HeaderPayloadLengthMatchesFrame(byte[] packet, int frameLength)
+        {
+            if (packet == null
+                || frameLength < PacketProtocol.HEADER_SIZE
+                || frameLength > packet.Length)
+                return false;
+
+            uint declared =
+                  (uint) packet[PacketProtocol.OFFSET_PAYLOAD_LEN]
+                | ((uint) packet[PacketProtocol.OFFSET_PAYLOAD_LEN + 1] <<  8)
+                | ((uint) packet[PacketProtocol.OFFSET_PAYLOAD_LEN + 2] << 16)
+                | ((uint) packet[PacketProtocol.OFFSET_PAYLOAD_LEN + 3] << 24);
+
+            return declared == (uint)(frameLength - PacketProtocol.HEADER_SIZE);
+        }
+
+        /// <summary>
         /// Extract the payload bytes from a full wire packet (header + payload).
         /// Returns an empty array if the packet is too short.
         /// </summary>

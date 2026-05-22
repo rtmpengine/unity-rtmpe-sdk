@@ -102,6 +102,29 @@ namespace RTMPE.Crypto
         }
 
         /// <summary>
+        /// True when the pinning configuration mandates an operator-supplied
+        /// pin but none is present — <see cref="ServerPinningMode.Strict"/>
+        /// with an empty or whitespace <c>pinnedServerPublicKeyHex</c>.
+        ///
+        /// <para>Under this configuration the handshake is refused at runtime:
+        /// Strict mode has no key to compare the server's static key against
+        /// (the <see cref="PinDecision.RefuseStrictNoPin"/> outcome).  Surfacing the
+        /// predicate lets the editor report it as a configuration warning
+        /// instead of leaving it to be discovered as a silent connection
+        /// failure on-device.</para>
+        /// </summary>
+        /// <param name="effectiveMode">
+        /// The effective pinning mode.  <c>NetworkSettings.EffectivePinningMode</c>
+        /// already folds the legacy require-pin flag into the enum, so passing
+        /// it covers both the enum and the legacy boolean.
+        /// </param>
+        /// <param name="pinnedKeyHex">The configured pin, possibly empty.</param>
+        public static bool StrictModeRequiresPinButNoneConfigured(
+            ServerPinningMode effectiveMode, string pinnedKeyHex)
+            => effectiveMode == ServerPinningMode.Strict
+               && string.IsNullOrWhiteSpace(pinnedKeyHex);
+
+        /// <summary>
         /// Decide which pin (if any) to enforce for the upcoming Challenge.
         /// </summary>
         /// <param name="mode">Configured pinning mode.</param>

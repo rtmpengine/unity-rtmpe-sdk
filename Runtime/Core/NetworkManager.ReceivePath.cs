@@ -420,7 +420,7 @@ namespace RTMPE.Core
                 return;
             }
 
-            nb.DispatchEnhancedRpc(req.MethodId, req.Args);
+            nb.DispatchEnhancedRpc(req.MethodId, req.Target, req.Args);
         }
 
         /// <summary>
@@ -532,7 +532,7 @@ namespace RTMPE.Core
                     // cannot abort the rest of the replay.
                     try
                     {
-                        nb.DispatchEnhancedRpc(request.MethodId, request.Args);
+                        nb.DispatchEnhancedRpc(request.MethodId, request.Target, request.Args);
                     }
                     catch (Exception ex)
                     {

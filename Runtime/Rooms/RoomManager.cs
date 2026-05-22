@@ -60,21 +60,20 @@ namespace RTMPE.Rooms
         //     swept on every CreateRoom and on ClearState — bounded growth.
         //
         // Wire-protocol coordination point:
-        //   The current RoomCreate (0x20) request payload defined in
-        //   RoomPacketBuilder does NOT carry the request_id, and the response
-        //   parser in RoomPacketParser does not extract it.  Promoting this
-        //   correlator from "client-side defence-in-depth + FIFO fallback" to
-        //   "true ID-based matching" requires:
-        //     (a) Prefixing BuildCreateRoomPayload with [request_id_len:2 LE]
-        //         [request_id:16 bytes] (raw GUID bytes; or 36-byte UTF-8 form).
-        //     (b) Gateway echoes the same bytes verbatim in the response after
-        //         the existing fields.
-        //     (c) ParseCreateRoomResponse extends to surface the echoed id.
-        //   Step (a)/(c) live in RoomPacketBuilder/Parser; step (b) is
-        //   gateway-side.  Until those land, FIFO is the operative match path
-        //   and the per-id bookkeeping here is a future-proof scaffold and a
-        //   useful debugging aid (logged via OnRoomError when stale entries
-        //   are evicted).
+        //   The RoomCreate (0x20) request payload appends an optional correlation
+        //   trailer — [request_id_len:2 LE][request_id:32 ASCII hex] — so that a
+        //   v4.0+ gateway can echo the id in its response.  The response parser
+        //   surfaces the echoed value as an optional field; when present, TryMatch
+        //   resolves by id directly (race-proof); when absent (pre-v4.0 gateway),
+        //   FIFO fallback applies automatically.
+        //     (a) SDK request side: BuildCreateRoomPayload appends the trailer.
+        //     (b) Gateway response side: echo of the request_id field — pending
+        //         deployment of the v4.0 gateway build.
+        //     (c) SDK response side: ParseCreateRoomResponse surfaces the echoed id.
+        //   Steps (a) and (c) are complete; step (b) activates id-based correlation
+        //   end-to-end once the v4.0 gateway is deployed.  In the interim FIFO
+        //   remains the operative match path — bounded, correct, and swept on every
+        //   CreateRoom call and on ClearState.
         private readonly PendingCreateTable<CreateRoomOptions> _pendingCreates =
             new PendingCreateTable<CreateRoomOptions>(
                 capacity: MaxPendingCreates,
@@ -251,7 +250,11 @@ namespace RTMPE.Rooms
             var opts      = options ?? new CreateRoomOptions();
             var requestId = _pendingCreates.Register(opts, nowTicks);
 
-            var payload = RoomPacketBuilder.BuildCreateRoomPayload(opts);
+            // Pass the registered id to the builder so it is included in the
+            // wire payload.  A v4.0+ gateway echoes it back in the response,
+            // enabling race-proof id-based correlation; legacy gateways ignore
+            // the trailing field and the FIFO fallback path remains active.
+            var payload = RoomPacketBuilder.BuildCreateRoomPayload(opts, requestId);
             var packet  = _packetBuilder.Build(PacketType.RoomCreate, PacketFlags.Reliable, payload);
             _sendOwned(packet);
         }
@@ -598,7 +601,7 @@ namespace RTMPE.Rooms
             if (!RoomPacketParser.ParseCreateRoomResponse(
                     payload, out bool ok, out string roomId,
                     out string roomCode, out int maxPlayers,
-                    out string localPlayerId, out string error))
+                    out string localPlayerId, out Guid? echoedRequestId, out string error))
             {
                 Debug.LogWarning("[RTMPE] RoomManager: malformed RoomCreate response.");
                 return;
@@ -606,14 +609,13 @@ namespace RTMPE.Rooms
 
             if (ok)
             {
-                // Match by echoed request_id when present; FIFO fallback when not
-                // (current gateway omits the field — see wire-protocol coordination
-                // note above).  When the response cannot be matched at all we
-                // synthesize default options rather than dropping the response —
-                // the room metadata in the response is authoritative; only the
-                // client-supplied IsPublic/Name view is reconstructed.
+                // Match by the echoed request_id when the v4.0+ gateway includes it;
+                // FIFO fallback for legacy gateways that omit it.  When the response
+                // cannot be matched at all, synthesize default options — the room
+                // metadata in the response is authoritative; only the client-supplied
+                // IsPublic/Name view is reconstructed from the original request.
                 CreateRoomOptions opts =
-                    _pendingCreates.TryMatch(echoedRequestId: null, out var matched)
+                    _pendingCreates.TryMatch(echoedRequestId, out var matched)
                         ? matched
                         : new CreateRoomOptions();
 

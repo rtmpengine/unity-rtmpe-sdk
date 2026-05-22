@@ -10,6 +10,13 @@
 //  [name_len:2 LE][name:N UTF-8]
 //  [max_players:1]
 //  [is_public:1]
+//  [request_id_len:2 LE][request_id:32 ASCII hex]  ← v4.0+ correlation trailer
+//
+// The request_id trailer is appended by the internal overload used by
+// RoomManager when the pending-create correlator is active.  Legacy gateways
+// that consume only the first four fields are unaffected; v4.0+ gateways echo
+// the field in the response, promoting TryMatch from FIFO-fallback to true
+// id-based correlation (race-proof under concurrent CreateRoom calls).
 //
 // ── RoomJoin (0x21) Client → Server ────────────────────────────────────────
 //  [room_id_len:2 LE][room_id:N UTF-8]           (empty if joining by code)
@@ -59,6 +66,46 @@ namespace RTMPE.Rooms
             WriteBytes(buf, ref offset, nameBytes);
             buf[offset++] = ClampByte(options.MaxPlayers, 0, 100);
             buf[offset++] = (byte)(options.IsPublic ? 1 : 0);
+
+            return buf;
+        }
+
+        /// <summary>
+        /// Build the payload for a <c>RoomCreate</c> (0x20) request, appending a
+        /// client-generated correlation identifier so a v4.0+ gateway can echo it
+        /// in the response and enable race-proof request matching.
+        /// </summary>
+        /// <remarks>
+        /// Wire layout:
+        /// <c>[name_len:2][name:N][max_players:1][is_public:1][request_id_len:2][request_id:32 hex]</c>
+        ///
+        /// The trailing field is omitted by the public overload; gateways that
+        /// predate v4.0 either stop reading at <c>is_public</c> (length-driven
+        /// parsers) or silently ignore the extra bytes.  The response parser reads
+        /// the echoed id conditionally, so both gateway generations interoperate.
+        /// </remarks>
+        internal static byte[] BuildCreateRoomPayload(CreateRoomOptions options, Guid requestId)
+        {
+            if (options == null) options = new CreateRoomOptions();
+
+            byte[] nameBytes  = SafeEncodeUtf8(options.Name, MaxNameBytes);
+            // Encode the GUID as 32 lowercase hex characters (no dashes, no curly
+            // braces).  Fixed length avoids a length-to-format ambiguity on the
+            // receiving side and keeps the field a known 34 bytes on the wire.
+            byte[] reqIdBytes = SafeEncodeUtf8(requestId.ToString("N"), MaxRoomIdBytes);
+
+            // Layout: [name_len:2][name:N][max_players:1][is_public:1]
+            //         [request_id_len:2][request_id:32]
+            int size = 2 + nameBytes.Length + 1 + 1 + 2 + reqIdBytes.Length;
+            var buf = new byte[size];
+            int offset = 0;
+
+            WriteU16LE(buf, ref offset, (ushort)nameBytes.Length);
+            WriteBytes(buf, ref offset, nameBytes);
+            buf[offset++] = ClampByte(options.MaxPlayers, 0, 100);
+            buf[offset++] = (byte)(options.IsPublic ? 1 : 0);
+            WriteU16LE(buf, ref offset, (ushort)reqIdBytes.Length);
+            WriteBytes(buf, ref offset, reqIdBytes);
 
             return buf;
         }

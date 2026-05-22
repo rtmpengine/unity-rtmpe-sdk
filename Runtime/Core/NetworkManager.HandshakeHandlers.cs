@@ -422,6 +422,16 @@ namespace RTMPE.Core
                             "[RTMPE] Dropped packet: too short to contain a valid header.");
                     return;
 
+                case HeaderValidationResult.MalformedFlags:
+                    // The flags byte carries a bit outside the protocol's
+                    // defined set — a corrupt, tampered, or version-skewed
+                    // frame.  Shares the malformed-header warning latch.
+                    if (ShouldWarn(ref _lastBadHeaderWarnTicks))
+                        Debug.LogWarning(
+                            "[RTMPE] Dropped packet: header flags byte carries a bit " +
+                            "outside the protocol's defined set.");
+                    return;
+
                 case HeaderValidationResult.Ok:
                     break;
             }
@@ -434,39 +444,35 @@ namespace RTMPE.Core
             // protocol — the SDK has no key material yet.  Post-handshake packets
             // carry session-bound semantics and must be AEAD-protected; the
             // `requiresEnc` gate below enforces that.  SessionAck is the one
-            // exception: its bootstrap encryption is opt-in via
-            // `NetworkSettings.ExpectEncryptedSessionAck`, so the gate consults
-            // that setting before deciding whether plaintext is acceptable.
+            // exception: it is the bootstrap envelope, and whether it is sealed
+            // is a negotiated property of the handshake
+            // (CapabilityFlags.EncryptedSessionAck) rather than a mandate of the
+            // static gate.
             // Note: wasEncrypted + packetType were captured by ValidateHeader
             // above; both are read from the plaintext header bytes which the
             // decrypt path preserves verbatim, so subsequent state-machine
             // logic can rely on them across the decrypt boundary.
             int packetLength = length;
 
-            // SessionAck bootstrap-encryption path.  When the gateway is run
-            // with RTMPE_ENCRYPT_SESSION_ACK=true and the SDK has opted in via
-            // NetworkSettings.ExpectEncryptedSessionAck, the SessionAck
-            // payload is sealed under a one-time AEAD key derived from the
-            // ECDH shared secret (HKDF info suffix \x03), with a fixed
-            // all-zero 12-byte nonce and AAD = [0x08, FLAG_ENCRYPTED].  The
-            // regular session-key decrypt path cannot open this packet —
+            // SessionAck bootstrap-encryption path.  When the handshake
+            // negotiated CapabilityFlags.EncryptedSessionAck the gateway seals
+            // the SessionAck payload under a one-time AEAD key derived from the
+            // ECDH shared secret (HKDF info suffix \x03), with a fixed all-zero
+            // 12-byte nonce and AAD = [0x08, FLAG_ENCRYPTED], and stamps
+            // FLAG_ENCRYPTED on the header.  The decrypt decision is taken
+            // purely from that wire bit: the SDK always advertises the
+            // capability, so a sealed SessionAck means the gateway honoured it.
+            // The regular session-key decrypt path cannot open this packet —
             // SessionAck is the bootstrap that delivers crypto_id, which the
-            // session-AEAD nonce depends on.  Route SessionAck through a
+            // session-AEAD nonce depends on — so it is routed through a
             // dedicated decrypt before the generic AEAD branch runs.
             //
-            // The wire-truth `wasEncrypted` flag is the input to the
-            // `requiresEnc` gate further down — it must reflect the FLAG_ENCRYPTED
-            // bit observed on the wire and never be mutated locally.  A separate
-            // `alreadyDecrypted` flag tracks whether plaintext has already been
-            // produced by the SessionAck-specific path, so the generic AEAD branch
-            // can be skipped without losing the original wire signal.  Conflating
-            // the two would cause a successfully-decrypted SessionAck to fail the
-            // ExpectEncryptedSessionAck gate and be silently dropped.
+            // `wasEncrypted` is wire truth (the FLAG_ENCRYPTED bit) and is
+            // never mutated locally; `alreadyDecrypted` tracks whether the
+            // SessionAck-specific path already produced plaintext so the
+            // generic AEAD branch is skipped.
             bool alreadyDecrypted = false;
-            if (wasEncrypted
-                && packetType == PacketType.SessionAck
-                && _settings != null
-                && _settings.ExpectEncryptedSessionAck)
+            if (wasEncrypted && packetType == PacketType.SessionAck)
             {
                 data = DecryptSessionAckPacket(data, length);
                 if (data == null)
@@ -474,8 +480,8 @@ namespace RTMPE.Core
                     if (ShouldWarn(ref _lastAeadFailWarnTicks))
                         Debug.LogWarning(
                             "[RTMPE] Dropped SessionAck: bootstrap AEAD authentication " +
-                            "failed.  Verify the gateway's RTMPE_ENCRYPT_SESSION_ACK " +
-                            "matches NetworkSettings.ExpectEncryptedSessionAck.");
+                            "failed — the ECDH-derived bootstrap key did not open the " +
+                            "sealed envelope.");
                     return;
                 }
                 packetLength = data.Length;
@@ -517,15 +523,13 @@ namespace RTMPE.Core
             // paths above preserve that byte verbatim, so re-reading after
             // the decrypt boundary would be redundant.
 
-            // SessionAck is the bootstrap envelope and its encryption is
-            // opt-in: gateways that have not enabled `RTMPE_ENCRYPT_SESSION_ACK`
-            // ship it in the clear, and the SDK customer signs up for the
-            // encrypted variant by setting `ExpectEncryptedSessionAck=true`.
-            // The static `RequiresEncryption` table cannot see settings, so
-            // we override SessionAck's verdict here based on the live config.
-            bool requiresEnc = packetType == PacketType.SessionAck
-                ? (_settings != null && _settings.ExpectEncryptedSessionAck)
-                : RequiresEncryption(packetType);
+            // SessionAck is excluded from RequiresEncryption — it is the
+            // bootstrap envelope and its encryption is negotiated, not
+            // mandated.  OnSessionAck performs the post-parse downgrade check
+            // once the gateway's advertised caps are known: a gateway that
+            // advertises EncryptedSessionAck but ships the envelope in the
+            // clear is rejected there.
+            bool requiresEnc = RequiresEncryption(packetType);
             if (!wasEncrypted && requiresEnc)
             {
                 if (ShouldWarn(ref _lastMissingEncryptionWarnTicks))
@@ -564,7 +568,7 @@ namespace RTMPE.Core
             {
                 // ── ECDH 4-step handshake ────────────────────────────────
                 case PacketType.Challenge:    OnChallenge(data);    break;
-                case PacketType.SessionAck:   OnSessionAck(data);   break;
+                case PacketType.SessionAck:   OnSessionAck(data, wasEncrypted); break;
 
                 // ── Legacy handshake (backward compatibility) ────────────────
                 case PacketType.HandshakeAck: OnHandshakeAck(data); break;
@@ -789,6 +793,13 @@ namespace RTMPE.Core
                 return;
             }
 
+            // Retain the verified server identity key: the Challenge Ed25519
+            // signature has now been checked against it, so it is a trusted
+            // anchor.  If the gateway advertises CapabilityFlags.IdentitySignedJwt
+            // in the upcoming SessionAck, OnSessionAck verifies the JWT
+            // signature against this same key.
+            _serverIdentityPublicKey = verifiedServerStaticPub;
+
             // Derive directional session keys (AEAD) + N-8 IP migration key via HKDF-SHA256.
             // Three independent expansions from a single PRK — info suffixes \x00, \x01, \x02.
             var derivedKeys = _handshakeHandler.DeriveSessionKeys(out _ipMigrationKey, out _sessionAckKey);
@@ -831,18 +842,11 @@ namespace RTMPE.Core
             // will not be reused, so the extra copy inside Send() is unnecessary.
             //
             // The cap advertisement carries every optional feature the SDK
-            // is willing to honour for this session.  ARQ_ACK is the only
-            // bit defined today; mirroring it onto
-            // `NetworkSettings.EmitArqSequence` keeps the on-wire promise
-            // honest — the SDK cannot consume the gateway's DataAck unless
-            // the local opt-in is also active.  A gateway that does not
-            // understand the cap field tolerates the trailing bytes
-            // (`payload[..32]` semantics are unchanged), so emitting the
-            // advertisement is safe against legacy gateways.
-            RTMPE.Core.Protocol.CapabilityFlags clientCaps =
-                _settings != null && _settings.EmitArqSequence
-                    ? RTMPE.Core.Protocol.CapabilityFlags.ArqAck
-                    : RTMPE.Core.Protocol.CapabilityFlags.None;
+            // is willing to honour for this session — see ComputeLocalCaps.
+            // A gateway that does not understand the cap field tolerates the
+            // trailing bytes (`payload[..32]` semantics are unchanged), so
+            // emitting the advertisement is safe against legacy gateways.
+            RTMPE.Core.Protocol.CapabilityFlags clientCaps = ComputeLocalCaps();
             var response = _packetBuilder.BuildHandshakeResponse(
                 _handshakeHandler.ClientPublicKey,
                 RTMPE.Protocol.WireFormat.Default,
@@ -852,10 +856,34 @@ namespace RTMPE.Core
         }
 
         /// <summary>
+        /// The capability bitmask the SDK advertises for this session.
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.EncryptedSessionAck"/>
+        /// is always set — the SDK can always decrypt the bootstrap envelope —
+        /// and <see cref="RTMPE.Core.Protocol.CapabilityFlags.ArqAck"/> is
+        /// added only when the local <c>EmitArqSequence</c> opt-in is active,
+        /// keeping the on-wire promise honest (the SDK cannot consume the
+        /// gateway's DataAck without the local opt-in).  The same value is
+        /// sent in HandshakeResponse and re-derived in OnSessionAck for the
+        /// negotiation intersection, so both call sites route through here.
+        /// </summary>
+        private RTMPE.Core.Protocol.CapabilityFlags ComputeLocalCaps()
+        {
+            var caps = RTMPE.Core.Protocol.CapabilityFlags.EncryptedSessionAck;
+            if (_settings != null && _settings.EmitArqSequence)
+                caps |= RTMPE.Core.Protocol.CapabilityFlags.ArqAck;
+            return caps;
+        }
+
+        /// <summary>
         /// Handle <c>SessionAck</c> (0x08): parse crypto_id, JWT, and reconnect token,
         /// then transition to <see cref="NetworkState.Connected"/> and start heartbeat.
         /// </summary>
-        private void OnSessionAck(byte[] data)
+        /// <param name="data">The SessionAck packet bytes (already decrypted
+        /// when the bootstrap envelope was sealed).</param>
+        /// <param name="wasEncrypted">Wire truth: whether the SessionAck
+        /// arrived carrying <see cref="PacketFlags.Encrypted"/>.  Used for the
+        /// post-parse downgrade check against the gateway's advertised caps.</param>
+        private void OnSessionAck(byte[] data, bool wasEncrypted)
         {
             // Guard: ignore stale ACKs that arrive after a timeout.
             // N-1: reconnect flow also terminates with SessionAck, so accept
@@ -880,31 +908,86 @@ namespace RTMPE.Core
 
             // Negotiate the session-effective capability set as the bitwise
             // intersection of what the SDK advertised in HandshakeResponse
-            // and what the gateway returned in SessionAck.  ARQ_ACK is the
-            // only bit the SDK advertises today (mirroring
-            // `EmitArqSequence`); the intersection captured here gates the
-            // Send / AeadPipeline / retransmit-tick paths for the rest of
-            // the session.  A legacy gateway that does not understand the
-            // SessionAck tail yields `gatewayCaps == None`, which makes the
-            // intersection empty and falls back to the pre-capability
-            // behaviour — exactly what the back-compat contract requires.
-            RTMPE.Core.Protocol.CapabilityFlags localCaps =
-                _settings != null && _settings.EmitArqSequence
-                    ? RTMPE.Core.Protocol.CapabilityFlags.ArqAck
-                    : RTMPE.Core.Protocol.CapabilityFlags.None;
+            // (re-derived here via ComputeLocalCaps so the two are always
+            // identical) and what the gateway returned in SessionAck.  The
+            // intersection captured here gates the Send / AeadPipeline /
+            // retransmit-tick paths for the rest of the session.  A legacy
+            // gateway that does not understand the SessionAck tail yields
+            // `gatewayCaps == None`, which makes the intersection empty and
+            // falls back to the pre-capability behaviour — exactly what the
+            // back-compat contract requires.
+            RTMPE.Core.Protocol.CapabilityFlags localCaps = ComputeLocalCaps();
             _negotiatedPeerCaps =
                 RTMPE.Core.Protocol.CapabilityFlagsWire.Negotiate(localCaps, gatewayCaps);
 
+            // Downgrade guard: a gateway that advertised EncryptedSessionAck
+            // must also have sealed the bootstrap envelope.  An advertised-
+            // but-plaintext SessionAck is refused rather than continued on an
+            // unprotected bootstrap.
+            //
+            // `gatewayCaps` is AEAD-authenticated when `wasEncrypted` is true
+            // (it was parsed from the decrypted payload) and attacker-mutable
+            // only when the packet arrived in the clear.  The guard is sound
+            // regardless: to suppress it an attacker would need a plaintext
+            // SessionAck the SDK still accepts, but a capability-aware gateway
+            // only ever emits a sealed envelope, and AEAD ciphertext is
+            // overwhelmingly unlikely to satisfy the length-prefix and
+            // UTF-8 checks in PacketParser.ParseSessionAck — so in practice
+            // no acceptable plaintext packet exists to pair with a cleared
+            // capability bit.  The guard's own correctness does not rest on
+            // that probability: it keys off the `wasEncrypted` wire bit, not
+            // on parse success.  It is deliberately NOT widened to "reject
+            // every plaintext SessionAck": that would break interoperability
+            // with genuinely legacy gateways, which legitimately ship the
+            // envelope in the clear and advertise no capability tail at all.
+            if ((gatewayCaps & RTMPE.Core.Protocol.CapabilityFlags.EncryptedSessionAck) != 0
+                && !wasEncrypted)
+            {
+                Debug.LogError(
+                    "[RTMPE] SessionAck rejected: the gateway advertised encrypted-" +
+                    "SessionAck support but delivered the bootstrap envelope in the " +
+                    "clear. Disconnecting.");
+                DisconnectWithReason(DisconnectReason.Unknown);
+                return;
+            }
+
             // Validate the JWT before we trust the sub claim that becomes the
-            // local session identifier.  Signature verification requires a
-            // configured public key (none is mandated today; see
-            // NetworkSettings); when absent the SDK still enforces the
-            // structural and temporal claims so a malformed or expired
+            // local session identifier.  When the gateway advertised
+            // CapabilityFlags.IdentitySignedJwt the token is verified against
+            // the server identity key the SDK verified on the Challenge —
+            // how strong an anchor that is depends on the server-key pinning
+            // mode.  Without that advertisement verification follows the
+            // NetworkSettings configuration; either way the structural and
+            // temporal claims are always enforced so a malformed or expired
             // token cannot install garbage as `_localPlayerId` and corrupt
             // every subsequent AEAD nonce.
+            bool gatewayAssertsIdentityJwt =
+                (gatewayCaps & RTMPE.Core.Protocol.CapabilityFlags.IdentitySignedJwt) != 0;
+
+            // Honour the gateway's identity-signed-JWT assertion as a hard
+            // requirement: if the identity key was not captured the SDK
+            // cannot perform the promised verification, so it fails closed
+            // rather than silently falling back to structural-only checks.
+            // The Challenge always precedes SessionAck, so this is
+            // unreachable today; the guard keeps a future handshake refactor
+            // from quietly weakening token verification.
+            if (gatewayAssertsIdentityJwt
+                && (_serverIdentityPublicKey == null || _serverIdentityPublicKey.Length == 0))
+            {
+                Debug.LogError(
+                    "[RTMPE] SessionAck rejected: the gateway advertised an " +
+                    "identity-signed JWT but the server identity key was not " +
+                    "available to verify it. Disconnecting.");
+                DisconnectWithReason(DisconnectReason.Unknown);
+                return;
+            }
+
+            byte[] jwtVerificationKey =
+                gatewayAssertsIdentityJwt ? _serverIdentityPublicKey : null;
             if (!TryValidateJwt(jwtToken,
                     expectedIssuer: _settings != null ? _settings.expectedJwtIssuer : null,
                     expectedAudience: _settings != null ? _settings.expectedJwtAudience : null,
+                    jwtVerificationKey,
                     out string subject,
                     out string jwtError))
             {

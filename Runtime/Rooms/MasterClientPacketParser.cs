@@ -24,6 +24,32 @@ namespace RTMPE.Rooms
     /// </summary>
     public static class MasterClientPacketParser
     {
+        // Strict UTF-8 codec — the lax decoder silently substitutes U+FFFD for
+        // malformed byte sequences, which would let a hostile server collapse
+        // two distinct player identifiers onto the same string and so defeat
+        // the roster-equality comparisons the decoded values feed (host
+        // promotion, kick targeting).  Symmetric with RoomPacketParser and the
+        // RPC stack, both of which already decode untrusted input strictly.
+        private static readonly UTF8Encoding StrictUtf8 =
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+        // Decode a server broadcast payload as strict UTF-8.  Returns false —
+        // so the caller discards the packet, honouring its Try* contract —
+        // when the bytes are not well-formed UTF-8.
+        private static bool TryDecodeStrictUtf8(byte[] payload, out string json)
+        {
+            try
+            {
+                json = StrictUtf8.GetString(payload);
+                return true;
+            }
+            catch (DecoderFallbackException)
+            {
+                json = null;
+                return false;
+            }
+        }
+
         /// <summary>
         /// Parse a <c>master_client_changed</c> broadcast payload.
         /// JSON shape:
@@ -34,7 +60,7 @@ namespace RTMPE.Rooms
             previousMasterId = string.Empty;
             newMasterId      = string.Empty;
             if (payload == null || payload.Length == 0) return false;
-            var json = Encoding.UTF8.GetString(payload);
+            if (!TryDecodeStrictUtf8(payload, out string json)) return false;
 
             // Accept either the Phase 2 explicit key names or the Phase 1
             // leave-driven promotion shape ("previous_host_id" / "new_host_id").
@@ -59,7 +85,7 @@ namespace RTMPE.Rooms
             kickerId       = string.Empty;
             targetPlayerId = string.Empty;
             if (payload == null || payload.Length == 0) return false;
-            var json = Encoding.UTF8.GetString(payload);
+            if (!TryDecodeStrictUtf8(payload, out string json)) return false;
 
             kickerId       = MiniJson.ExtractStringField(json, "kicker_id") ?? string.Empty;
             targetPlayerId = MiniJson.ExtractStringField(json, "target_player_id") ?? string.Empty;
@@ -75,7 +101,7 @@ namespace RTMPE.Rooms
         {
             sceneName = string.Empty;
             if (payload == null || payload.Length == 0) return false;
-            var json = Encoding.UTF8.GetString(payload);
+            if (!TryDecodeStrictUtf8(payload, out string json)) return false;
 
             sceneName = MiniJson.ExtractStringField(json, "scene_name") ?? string.Empty;
             return !string.IsNullOrEmpty(sceneName);
@@ -167,6 +193,14 @@ namespace RTMPE.Rooms
                                         else return null;
                                         code = (code << 4) | v;
                                     }
+                                    // Reject an escaped NUL or C0 control code.
+                                    // The strict-UTF-8 gate inspects the raw
+                                    // payload bytes only — a \uXXXX escape is
+                                    // itself plain ASCII and passes that gate,
+                                    // so a control codepoint must be refused
+                                    // here before it reaches a roster-compared
+                                    // identifier.  Mirrors LobbyPacketParser.
+                                    if (code < 0x20) return null;
                                     sb.Append((char)code);
                                     i += 6;
                                     break;
@@ -175,6 +209,12 @@ namespace RTMPE.Rooms
                         }
                         else
                         {
+                            // A raw C0 control character (NUL included) is a
+                            // JSON-spec violation — control codes must arrive
+                            // \u-escaped.  A raw NUL is well-formed UTF-8 and
+                            // would otherwise pass the strict-UTF-8 gate, so
+                            // it is refused at the structural layer.
+                            if (c < 0x20) return null;
                             sb.Append(c);
                             i++;
                         }

@@ -38,6 +38,13 @@
 //    with a warning; the rest of the payload continues to apply.  This makes
 //    the receiver tolerant to a delta that was authored against a slightly
 //    newer state without crashing the gameplay layer.
+//  • An Add or Insert that would push the list past its configured size
+//    ceiling is dropped op-locally, so a stream of delta payloads cannot
+//    grow the receiver's list without bound.
+//  • The op log applies atomically.  A malformed element, a truncated
+//    payload, or an unknown op reverts the list to its pre-payload contents,
+//    and change notifications are dispatched only once the whole payload has
+//    applied — a subscriber never observes an op the payload then discards.
 //  • op_count is a single byte — at most 255 ops per flush.  When more
 //    mutations queue up between two flushes, the surplus is split across
 //    subsequent flushes.  When the local op log exceeds a soft cap
@@ -59,6 +66,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using UnityEngine;
+using RTMPE.Core;
 
 namespace RTMPE.Sync
 {
@@ -92,6 +100,16 @@ namespace RTMPE.Sync
         // grows past FullSyncOpThreshold we collapse it into a single FullSync
         // op to bound per-flush bandwidth and op-count overflow risk.
         private readonly List<PendingOp> _pendingOps = new List<PendingOp>();
+
+        // Reusable scratch for the atomic apply path in Deserialize.
+        // _rollbackBuffer captures the pre-payload contents so a payload that
+        // fails partway is reverted in full; _deferredChanges holds the change
+        // notifications until the whole payload has been confirmed applied, so
+        // a subscriber never observes an op that the payload later rolled back.
+        // Both reuse their backing storage across calls — no per-payload alloc.
+        private readonly List<T> _rollbackBuffer = new List<T>();
+        private readonly List<NetworkVariableListChangeEvent<T>> _deferredChanges =
+            new List<NetworkVariableListChangeEvent<T>>();
 
         /// <summary>
         /// When the local change log exceeds this threshold the next flush is
@@ -358,15 +376,68 @@ namespace RTMPE.Sync
         public override void Deserialize(BinaryReader reader)
         {
             byte opCount = reader.ReadByte();
+            if (opCount == 0) return;
+
+            // The configured ceiling bounds the list against an attacker who
+            // streams unbounded Add/Insert deltas; resolved once per payload so
+            // the per-op checks below do not repeat the settings lookup.
+            int maxListSize = ResolveMaxListSize();
+
+            // The op log applies atomically.  A malformed element, an exhausted
+            // stream, or an unknown op must leave the list exactly as it was
+            // before this payload — so the pre-payload contents are captured
+            // here and restored on any failure, and change notifications are
+            // queued rather than dispatched until the whole payload has been
+            // confirmed applied.
+            _rollbackBuffer.Clear();
+            _rollbackBuffer.AddRange(_items);
+            _deferredChanges.Clear();
+
+            try
+            {
+                ApplyOpLog(reader, opCount, maxListSize);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] NetworkVariableList<{typeof(T).Name}>.Deserialize: payload " +
+                    $"rejected ({ex.GetType().Name}: {ex.Message}).  Restoring the " +
+                    "pre-payload contents so owner and receiver stay converged.");
+                _items.Clear();
+                _items.AddRange(_rollbackBuffer);
+                _rollbackBuffer.Clear();
+                _deferredChanges.Clear();
+                return;
+            }
+
+            // Payload applied cleanly — release the snapshot and dispatch the
+            // queued notifications now that the list is in a consistent state.
+            // The queued events are moved into a local before dispatch and the
+            // shared field is cleared first: a subscriber that synchronously
+            // re-enters Deserialize on this same instance then operates on a
+            // fresh _deferredChanges and cannot corrupt this loop's iteration.
+            _rollbackBuffer.Clear();
+            if (_deferredChanges.Count > 0)
+            {
+                var pending = _deferredChanges.ToArray();
+                _deferredChanges.Clear();
+                for (int i = 0; i < pending.Length; i++)
+                    Raise(pending[i]);
+            }
+        }
+
+        // Apply every op in the payload to _items, queueing change events into
+        // _deferredChanges.  Throws on a corrupt payload (truncation, unknown
+        // op, oversized FullSync) so the caller can revert atomically; benign
+        // out-of-range Insert/RemoveAt/Set indices are skipped op-locally,
+        // matching the receiver-tolerance contract in the file header.
+        private void ApplyOpLog(BinaryReader reader, byte opCount, int maxListSize)
+        {
             for (int i = 0; i < opCount; i++)
             {
                 if (reader.BaseStream.Position >= reader.BaseStream.Length)
-                {
-                    Debug.LogWarning(
-                        $"[RTMPE] NetworkVariableList<{typeof(T).Name}>.Deserialize: payload " +
-                        "truncated mid-op log.  Stopping early.");
-                    return;
-                }
+                    throw new EndOfStreamException(
+                        $"op log truncated after {i} of {opCount} ops");
 
                 ListOp op = (ListOp)reader.ReadByte();
                 switch (op)
@@ -374,9 +445,19 @@ namespace RTMPE.Sync
                     case ListOp.Add:
                     {
                         T val = ReadElement(reader);
+                        // Cumulative ceiling: an Add that would push the list
+                        // past its configured maximum is skipped, so a stream
+                        // of Add deltas cannot grow the receiver without bound.
+                        if (_items.Count >= maxListSize)
+                        {
+                            Debug.LogWarning(
+                                $"[RTMPE] NetworkVariableList<{typeof(T).Name}>: Add would " +
+                                $"exceed the configured max {maxListSize}.  Dropping op.");
+                            break;
+                        }
                         int idx = _items.Count;
                         _items.Add(val);
-                        Raise(new NetworkVariableListChangeEvent<T>(
+                        _deferredChanges.Add(new NetworkVariableListChangeEvent<T>(
                             NetworkListChangeKind.Add, idx, val, default));
                         break;
                     }
@@ -391,8 +472,15 @@ namespace RTMPE.Sync
                                 $"{idx} exceeds Count {_items.Count}.  Dropping op.");
                             break;
                         }
+                        if (_items.Count >= maxListSize)
+                        {
+                            Debug.LogWarning(
+                                $"[RTMPE] NetworkVariableList<{typeof(T).Name}>: Insert would " +
+                                $"exceed the configured max {maxListSize}.  Dropping op.");
+                            break;
+                        }
                         _items.Insert(idx, val);
-                        Raise(new NetworkVariableListChangeEvent<T>(
+                        _deferredChanges.Add(new NetworkVariableListChangeEvent<T>(
                             NetworkListChangeKind.Insert, idx, val, default));
                         break;
                     }
@@ -408,7 +496,7 @@ namespace RTMPE.Sync
                         }
                         T removed = _items[idx];
                         _items.RemoveAt(idx);
-                        Raise(new NetworkVariableListChangeEvent<T>(
+                        _deferredChanges.Add(new NetworkVariableListChangeEvent<T>(
                             NetworkListChangeKind.RemoveAt, idx, default, removed));
                         break;
                     }
@@ -425,14 +513,14 @@ namespace RTMPE.Sync
                         }
                         T previous = _items[idx];
                         _items[idx] = val;
-                        Raise(new NetworkVariableListChangeEvent<T>(
+                        _deferredChanges.Add(new NetworkVariableListChangeEvent<T>(
                             NetworkListChangeKind.Set, idx, val, previous));
                         break;
                     }
                     case ListOp.Clear:
                     {
                         _items.Clear();
-                        Raise(new NetworkVariableListChangeEvent<T>(
+                        _deferredChanges.Add(new NetworkVariableListChangeEvent<T>(
                             NetworkListChangeKind.Clear, -1, default, default));
                         break;
                     }
@@ -443,56 +531,29 @@ namespace RTMPE.Sync
                         // Defence against an attacker-controlled wire field:
                         // pre-allocating capacity for the full uint16 range
                         // would commit ~512 KB per variable per tick at
-                        // 16-byte elements.  Cap at the configured ceiling and
-                        // reject the entire FullSync if the wire count
-                        // exceeds it — partial application would leave owner
-                        // and receiver visibly desynchronised.
-                        int maxListSize = ResolveMaxListSize();
+                        // 16-byte elements.  A FullSync above the configured
+                        // ceiling is rejected outright — the atomic restore in
+                        // Deserialize keeps owner and receiver converged.
                         if (count > maxListSize)
-                        {
-                            Debug.LogWarning(
-                                $"[RTMPE] NetworkVariableList<{typeof(T).Name}>: FullSync " +
-                                $"count {count} exceeds configured max " +
-                                $"{maxListSize}.  Rejecting payload.");
-                            return;
-                        }
+                            throw new InvalidDataException(
+                                $"FullSync count {count} exceeds configured max {maxListSize}");
 
                         _items.Clear();
                         _items.Capacity = Math.Max(_items.Capacity, count);
                         for (int k = 0; k < count; k++)
                         {
                             if (reader.BaseStream.Position >= reader.BaseStream.Length)
-                            {
-                                Debug.LogWarning(
-                                    $"[RTMPE] NetworkVariableList<{typeof(T).Name}>: FullSync " +
-                                    "payload truncated.  Stopping early.");
-                                break;
-                            }
-                            try
-                            {
-                                _items.Add(ReadElement(reader));
-                            }
-                            catch (Exception ex)
-                            {
-                                // A single malformed element aborts the FullSync rather
-                                // than leaving the list in a partially-populated state.
-                                Debug.LogWarning(
-                                    $"[RTMPE] NetworkVariableList<{typeof(T).Name}>: FullSync " +
-                                    $"element {k} failed deserialization ({ex.GetType().Name}).  " +
-                                    "Aborting FullSync to avoid partial state.");
-                                _items.Clear();
-                                return;
-                            }
+                                throw new EndOfStreamException(
+                                    $"FullSync truncated after {k} of {count} elements");
+                            _items.Add(ReadElement(reader));
                         }
-                        Raise(new NetworkVariableListChangeEvent<T>(
+                        _deferredChanges.Add(new NetworkVariableListChangeEvent<T>(
                             NetworkListChangeKind.FullSync, -1, default, default));
                         break;
                     }
                     default:
-                        Debug.LogWarning(
-                            $"[RTMPE] NetworkVariableList<{typeof(T).Name}>: unknown op " +
-                            $"0x{(byte)op:X2} at index {i} of {opCount}.  Aborting payload.");
-                        return;
+                        throw new InvalidDataException(
+                            $"unknown op 0x{(byte)op:X2} at index {i} of {opCount}");
                 }
             }
         }

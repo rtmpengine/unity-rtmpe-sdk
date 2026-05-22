@@ -325,6 +325,31 @@ namespace RTMPE.Rpc
             => Enum.IsDefined(typeof(RpcTarget), targetByte);
 
         /// <summary>
+        /// Decide whether an inbound Enhanced RPC may be dispatched to its
+        /// target method, given the method's declared <see cref="RpcTarget"/>
+        /// and the audience byte carried on the wire.
+        ///
+        /// <para>Dispatch is permitted only when both conditions hold:</para>
+        /// <list type="bullet">
+        ///  <item>The wire audience equals the method's declared audience.
+        ///  A conforming sender stamps the declared value verbatim
+        ///  (see <c>EnhancedRpcPacketBuilder</c>), so a divergence means the
+        ///  call is being made under an audience contract the method was
+        ///  never authored for.</item>
+        ///  <item>The declared audience is not <see cref="RpcTarget.Server"/>.
+        ///  A <c>Server</c> RPC is consumed by the authoritative server;
+        ///  executing it on a receiving client would run server-side logic
+        ///  on an untrusted peer.</item>
+        /// </list>
+        /// </summary>
+        /// <param name="declaredTarget">
+        /// The <see cref="RtmpeRpcAttribute"/> target of the resolved method.
+        /// </param>
+        /// <param name="wireTarget">The audience byte decoded from the packet.</param>
+        public static bool IsDispatchPermitted(RpcTarget declaredTarget, RpcTarget wireTarget)
+            => declaredTarget == wireTarget && declaredTarget != RpcTarget.Server;
+
+        /// <summary>
         /// Apply the configured sender policy.  Zero is always rejected
         /// (it is the SDK's pre-authentication sentinel); non-zero
         /// values are passed through <see cref="SenderVerifier"/> when
@@ -334,10 +359,14 @@ namespace RTMPE.Rpc
         {
             if (senderId == 0UL) return false;
             var hook = SenderVerifier;
-            // The default verifier is non-null (see initialiser); a caller
-            // that explicitly assigns null falls back to "structural-only"
-            // semantics — zero rejected, every non-zero accepted.
-            if (hook == null) return true;
+            // A sender-policy gate must fail closed.  The default verifier is
+            // non-null (see the initialiser), so a null hook means an explicit
+            // assignment cleared it: treat that as deny-all rather than
+            // admit-all, matching the discipline applied to a throwing
+            // verifier below.  A caller that intends to admit peers installs
+            // a concrete verifier — the self-only DefaultSenderVerifier, or a
+            // roster-aware delegate via SetServerAttestedSenderVerifier.
+            if (hook == null) return false;
             // Verifier hooks must fail-closed: a buggy integrator delegate
             // (NRE on a stale roster reference, Dictionary mutation in
             // flight, …) must drop the packet rather than abort the parse

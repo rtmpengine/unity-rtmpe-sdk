@@ -135,11 +135,24 @@ namespace RTMPE.Rooms
                 char first = json[firstNonWs];
                 if (first == '[')
                 {
-                    ParseJsonArray(json, rooms, maxEntries, maxStringBytes);
+                    // Legacy bare-array shape — the payload itself is the
+                    // room array, starting at this first non-whitespace char.
+                    ParseJsonArray(json, firstNonWs, rooms, maxEntries, maxStringBytes);
                 }
                 else if (first == '{')
                 {
-                    int declaredVersion = ReadIntField(json, "version");
+                    // Versioned envelope.  Both the schema-version guard and
+                    // the room-array lookup resolve their fields by walking
+                    // only the envelope's own top-level members, so a
+                    // `version` key or an array nested inside a room object
+                    // is never mistaken for the envelope's own field — a
+                    // non-canonical or hostile payload cannot smuggle either.
+                    int declaredVersion = 0;
+                    if (TryFindTopLevelMember(json, firstNonWs, "version",
+                                              out int versionValueStart))
+                    {
+                        declaredVersion = ReadIntValueAt(json, versionValueStart);
+                    }
                     if (declaredVersion > MaxKnownEnvelopeVersion)
                     {
                         // Future-version envelope from a Room Service build
@@ -148,10 +161,18 @@ namespace RTMPE.Rooms
                         // versioning policy on the Sync side.
                         return rooms;
                     }
-                    // Locate the rooms array.  `IndexOf` after the version
-                    // marker is sufficient because the canonical envelope
-                    // shape places `rooms` as the only top-level array.
-                    ParseJsonArray(json, rooms, maxEntries, maxStringBytes);
+                    // Parse the `rooms` member by key.  Selecting it by key
+                    // rather than by the first '[' in the payload prevents a
+                    // non-canonical envelope that places another array ahead
+                    // of `rooms` from being parsed as the room list.
+                    if (TryFindTopLevelMember(json, firstNonWs, "rooms",
+                                              out int roomsValueStart)
+                        && roomsValueStart < json.Length
+                        && json[roomsValueStart] == '[')
+                    {
+                        ParseJsonArray(json, roomsValueStart, rooms,
+                                       maxEntries, maxStringBytes);
+                    }
                 }
             }
             catch
@@ -175,6 +196,126 @@ namespace RTMPE.Rooms
             return pos;
         }
 
+        // ── Top-level envelope member lookup ─────────────────────────────────
+        //
+        // The schema-version guard and the `rooms` array selection resolve
+        // their fields against the envelope's ROOT object only.  Walking just
+        // the depth-1 members means a `version` key or an array nested inside
+        // a room object is never read as the envelope's own field, so a
+        // non-canonical or hostile payload cannot shadow either by embedding
+        // it in a nested object.
+
+        // Find the closing quote of a JSON string whose opening quote has
+        // already been consumed; `start` is the first content char.  Returns
+        // the index of the unescaped terminating quote, or -1 if unterminated.
+        private static int IndexOfStringEnd(string json, int start)
+        {
+            for (int i = start; i < json.Length; i++)
+            {
+                char c = json[i];
+                if (c == '\\') { i++; continue; }   // skip the escaped char
+                if (c == '"') return i;
+            }
+            return -1;
+        }
+
+        // Skip one JSON value beginning at json[valueStart].  Returns the
+        // index immediately past the value, or -1 on a malformed/truncated
+        // value.  Strings and balanced object/array spans are skipped whole;
+        // a primitive (number, true, false, null) is scanned up to the next
+        // structural delimiter.
+        private static int SkipValue(string json, int valueStart)
+        {
+            if (valueStart >= json.Length) return -1;
+            char c = json[valueStart];
+            if (c == '"')
+            {
+                int end = IndexOfStringEnd(json, valueStart + 1);
+                return end < 0 ? -1 : end + 1;
+            }
+            if (c == '{' || c == '[')
+            {
+                int depth = 0;
+                bool inString = false;
+                for (int i = valueStart; i < json.Length; i++)
+                {
+                    char ch = json[i];
+                    if (inString)
+                    {
+                        if (ch == '\\') { i++; continue; }
+                        if (ch == '"') inString = false;
+                        continue;
+                    }
+                    if (ch == '"') { inString = true; continue; }
+                    if (ch == '{' || ch == '[') depth++;
+                    else if (ch == '}' || ch == ']')
+                    {
+                        depth--;
+                        if (depth == 0) return i + 1;
+                    }
+                }
+                return -1;   // unbalanced object/array
+            }
+            // Primitive value — consume up to the next structural delimiter.
+            int j = valueStart;
+            while (j < json.Length)
+            {
+                char ch = json[j];
+                if (ch == ',' || ch == '}' || ch == ']') break;
+                j++;
+            }
+            return j;
+        }
+
+        // Locate the value of a depth-1 member of the root object whose
+        // opening brace is at json[rootBraceIndex].  On success sets
+        // <paramref name="valueStart"/> to the index of the value's first
+        // non-whitespace char and returns true; returns false when the key
+        // is absent or the envelope is malformed.
+        private static bool TryFindTopLevelMember(
+            string json, int rootBraceIndex, string key, out int valueStart)
+        {
+            valueStart = -1;
+            if (rootBraceIndex < 0 || rootBraceIndex >= json.Length
+                || json[rootBraceIndex] != '{')
+                return false;
+
+            int i = rootBraceIndex + 1;
+            while (i < json.Length)
+            {
+                char c = json[i];
+                if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ',')
+                {
+                    i++;
+                    continue;
+                }
+                if (c == '}') return false;     // end of root object — key absent
+                if (c != '"') return false;     // malformed — a member must start with a key
+
+                int keyStart = i + 1;
+                int keyEnd   = IndexOfStringEnd(json, keyStart);
+                if (keyEnd < 0) return false;
+
+                int colon = SkipWhitespace(json, keyEnd + 1);
+                if (colon >= json.Length || json[colon] != ':') return false;
+
+                int vStart = SkipWhitespace(json, colon + 1);
+                if (vStart >= json.Length) return false;
+
+                if (keyEnd - keyStart == key.Length
+                    && string.CompareOrdinal(json, keyStart, key, 0, key.Length) == 0)
+                {
+                    valueStart = vStart;
+                    return true;
+                }
+
+                int afterValue = SkipValue(json, vStart);
+                if (afterValue < 0) return false;
+                i = afterValue;
+            }
+            return false;
+        }
+
         // ── Minimal JSON array parser ────────────────────────────────────────
         // We avoid UnityEngine.JsonUtility (no List<T> support without wrappers)
         // and Newtonsoft (optional dependency) by hand-rolling a lightweight
@@ -182,12 +323,17 @@ namespace RTMPE.Rooms
 
         private static void ParseJsonArray(
             string json,
+            int arrayStart,
             List<LobbyRoomInfo> out_,
             int maxEntries,
             int maxStringBytes)
         {
-            int pos = json.IndexOf('[');
-            if (pos < 0) return;
+            // arrayStart is the index of the opening '[' located by the
+            // caller: the bare-array dispatch passes the payload's first
+            // non-whitespace char; the envelope dispatch passes the start of
+            // the `rooms` member's array value.
+            int pos = arrayStart;
+            if (pos < 0 || pos >= json.Length || json[pos] != '[') return;
 
             int depth = 0;
             int objStart = -1;
@@ -249,13 +395,22 @@ namespace RTMPE.Rooms
                 if (nestDepth > MaxNestingDepth) return null;
             }
 
-            string roomId      = ReadStringField(obj, "room_id",      maxStringBytes);
-            string roomCode    = ReadStringField(obj, "room_code",    maxStringBytes);
-            string name        = ReadStringField(obj, "name",         maxStringBytes);
-            int    playerCount = ReadIntField(obj,    "player_count");
-            int    maxPlayers  = ReadIntField(obj,    "max_players");
-            bool   isPublic    = ReadBoolField(obj,   "is_public");
-            string lobbyName   = ReadStringField(obj, "lobby_name",   maxStringBytes);
+            // Resolve every field against the room object's own depth-1
+            // members.  Selecting fields structurally — rather than by the
+            // first "key" substring anywhere in the slice — prevents an
+            // attacker-chosen value (notably the room name) that embeds a
+            // `"room_id":"…"` fragment from shadowing the genuine field.
+            int rootBrace = SkipWhitespace(obj, 0);
+            if (rootBrace >= obj.Length || obj[rootBrace] != '{')
+                return null;
+
+            string roomId      = ReadStringField(obj, rootBrace, "room_id",      maxStringBytes);
+            string roomCode    = ReadStringField(obj, rootBrace, "room_code",    maxStringBytes);
+            string name        = ReadStringField(obj, rootBrace, "name",         maxStringBytes);
+            int    playerCount = ReadIntField(obj,    rootBrace, "player_count");
+            int    maxPlayers  = ReadIntField(obj,    rootBrace, "max_players");
+            bool   isPublic    = ReadBoolField(obj,   rootBrace, "is_public");
+            string lobbyName   = ReadStringField(obj, rootBrace, "lobby_name",   maxStringBytes);
 
             // Reject the row entirely if any required string was malformed.  An
             // explicit null (rather than empty string) signals a parse error.
@@ -273,19 +428,29 @@ namespace RTMPE.Rooms
             return new LobbyRoomInfo(roomId, roomCode, name, playerCount, maxPlayers, isPublic, lobbyName);
         }
 
-        // Decode a JSON string value, applying length caps and full escape
-        // handling.  Returns null on malformed input (truncated escape, embedded
-        // control char, exceeds maxBytes); returns empty string when the field
-        // is simply absent.
-        private static string ReadStringField(string json, string key, int maxBytes)
+        // Read a string field of the room object whose opening brace is at
+        // json[rootBrace].  The key is located among the object's depth-1
+        // members only — a `"key":"…"` fragment buried inside another field's
+        // string value cannot shadow it.  Returns null on a malformed value
+        // (truncated escape, embedded control char, exceeds maxBytes); returns
+        // empty string when the field is absent or is not a JSON string.
+        private static string ReadStringField(string json, int rootBrace, string key, int maxBytes)
         {
-            var pattern = "\"" + key + "\":\"";
-            int start = json.IndexOf(pattern, StringComparison.Ordinal);
-            if (start < 0) return string.Empty;
-            start += pattern.Length;
+            if (!TryFindTopLevelMember(json, rootBrace, key, out int valueStart))
+                return string.Empty;
+            if (valueStart >= json.Length || json[valueStart] != '"')
+                return string.Empty;   // present, but not a string value
+            return ReadStringValueAt(json, valueStart + 1, maxBytes);
+        }
 
+        // Decode a JSON string value whose content begins at json[contentStart]
+        // (i.e. immediately after the opening quote), applying length caps and
+        // full escape handling.  Returns null on malformed input (truncated
+        // escape, embedded control char, exceeds maxBytes).
+        private static string ReadStringValueAt(string json, int contentStart, int maxBytes)
+        {
             var sb = new StringBuilder();
-            int i = start;
+            int i = contentStart;
             while (i < json.Length)
             {
                 char c = json[i];
@@ -361,16 +526,15 @@ namespace RTMPE.Rooms
             return -1;
         }
 
-        private static int ReadIntField(string json, string key)
+        // Read an integer JSON value beginning at json[pos] (leading spaces
+        // are skipped first).  The scan length is capped so an absurdly long
+        // digit run cannot drive an unbounded substring allocation.  Returns
+        // 0 when no integer digits are present.
+        private static int ReadIntValueAt(string json, int pos)
         {
-            var pattern = $"\"{key}\":";
-            int start = json.IndexOf(pattern, StringComparison.Ordinal);
-            if (start < 0) return 0;
-            start += pattern.Length;
-            // Skip whitespace.
+            int start = pos;
             while (start < json.Length && json[start] == ' ') start++;
             int end = start;
-            // Cap numeric scan length to defend against absurd integer strings.
             int maxScan = Math.Min(json.Length, start + 16);
             while (end < maxScan && (char.IsDigit(json[end]) || json[end] == '-')) end++;
             if (end == start) return 0;
@@ -378,14 +542,26 @@ namespace RTMPE.Rooms
             return v;
         }
 
-        private static bool ReadBoolField(string json, string key)
+        // Read an integer field of the room object whose opening brace is at
+        // json[rootBrace].  The key is resolved among the object's depth-1
+        // members, so a `"key":` fragment nested inside another field's value
+        // cannot shadow it.  Returns 0 when the field is absent.
+        private static int ReadIntField(string json, int rootBrace, string key)
         {
-            var pattern = $"\"{key}\":";
-            int start = json.IndexOf(pattern, StringComparison.Ordinal);
-            if (start < 0) return false;
-            start += pattern.Length;
-            while (start < json.Length && json[start] == ' ') start++;
-            return start < json.Length && json[start] == 't'; // "true" starts with 't'
+            if (!TryFindTopLevelMember(json, rootBrace, key, out int valueStart))
+                return 0;
+            return ReadIntValueAt(json, valueStart);
+        }
+
+        // Read a boolean field of the room object whose opening brace is at
+        // json[rootBrace], resolved among the object's depth-1 members.
+        // Returns false when the field is absent.  TryFindTopLevelMember
+        // already advances valueStart past leading whitespace.
+        private static bool ReadBoolField(string json, int rootBrace, string key)
+        {
+            if (!TryFindTopLevelMember(json, rootBrace, key, out int valueStart))
+                return false;
+            return valueStart < json.Length && json[valueStart] == 't'; // "true" starts with 't'
         }
     }
 }

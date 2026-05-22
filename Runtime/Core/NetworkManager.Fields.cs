@@ -54,11 +54,24 @@ namespace RTMPE.Core
         private byte[] _ipMigrationKey;
         /// <summary>
         /// 32-byte AEAD key (HKDF info suffix <c>\x03</c>) used to decrypt the
-        /// SessionAck payload when the gateway is configured with
-        /// <c>RTMPE_ENCRYPT_SESSION_ACK=true</c> and
-        /// <see cref="NetworkSettings.ExpectEncryptedSessionAck"/> is enabled.
+        /// SessionAck payload when the handshake negotiated
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.EncryptedSessionAck"/>
+        /// and the SessionAck therefore arrives carrying
+        /// <see cref="PacketFlags.Encrypted"/>.
         /// </summary>
         private byte[] _sessionAckKey;
+
+        /// <summary>
+        /// The 32-byte Ed25519 server static identity public key, captured
+        /// once the handshake <see cref="PacketType.Challenge"/> signature
+        /// has been verified against it.  When the gateway advertises
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.IdentitySignedJwt"/>
+        /// the SessionAck handler verifies the JWT signature against this
+        /// key rather than relying on out-of-band NetworkSettings key
+        /// configuration.  How strong an anchor it is depends on the
+        /// server-key pinning mode that captured it.
+        /// </summary>
+        private byte[] _serverIdentityPublicKey;
 
         /// <summary>
         /// Owns the per-session ARQ sequence space.  Allocates the 4-byte

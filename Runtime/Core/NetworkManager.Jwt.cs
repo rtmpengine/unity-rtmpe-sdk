@@ -20,10 +20,19 @@ namespace RTMPE.Core
         /// <see cref="JwtValidator"/>; see that class for the full RFC
         /// reference set and threat model.
         /// </summary>
+        /// <param name="identityVerificationKey">
+        /// When non-null, the 32-byte Ed25519 server identity public key the
+        /// JWT signature is verified against — supplied by the SessionAck
+        /// handler when the gateway advertised
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.IdentitySignedJwt"/>.
+        /// When null, signature verification follows the NetworkSettings
+        /// configuration.
+        /// </param>
         internal bool TryValidateJwt(
             string jwt,
             string expectedIssuer,
             string expectedAudience,
+            byte[] identityVerificationKey,
             out string subject,
             out string error)
         {
@@ -33,7 +42,7 @@ namespace RTMPE.Core
             // path (once per session) and the validator carries no
             // accumulated state — the warned-once latches are
             // AppDomain-scoped statics on JwtValidator itself.
-            return new JwtValidator(_settings)
+            return new JwtValidator(_settings, identityVerificationKey)
                 .TryValidate(jwt, expectedIssuer, expectedAudience, out subject, out error);
         }
 

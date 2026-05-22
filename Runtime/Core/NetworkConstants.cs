@@ -162,7 +162,7 @@ namespace RTMPE.Core
         // ── State synchronisation ─────────────────────────────────────────────
         StateSync         = 0x40,   // Server → Client: authoritative full snapshot
         // ── Network variable delta synchronisation ───────────────────────
-        // Payload: [object_id:8 LE][var_count:1][for each: [var_id:2 LE][value bytes...]]
+        // Payload: [object_id:8 LE][tick:4 LE][var_count:1][for each: [var_id:2 LE][value_len:2 LE][value bytes...]]
         VariableUpdate    = 0x41,   // Client → Server → all room clients: dirty variable delta
         // ── Interest Management (Feature #6) ─────────────────────────────
         // Payload: [x: float LE 4 B][y: float LE 4 B] — total 8 bytes.

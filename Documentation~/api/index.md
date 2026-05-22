@@ -9,6 +9,8 @@
 
 - [NetworkManager](#networkmanager)
 - [RoomManager](#roommanager)
+- [LobbyManager](#lobbymanager)
+- [MatchmakingManager](#matchmakingmanager)
 - [SpawnManager](#spawnmanager)
 - [INetworkObjectPool](#inetworkobjectpool)
 - [OwnershipManager](#ownershipmanager)
@@ -45,7 +47,8 @@ Place it on a GameObject **only in the boot scene**.
 ### Static members
 
 ```csharp
-// Returns the singleton instance, or null after OnApplicationQuit.
+// Returns the NetworkManager placed in the scene. Returns null — with a
+// one-time warning — when the scene contains none, and after OnApplicationQuit.
 static NetworkManager Instance { get; }
 
 // Thread-safe null check — no side effects.
@@ -159,6 +162,12 @@ RoomManager Rooms { get; }
 
 // Spawn / Despawn networked GameObjects (+ optional INetworkObjectPool).
 SpawnManager Spawner { get; }
+
+// Lobby browser — list / filter rooms without joining one.
+LobbyManager Lobby { get; }
+
+// Matchmaking — AutoJoinOrCreate by mode / lobby.
+MatchmakingManager Matchmaking { get; }
 ```
 
 ### Events
@@ -227,9 +236,10 @@ event Action<ulong> OnLeftRoom
 **Namespace:** `RTMPE.Rooms`
 **Access:** `NetworkManager.Instance.Rooms`
 
-Handles room creation, joining, leaving, and listing. All operations travel
-over the reliable KCP channel (AEAD-encrypted once the session is established)
-and produce an event callback.
+Handles room creation, joining, leaving, listing, custom properties,
+master-client transfer, and scene coordination. All operations are sent with
+`FLAG_RELIABLE` (reliable delivery), AEAD-encrypted once the session is
+established, and produce an event callback.
 
 ### Operations
 
@@ -252,6 +262,28 @@ void LeaveRoom()
 // Request a list of rooms. Fires OnRoomListReceived with the results.
 // publicOnly — when true, returns only rooms marked as public.
 void ListRooms(bool publicOnly = true)
+
+// Replace the current room's custom properties. Fires OnRoomPropertiesChanged
+// once the server accepts and broadcasts the update.
+void SetRoomProperties(IReadOnlyDictionary<string, PropertyValue> properties)
+
+// Set a single room property by key. Convenience wrapper over SetRoomProperties.
+void SetRoomProperty(string key, PropertyValue value)
+
+// Set custom properties for a player in the room. Fires OnPlayerPropertiesChanged.
+void SetPlayerProperties(string playerId, IReadOnlyDictionary<string, PropertyValue> properties)
+
+// Request that the master-client role be transferred to targetPlayerId.
+// On acceptance every client in the room receives OnMasterClientChanged.
+void TransferMasterClient(string targetPlayerId)
+
+// Request the server remove targetPlayerId from the room.
+// On acceptance every client receives OnPlayerKicked.
+void KickPlayer(string targetPlayerId)
+
+// Report that the local client finished loading sceneName. When every player
+// has reported the same scene, all clients receive OnAllPlayersSceneLoaded.
+void ReportSceneLoaded(string sceneName)
 ```
 
 ### State
@@ -318,6 +350,140 @@ event Action<string, string> OnPlayerKicked
 // for the authoritative scene (stored in the reserved Scene property).
 // Argument is the scene name that just finished loading for everyone.
 event Action<string> OnAllPlayersSceneLoaded
+```
+
+---
+
+## LobbyManager
+
+**Namespace:** `RTMPE.Rooms`
+**Access:** `NetworkManager.Instance.Lobby`
+
+Browse and filter the rooms in a lobby without joining one. A fresh
+`LobbyManager` is created on every `Connect()` / `Reconnect()`.
+
+### Properties
+
+```csharp
+// Name of the lobby currently joined; "" means the Default lobby.
+string CurrentLobbyName { get; }
+
+// True while the local client is in the lobby browser.
+bool IsInLobby { get; }
+
+// Most recent room list received from the server.
+IReadOnlyList<LobbyRoomInfo> Rooms { get; }
+```
+
+### Methods
+
+```csharp
+// Enter the lobby browser. "" selects the Default lobby.
+// The server replies with the current room list (OnRoomListUpdated).
+void JoinLobby(string lobbyName = "")
+
+// Leave the lobby browser (fire-and-forget).
+void LeaveLobby()
+
+// Request a filtered / sorted one-shot room list (see LobbyQueryOptions).
+void ListRooms(LobbyQueryOptions opts = null)
+```
+
+### Events
+
+```csharp
+// Fired when the server pushes an updated room list — after JoinLobby,
+// ListRooms, or a server-side lobby change.
+event Action<IReadOnlyList<LobbyRoomInfo>> OnRoomListUpdated
+```
+
+### LobbyRoomInfo (immutable)
+
+```csharp
+string RoomId      { get; }
+string RoomCode    { get; }
+string Name        { get; }
+int    PlayerCount { get; }
+int    MaxPlayers  { get; }
+bool   IsPublic    { get; }
+string LobbyName   { get; }
+```
+
+### LobbyQueryOptions
+
+```csharp
+string            LobbyName  { get; set; } = "";   // "" = Default lobby
+int               MaxResults { get; set; } = 0;    // 1–100; 0 = server default (100)
+LobbySort         SortBy     { get; set; } = LobbySort.PlayerCount;
+List<LobbyFilter> Filters    { get; set; }         // null = no filter
+```
+
+- `LobbySort` — `PlayerCount` (0), `Age` (1), `Name` (2).
+- `LobbyFilter` — `{ string Key; LobbyFilterOp Op; object Value; }`.
+- `LobbyFilterOp` — `Eq` (0), `NotEq` (1), `Lt` (2), `Gt` (3), `LtEq` (4), `GtEq` (5).
+
+---
+
+## MatchmakingManager
+
+**Namespace:** `RTMPE.Rooms`
+**Access:** `NetworkManager.Instance.Matchmaking`
+
+AutoJoinOrCreate matchmaking: the server atomically finds an open room
+matching the requested mode / lobby or creates one, then joins the player.
+A fresh `MatchmakingManager` is created on every `Connect()` / `Reconnect()`.
+
+### Property
+
+```csharp
+// True while a matchmaking request is in flight.
+bool IsMatchmaking { get; }
+```
+
+### Methods
+
+```csharp
+// Start matchmaking (default 30 s timeout).
+// Throws InvalidOperationException if not Connected / InRoom or a request
+// is already in flight; ArgumentException on an invalid Mode.
+void StartMatchmaking(MatchmakingOptions options)
+
+// Same, with an explicit timeout — clamped to (0, 300] seconds;
+// double.PositiveInfinity disables the timeout.
+void StartMatchmaking(MatchmakingOptions options, double timeoutSeconds)
+
+// Abort an in-flight request. Idempotent.
+void CancelFindMatch()
+```
+
+> `Tick(double)` drives the timeout clock but is called automatically by
+> `NetworkManager.Update()` — applications do not call it.
+
+### Events
+
+```csharp
+event Action<MatchmakingResult> OnMatchmakingComplete   // matched / created room
+event Action<string>            OnMatchmakingFailed     // server-side failure
+event Action                    OnMatchmakingCancelled  // CancelFindMatch()
+event Action                    OnMatchmakingTimedOut   // timeout elapsed
+```
+
+### MatchmakingOptions
+
+```csharp
+string Mode        { get; set; } = "";   // required, non-empty
+string LobbyName   { get; set; } = "";
+int    MinPlayers  { get; set; } = 0;    // <= 0 → server default (2)
+int    MaxPlayers  { get; set; } = 0;    // <= 0 → server default
+string DisplayName { get; set; } = "";
+```
+
+### MatchmakingResult (immutable)
+
+```csharp
+string RoomId   { get; }
+string RoomCode { get; }
+bool   Created  { get; }   // true = a new room was created for this match
 ```
 
 ---
@@ -401,8 +567,12 @@ public void ClearAll()
 ### Object ID generation
 
 ```csharp
-// Internal: objectId = (LocalPlayerId & 0xFFFFFFFF) << 32 | (localCounter++)
-// Guarantees uniqueness across up to 16 concurrent players without a server round-trip.
+// Internal (ObjectIdMath.Compose):
+//   high 32 bits = MixSessionId(gatewaySessionId) — xor-fold + SplitMix64 avalanche
+//   low  32 bits = per-session spawn counter
+//   objectId     = (high << 32) | (counter & 0xFFFFFFFF)
+// The avalanche mixing spreads ids across the 64-bit space so two players'
+// object ids do not collide without a server round-trip.
 ```
 
 ---
@@ -452,14 +622,18 @@ Manages object ownership. Ownership is **server-authoritative** — the local cl
 cannot self-assign ownership; it sends a request and waits for a server grant.
 
 ```csharp
-// Request the server to transfer ownership of objectId to newOwnerId.
+// Request the server to transfer ownership of objectId to newOwnerPlayerId.
 // The server validates the request and broadcasts an OwnershipTransfer RPC
 // to all clients.
-void RequestOwnershipTransfer(ulong objectId, string newOwnerId)
+void RequestOwnershipTransfer(ulong objectId, string newOwnerPlayerId)
 
-// Called internally when the server grants an OwnershipTransfer.
-// Updates local ownership records and fires IsOwner change on the affected object.
-void ApplyOwnershipGrant(ulong objectId, string newOwnerId)
+// Apply a server-decided ownership grant. The three-argument form is the
+// primary entry point: serverAttested must be true for a grant that did not
+// originate from a local RequestOwnershipTransfer call (an unattested grant
+// with no matching outstanding request is rejected). The two-argument
+// overload forwards with serverAttested: false and is kept for back-compat.
+void ApplyOwnershipGrant(ulong objectId, string newOwnerPlayerId, bool serverAttested)
+void ApplyOwnershipGrant(ulong objectId, string newOwnerPlayerId)
 
 // Snapshot of live objects owned by a given player UUID.
 IReadOnlyList<NetworkBehaviour> GetObjectsOwnedBy(string playerId)
@@ -708,6 +882,11 @@ Set them in the Unity Inspector or assign them in code by field name.
 | `apiKeyPskHex`                 | `string` | `""`        | 64-char hex PSK — copy from the RTMPE dashboard |
 | `pinnedServerPublicKeyHex`     | `string` | `""`        | 64-char hex — optional server cert pinning |
 
+> The table above lists the **core connection fields**. `NetworkSettings` also
+> carries advanced tuning fields (interest management, client-side prediction
+> thresholds, spawn-rate limits, variable batching, JWT verification). Inspect
+> the `NetworkSettings` asset in the Unity Inspector for the full, current set.
+
 ---
 
 ## CreateRoomOptions
@@ -738,8 +917,9 @@ public sealed class CreateRoomOptions
 ```csharp
 public sealed class JoinRoomOptions
 {
-    // Name displayed to other players in the room. Max 32 bytes UTF-8. Default: "Player".
-    public string DisplayName { get; set; }
+    // Name displayed to other players in the room (max 32 characters).
+    // Default: "" (empty) — the server assigns a fallback name when blank.
+    public string DisplayName { get; set; } = string.Empty;
 }
 ```
 
@@ -824,6 +1004,10 @@ public enum DisconnectReason
                      // non-recoverable transport error (SocketException propagated
                      // from the network thread).
     Kicked,          // Server forcibly removed the player.
+    NonceExhausted,  // The outbound AEAD nonce counter reached 2^32 packets;
+                     // the session must be fully re-established.
+    ProtocolError,   // The gateway sent a packet violating the expected protocol
+                     // sequence; the connection can no longer be trusted.
 }
 ```
 
@@ -837,6 +1021,8 @@ public enum DisconnectReason
 | `Connect(apiKey)` or `Reconnect()` does not reach `SessionAck` within `connectionTimeoutMs` | `Timeout`        | No               |
 | Background thread raises `SocketException`                                       | `ConnectionLost` | No               |
 | Server kicks the player (game logic)                                             | `Kicked`         | No               |
+| Outbound AEAD nonce counter exhausted (2³² packets)                               | `NonceExhausted` | No               |
+| Gateway sent a packet violating the expected protocol sequence                    | `ProtocolError`  | No               |
 
 > **Reconnect pattern.** Only the heartbeat-miss path preserves the token,
 > because it is the only case where the client has strong evidence that the

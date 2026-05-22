@@ -31,8 +31,8 @@
 // byte has bit 0x01 set before treating the remainder as quantized
 // fields.  Any unrecognised length / flag combination is rejected.
 //
-// The payload is wrapped in a 13-byte RTMPE header (PacketType.Data, 0x10)
-// by the caller via NetworkManager.SendData().
+// The payload is wrapped in a 13-byte RTMPE header (PacketType.StateSync,
+// 0x40) by the caller via NetworkManager.SendStateSync().
 //
 // The layout matches the Go server's ObjectState struct field order so that
 // future server-side deserialisers can read the raw bytes directly.

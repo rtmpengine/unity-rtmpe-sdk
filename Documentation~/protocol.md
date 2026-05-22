@@ -11,7 +11,7 @@
 2. [Flag Bits](#2-flag-bits)
 3. [Packet Types](#3-packet-types)
 4. [Handshake Sequence](#4-handshake-sequence)
-5. [Raw Binary Packets (0x05–0x08)](#5-raw-binary-packets-0x050x08)
+5. [Raw Binary Packets (0x05–0x09)](#5-raw-binary-packets-0x050x09)
 6. [AEAD Encryption on the Wire](#6-aead-encryption-on-the-wire)
 7. [Nonce Construction](#7-nonce-construction)
 8. [Room Operation Payloads](#8-room-operation-payloads)
@@ -58,17 +58,23 @@ PacketProtocol.HEADER_SIZE  = 13
 
 The `flags` byte is a bitmask. Multiple flags may be set simultaneously.
 
-| Bit    | Hex    | Name          | Meaning |
-|--------|--------|---------------|---------|
-| Bit 0  | `0x01` | `Compressed`  | Payload is LZ4-compressed (applied before AEAD when `CompressIfBeneficial` shrinks the payload) |
-| Bit 1  | `0x02` | `Encrypted`   | Payload is ChaCha20-Poly1305 AEAD encrypted |
-| Bit 2  | `0x04` | `Reliable`    | Packet is sent over the reliable KCP channel (port 7778) |
+| Bit    | Hex    | Name              | Meaning |
+|--------|--------|-------------------|---------|
+| Bit 0  | `0x01` | `Compressed`      | Payload is LZ4-compressed (applied before AEAD when `CompressIfBeneficial` shrinks the payload) |
+| Bit 1  | `0x02` | `Encrypted`       | Payload is ChaCha20-Poly1305 AEAD encrypted |
+| Bit 2  | `0x04` | `Reliable`        | Packet requires acknowledged (reliable) delivery — marks it for the gateway's KCP/ARQ reliability layer |
+| Bit 3  | `0x08` | `EnhancedRpc`     | `Rpc` (0x50) payload uses the 27-byte Enhanced RPC header |
+| Bit 4  | `0x10` | `GameplayOrdered` | Payload begins with a 4-byte LE gameplay sequence used to order RPC and StateSync against each other |
+| Bit 5  | `0x20` | `AppSequence`     | An application-level monotonic sequence (4-byte LE) is bound into the AEAD AAD |
 
 ```csharp
-// C# constants
-PacketFlags.Compressed = 0x01
-PacketFlags.Encrypted  = 0x02
-PacketFlags.Reliable   = 0x04
+// C# constants (PacketFlags)
+PacketFlags.Compressed      = 0x01
+PacketFlags.Encrypted       = 0x02
+PacketFlags.Reliable        = 0x04
+PacketFlags.EnhancedRpc     = 0x08
+PacketFlags.GameplayOrdered = 0x10
+PacketFlags.AppSequence     = 0x20
 ```
 
 **Compression order:** `Lz4Compressor.CompressIfBeneficial` is applied to the
@@ -81,40 +87,66 @@ uncompressed plaintext.
 
 ## 3. Packet Types
 
-| Hex    | Name               | Direction | Channel   | Payload format |
-|--------|--------------------|-----------|-----------|----------------|
-| `0x01` | `Handshake`        | C↔S       | KCP       | FlatBuffers *(legacy, pre-v3 only)* |
-| `0x02` | `HandshakeAck`     | S→C       | KCP       | FlatBuffers *(legacy, pre-v3 only)* |
-| `0x03` | `Heartbeat`        | C→S       | UDP       | empty — see §13 |
-| `0x04` | `HeartbeatAck`     | S→C       | UDP       | empty — see §13 |
-| `0x05` | `HandshakeInit`    | C→S       | KCP       | **Raw binary** — see §5 |
-| `0x06` | `Challenge`        | S→C       | KCP       | **Raw binary** — see §5 |
-| `0x07` | `HandshakeResponse`| C→S       | KCP       | **Raw binary** — see §5 |
-| `0x08` | `SessionAck`       | S→C       | KCP       | **Raw binary** — see §5 |
-| `0x09` | `ReconnectInit`    | C→S       | KCP       | **Raw binary** — see §5 (token + optional HMAC proof) |
-| `0x0A` | `ReconnectAck`     | reserved  | KCP       | reserved — future single-round-trip variant |
-| `0x10` | `Data`             | C↔S       | UDP       | application-defined |
-| `0x11` | `DataAck`          | S→C       | UDP       | empty |
-| `0x20` | `RoomCreate`       | C↔S       | KCP       | Custom binary — see §8 |
-| `0x21` | `RoomJoin`         | C↔S       | KCP       | Custom binary — see §8 |
-| `0x22` | `RoomLeave`        | C↔S       | KCP       | Custom binary — see §8 |
-| `0x23` | `RoomList`         | C↔S       | KCP       | Custom binary — see §8 |
-| `0x30` | `Spawn`            | C↔S       | KCP       | Custom binary — see §9 |
-| `0x31` | `Despawn`          | C↔S       | KCP       | Custom binary — see §9 |
-| `0x40` | `StateSync`        | S→C       | UDP       | Custom binary — see §10 |
-| `0x41` | `VariableUpdate`   | C→S→C     | KCP       | Custom binary — see §12 (client → server relays to room) |
-| `0x50` | `Rpc`              | C→S       | KCP       | Custom binary — see §11 |
-| `0x51` | `RpcResponse`      | S→C       | KCP       | Custom binary — see §11 |
-| `0xFF` | `Disconnect`       | C↔S       | KCP       | empty — see §14 |
+> **Transport.** With the shipped `UdpTransport`, every packet type below
+> travels over the SDK's single UDP socket. Packets needing acknowledged
+> delivery additionally set `FLAG_RELIABLE` (§2); the gateway may route those
+> over its KCP transport. The "Reliable" column indicates which types the SDK
+> sends with `FLAG_RELIABLE`.
 
-> **C↔S** = bidirectional. **C→S** = client to server. **S→C** = server to client.
+| Hex    | Name                  | Direction | Reliable | Payload format |
+|--------|-----------------------|-----------|----------|----------------|
+| `0x01` | `Handshake`           | C↔S       | —        | FlatBuffers *(legacy, pre-v3 only)* |
+| `0x02` | `HandshakeAck`        | S→C       | —        | FlatBuffers *(legacy, pre-v3 only)* |
+| `0x03` | `Heartbeat`           | C→S       | no       | empty — see §13 |
+| `0x04` | `HeartbeatAck`        | S→C       | no       | empty — see §13 |
+| `0x05` | `HandshakeInit`       | C→S       | yes      | **Raw binary** — see §5 |
+| `0x06` | `Challenge`           | S→C       | yes      | **Raw binary** — see §5 |
+| `0x07` | `HandshakeResponse`   | C→S       | yes      | **Raw binary** — see §5 |
+| `0x08` | `SessionAck`          | S→C       | yes      | **Raw binary** — see §5 |
+| `0x09` | `ReconnectInit`       | C→S       | yes      | **Raw binary** — see §5 (token + optional HMAC proof) |
+| `0x0A` | `ReconnectAck`        | reserved  | —        | reserved — gateway replies with `Challenge` (0x06) instead |
+| `0x10` | `Data`                | C↔S       | optional | application-defined |
+| `0x11` | `DataAck`             | S→C       | no       | empty |
+| `0x20` | `RoomCreate`          | C→S       | yes      | Custom binary — see §8 |
+| `0x21` | `RoomJoin`            | C↔S       | yes      | Custom binary — see §8 (request / join ack) |
+| `0x22` | `RoomLeave`           | C→S       | yes      | Custom binary — see §8 |
+| `0x23` | `RoomList`            | C→S       | yes      | Custom binary — see §8 |
+| `0x24` | `RoomPropertyUpdate`  | C→S→all   | yes      | JSON — room-level custom property update |
+| `0x25` | `PlayerPropertyUpdate`| C→S→all   | yes      | JSON — per-player custom property update |
+| `0x26` | `MatchmakingRequest`  | C→S       | yes      | JSON — AutoJoinOrCreate request |
+| `0x27` | `LobbyJoin`           | C→S       | yes      | Custom binary — enter lobby browser |
+| `0x28` | `LobbyLeave`          | C→S       | no       | empty — exit lobby browser (fire-and-forget) |
+| `0x29` | `LobbyList`           | C→S       | yes      | Custom binary — filtered room-list request |
+| `0x2A` | `LobbyRoomListUpdate` | S→C       | —        | JSON array — pushed lobby room list |
+| `0x2B` | `MatchmakingResponse` | S→C       | —        | JSON — matchmaking result |
+| `0x2C` | `MasterClientChanged` | S→all     | —        | Custom binary — master-client changed |
+| `0x2D` | `MasterClientTransfer`| C→S       | yes      | Custom binary — request master-client transfer |
+| `0x2E` | `KickPlayer`          | C→S / S→all | yes    | Custom binary — kick request / broadcast |
+| `0x2F` | `SceneLoaded`         | C→S / S→all | yes    | Custom binary — scene-load readiness |
+| `0x30` | `Spawn`               | C↔S       | yes      | Custom binary — see §9 |
+| `0x31` | `Despawn`             | C↔S       | yes      | Custom binary — see §9 |
+| `0x40` | `StateSync`           | C→S→C     | no       | Custom binary — see §10 |
+| `0x41` | `VariableUpdate`      | C→S→C     | yes      | Custom binary — see §12 (client → server relays to room) |
+| `0x42` | `PositionUpdate`      | C→S       | no       | `[x:4 LE f32][y:4 LE f32]` — interest-zone position |
+| `0x43` | `InputPayload`        | C→S       | yes      | Custom binary — server-authoritative input batch |
+| `0x44` | `VariableBatchUpdate` | C→S→C     | yes      | Custom binary — coalesced multi-object variable batch |
+| `0x50` | `Rpc`                 | C→S       | yes      | Custom binary — see §11 |
+| `0x51` | `RpcResponse`         | S→C       | yes      | Custom binary — see §11 |
+| `0x52` | `RpcBufferReplay`     | S→C       | yes      | Custom binary — buffered RPC events for late joiners |
+| `0xFF` | `Disconnect`          | C↔S       | no       | empty — see §14 |
+
+> **C↔S** = bidirectional. **C→S** = client to server. **S→C** = server to
+> client. **C→S→all** = client sends; gateway relays to every room member.
+> A "Reliable" value of "—" marks legacy or server-originated types the SDK
+> does not itself send.
 
 ---
 
 ## 4. Handshake Sequence
 
-The connection is established with a 4-step exchange. All handshake packets are sent
-over the reliable KCP channel (port 7778).
+The connection is established with a 4-step exchange. With the shipped
+`UdpTransport` these packets travel over the SDK's single UDP socket; they
+carry `FLAG_RELIABLE` so the gateway delivers them reliably.
 
 ```
 Step  Packet            Hex    Dir   Payload
@@ -129,7 +161,8 @@ Step  Packet            Hex    Dir   Payload
 
 ### Step 1 — HandshakeInit
 
-Client encrypts its API key with the PSK (`GATEWAY_API_KEY_ENCRYPTION_KEY_HEX`):
+Client encrypts its API key with the pre-shared key (the gateway's configured
+API-key PSK):
 
 ```
 plaintext = [api_key_len:2 LE u16][api_key_bytes:N]
@@ -169,13 +202,21 @@ must match. Verification failure aborts the handshake.
 ### Step 3 — HandshakeResponse
 
 ```
-payload = [client_pub:32]   // client's X25519 ephemeral public key
+payload = [client_pub:32]              // client's X25519 ephemeral public key
+          [preferred_wire_format:1]    // negotiated state-sync wire format (2 or 4)
+          [client_caps:4 LE]?          // optional capability advertisement
 ```
+
+Minimum size: **33 bytes** (32-byte key + 1-byte wire-format selector). When
+the client advertises capabilities a 4-byte little-endian caps tail is
+appended (37 bytes); the tail is omitted entirely when no capabilities are
+set, keeping the packet byte-compatible with a pre-capability gateway.
 
 ### Step 4 — SessionAck
 
 ```
 payload = [crypto_id:4 LE][jwt_len:2 LE][jwt:jwt_len][rc_len:2 LE][reconnect_token:rc_len]
+          [gateway_caps:4 LE]?    // optional — gateway capability advertisement
 ```
 
 - `crypto_id` — a server-assigned `u32` used as the high 4 bytes of every subsequent AEAD nonce.
@@ -224,8 +265,8 @@ tokens that always fail.
 |------------------|-------------------|
 | `HandshakeInit`  | `[nonce:12][ct+tag:N]` — N = plaintext + 16 (Poly1305 tag) |
 | `Challenge`      | `[eph_pub:32][static_pub:32][ed25519_sig:64]` = 128 bytes exactly |
-| `HandshakeResponse` | `[client_pub:32]` = 32 bytes exactly |
-| `SessionAck`     | `[crypto_id:4][jwt_len:2][jwt:N][rc_len:2][rc:R]` (first AEAD-encrypted) |
+| `HandshakeResponse` | `[client_pub:32][preferred_wire_format:1][client_caps:4 LE]?` — 33 bytes (37 with the optional caps tail) |
+| `SessionAck`     | `[crypto_id:4][jwt_len:2][jwt:N][rc_len:2][rc:R][gateway_caps:4 LE]?` (first AEAD-encrypted) |
 | `ReconnectInit`  | `[token_len:2][token:N][proof:32]?` — see §4 reconnect shortcut |
 
 ---
@@ -339,8 +380,8 @@ Offset  Size  Content
 ### Nonce exhaustion (hard stop)
 
 The SDK tracks its outbound counter as a `long` starting at `-1`. The first
-`Interlocked.Increment` returns `0`. Two thresholds mirror the Rust gateway's
-`SEQUENCE_EXHAUSTION_THRESHOLD` / `NEAR_EXHAUSTION_MARGIN`:
+`Interlocked.Increment` returns `0`. Two thresholds, kept in step with the
+gateway, protect against counter exhaustion:
 
 | Threshold                          | Value (constant)              | Effect |
 |------------------------------------|-------------------------------|--------|
@@ -358,7 +399,8 @@ decryption. AEAD tag failure always causes a silent drop.
 
 ## 8. Room Operation Payloads
 
-Room packets are sent over KCP (reliable), encrypted with AEAD.
+Room packets carry `FLAG_RELIABLE` (reliable delivery) and, once the session
+is established, are AEAD-encrypted.
 
 ### RoomCreate (0x20) — client → server
 
@@ -430,7 +472,8 @@ other field empty (zero-length).
 
 ## 9. Spawn / Despawn Payloads
 
-Spawn and despawn packets travel over KCP, encrypted with AEAD.
+Spawn and despawn packets carry `FLAG_RELIABLE` (reliable delivery) and are
+AEAD-encrypted.
 
 ### SpawnRequest / Spawn (0x30) payload
 
@@ -458,11 +501,32 @@ Minimum size: 4 + 8 + 2 + 0 + 12 + 16 = **42 bytes** (empty owner string).
 
 ## 10. State Sync Payload
 
-State sync packets (0x40) travel over the **unreliable UDP channel** for minimum latency.
-They are AEAD-encrypted but marked as unreliable — loss is acceptable since a fresh
-snapshot arrives at 30 Hz.
+`StateSync` (0x40) packets are AEAD-encrypted and sent **unreliably** (no
+`FLAG_RELIABLE`) for minimum latency — loss is acceptable because a fresh
+snapshot follows at 30 Hz. The type is **bidirectional**: clients send
+transform updates with it, and the gateway relays / snapshots state back with
+it. Two payload shapes share the type.
 
-### StateDelta payload
+### Client → server: transform update
+
+`NetworkTransform` sends a **fixed 48-byte** payload (no `changed_mask`):
+
+```
+[object_id:8 LE u64]                                            // offset 0
+[pos_x:4 LE f32][pos_y:4 LE f32][pos_z:4 LE f32]                // offset 8
+[rot_x:4 LE f32][rot_y:4 LE f32][rot_z:4 LE f32][rot_w:4 LE f32] // offset 20
+[scl_x:4 LE f32][scl_y:4 LE f32][scl_z:4 LE f32]                // offset 36
+```
+
+Total: **48 bytes** (`TransformPacketBuilder.BuildUpdatePayload`). When
+quantization is enabled the SDK instead emits a **25-byte** quantized variant
+(`BuildQuantizedUpdatePayload`) whose first byte is a `FLAG_QUANTIZED` (`0x01`)
+control byte; the 48-byte and 25-byte shapes are distinguished by total length.
+
+### Server → client: StateDelta
+
+The gateway relays state as a variable-length **StateDelta** carrying only the
+components that changed (parsed by `TransformPacketParser.TryParseStateDelta`):
 
 ```
 [object_id:8 LE u64]
@@ -475,13 +539,15 @@ snapshot arrives at 30 Hz.
     [scl_x:4 LE f32][scl_y:4 LE f32][scl_z:4 LE f32]
 ```
 
-Maximum size: 8 + 1 + 12 + 16 + 12 = **49 bytes** (all components present).
+Minimum size: **9 bytes** (object_id + empty mask). Maximum size:
+8 + 1 + 12 + 16 + 12 = **49 bytes** (all components present). Bits 3–7 of
+`changed_mask` are reserved — a payload that sets any of them is rejected.
 
 ---
 
 ## 11. RPC Payloads
 
-RPC packets travel over KCP (reliable), encrypted with AEAD.
+RPC packets carry `FLAG_RELIABLE` (reliable delivery) and are AEAD-encrypted.
 
 ### Rpc (0x50) — client → server
 
@@ -517,7 +583,7 @@ RPC packets travel over KCP (reliable), encrypted with AEAD.
 ## 12. NetworkVariable Wire Format (VariableUpdate — 0x41)
 
 `VariableUpdate` (0x41) is the dedicated packet type for replicating dirty
-`NetworkVariable` values. It travels over the reliable KCP channel and is
+`NetworkVariable` values. It carries `FLAG_RELIABLE` (reliable delivery) and is
 flushed at 30 Hz by the SDK for every owned, spawned object that has at least
 one dirty variable. On the server it is relayed to all other clients in the room.
 
@@ -525,6 +591,7 @@ one dirty variable. On the server it is relayed to all other clients in the room
 
 ```
 [object_id:8 LE u64]
+[tick:4 LE u32]            // sender's local tick at flush time
 [var_count:1 u8]
 per variable:
   [var_id:2 LE u16]

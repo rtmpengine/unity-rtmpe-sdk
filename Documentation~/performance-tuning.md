@@ -31,7 +31,8 @@ Set `NetworkSettings.tickRate` on the `RTMPESettings` asset **before** calling
 
 Each `NetworkVariable<T>` adds to the per-tick payload. Measured wire sizes
 per variable (value-only; the outer `VariableUpdate` packet adds 8 bytes for
-`object_id` + 1 byte for `var_count` + 4 bytes of `[var_id][value_len]` per entry):
+`object_id`, 4 bytes for `tick`, 1 byte for `var_count`, and 4 bytes of
+`[var_id][value_len]` per entry):
 
 | Type                         | Value bytes          |
 |------------------------------|----------------------|
@@ -102,7 +103,7 @@ snapping for fast-moving objects.
 
 Key optimisations already in place:
 
-- `NetworkVariable.SerializeWithId` renteds a pool-backed `byte[1024]` from
+- `NetworkVariable.SerializeWithId` rents a pool-backed `byte[1024]` from
   `ArrayPool<byte>.Shared`. Falls back to a growable `MemoryStream` only for
   unusually large string values.
 - `NetworkManager` caches the heartbeat and variable-update delegates (no

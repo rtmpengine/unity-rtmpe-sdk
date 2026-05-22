@@ -24,13 +24,17 @@
 //     RPC / variable-update / ownership-transfer use cases — those
 //     payloads are small (≤ 1.4 KB), strictly ordered, and rare enough
 //     that head-of-line blocking is acceptable.
-//   • Wired into the on-wire packet format yet.  The 4-byte sequence in
-//     PacketProtocol.OFFSET_SEQUENCE today is the AEAD nonce counter,
-//     owned by the Crypto / Security team.  Threading the ARQ sequence
-//     into the wire requires either repurposing the AEAD nonce (must be
-//     done in lock-step with the gateway) or adding a 4-byte ARQ header
-//     under FLAG_RELIABLE.  That coordination is tracked separately;
-//     this module ships the client half so it can land independently.
+//
+// On-wire integration:
+//
+//   The ARQ sequence IS wired into the on-wire format — it is carried in a
+//   dedicated 4-byte sub-header emitted under FLAG_RELIABLE (see
+//   NetworkManager.AeadPipeline), independent of the AEAD nonce counter,
+//   and the gateway acknowledges it with DataAck (0x11).  ARQ activates
+//   only when the caller requests reliable delivery, NetworkSettings.
+//   EmitArqSequence is true, and the session negotiated the CAP_ARQ_ACK
+//   capability; otherwise the send downgrades to a single best-effort
+//   transmission.
 //
 // All operations are O(1) expected.  Allocation-free after construction
 // for the common-case small in-flight window.

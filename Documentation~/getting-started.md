@@ -133,23 +133,17 @@ Open **Window → Package Manager**. You should see:
 RTMPE SDK   1.1.0   ✓
 ```
 
-The `RTMPE` namespace is now available in all scripts.
+The RTMPE SDK types — under the `RTMPE.Core`, `RTMPE.Rooms`, `RTMPE.Sync`,
+`RTMPE.Rpc`, and `RTMPE.Transport` namespaces — are now available in all
+scripts.
 
-### About the mirror repository
+### About the install URL
 
 The Git URL above points to `rtmpengine/unity-rtmpe-sdk` — a flat,
-UPM-installable mirror of the package directory inside the RTMPE
-monorepo. The mirror is published automatically by the
-`publish-unity-sdk-mirror` GitHub Actions workflow on every commit to
-`main` that touches the package; you do not need to clone the monorepo
-to install the SDK.
-
-If the mirror appears to lag behind the monorepo (a release note
-references behaviour you cannot reproduce), the most recent workflow run
-on the monorepo's **Actions → Publish Unity SDK Mirror** tab will show
-why. Re-running it republishes the mirror; until then, install Option B
-(local copy) directly from the monorepo at
-`clients/unity-sdk/Packages/com.rtmpe.sdk` as a stop-gap.
+UPM-installable repository. You do not need any other repository to
+install or use the SDK; the Unity Package Manager pulls everything it
+needs from that URL. If you prefer a pinned local copy, use Option B
+above.
 
 ---
 
@@ -1045,6 +1039,8 @@ hp.OnValueChanged += (oldVal, newVal) => UpdateUI(newVal);
 | `Timeout`        | Initial handshake or token `Reconnect()` did not complete within `connectionTimeoutMs` | No          |
 | `ConnectionLost` | 3 consecutive missed `HeartbeatAck` (recoverable) or a transport `SocketException` (not recoverable) | Heartbeat-miss only |
 | `Kicked`         | Server forcibly removed the player                                      | No                         |
+| `NonceExhausted` | The outbound AEAD nonce counter reached 2³² packets — the session must be fully re-established | No |
+| `ProtocolError`  | The gateway sent a packet that violates the expected protocol sequence; the connection cannot be trusted | No |
 
 Only the heartbeat-miss path preserves the reconnect token. Check
 `NetworkManager.CanReconnect` in your `OnDisconnected` handler and call
@@ -1193,7 +1189,7 @@ if (NetworkManager.Instance.State == NetworkState.Disconnected)
 | ---------------------- | ------------------------------------------------------------- |
 | Tick rate              | 30 Hz — state updates every 33.3 ms                           |
 | Latency P99            | < 30 ms within region                                         |
-| Max players per room   | 16 (configurable per project in the dashboard)                |
+| Max players per room   | 1–100 — set per room via `CreateRoomOptions.MaxPlayers` (`0` = server default of 100) |
 | Position threshold     | 0.01 m — sub-centimetre moves are suppressed to save bandwidth |
 | Rotation threshold     | 0.1° — tiny rotations are suppressed                          |
 | NetworkVariable flush  | 30 Hz — no manual flush needed                                |
@@ -1204,4 +1200,4 @@ if (NetworkManager.Instance.State == NetworkState.Disconnected)
 
 ---
 
-*RTMPE SDK 1.1.0 — [Changelog](../CHANGELOG.md) — [Protocol Reference](protocol.md) — [API Reference](api/index.md)*
+*RTMPE SDK 1.1.0 — [Changelog](https://github.com/rtmpengine/unity-rtmpe-sdk/blob/main/CHANGELOG.md) — [Protocol Reference](protocol.md) — [API Reference](api/index.md)*

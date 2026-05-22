@@ -20,7 +20,7 @@ public struct CreateRoomRequest : IFlatbufferObject
   public CreateRoomRequest __assign(int _i, ByteBuffer _bb) { __init(_i, _bb); return this; }
 
   public uint ProjectId { get { int o = __p.__offset(4); return o != 0 ? __p.bb.GetUint(o + __p.bb_pos) : (uint)0; } }
-  public byte MaxPlayers { get { int o = __p.__offset(6); return o != 0 ? __p.bb.Get(o + __p.bb_pos) : (byte)16; } }
+  public byte MaxPlayers { get { int o = __p.__offset(6); return o != 0 ? __p.bb.Get(o + __p.bb_pos) : (byte)0; } }
   public byte TickRate { get { int o = __p.__offset(8); return o != 0 ? __p.bb.Get(o + __p.bb_pos) : (byte)30; } }
   public string RoomName { get { int o = __p.__offset(10); return o != 0 ? __p.__string(o + __p.bb_pos) : null; } }
 #if ENABLE_SPAN_T
@@ -39,7 +39,7 @@ public struct CreateRoomRequest : IFlatbufferObject
 
   public static Offset<RTMPE.Messages.CreateRoomRequest> CreateCreateRoomRequest(FlatBufferBuilder builder,
       uint project_id = 0,
-      byte max_players = 16,
+      byte max_players = 0,
       byte tick_rate = 30,
       StringOffset room_nameOffset = default(StringOffset),
       StringOffset metadataOffset = default(StringOffset)) {
@@ -54,7 +54,7 @@ public struct CreateRoomRequest : IFlatbufferObject
 
   public static void StartCreateRoomRequest(FlatBufferBuilder builder) { builder.StartTable(5); }
   public static void AddProjectId(FlatBufferBuilder builder, uint projectId) { builder.AddUint(0, projectId, 0); }
-  public static void AddMaxPlayers(FlatBufferBuilder builder, byte maxPlayers) { builder.AddByte(1, maxPlayers, 16); }
+  public static void AddMaxPlayers(FlatBufferBuilder builder, byte maxPlayers) { builder.AddByte(1, maxPlayers, 0); }
   public static void AddTickRate(FlatBufferBuilder builder, byte tickRate) { builder.AddByte(2, tickRate, 30); }
   public static void AddRoomName(FlatBufferBuilder builder, StringOffset roomNameOffset) { builder.AddOffset(3, roomNameOffset.Value, 0); }
   public static void AddMetadata(FlatBufferBuilder builder, StringOffset metadataOffset) { builder.AddOffset(4, metadataOffset.Value, 0); }
@@ -98,7 +98,7 @@ public class CreateRoomRequestT
 
   public CreateRoomRequestT() {
     this.ProjectId = 0;
-    this.MaxPlayers = 16;
+    this.MaxPlayers = 0;
     this.TickRate = 30;
     this.RoomName = null;
     this.Metadata = null;

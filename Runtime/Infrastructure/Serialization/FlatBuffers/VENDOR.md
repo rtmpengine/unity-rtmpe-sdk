@@ -58,31 +58,16 @@ against this directory before the vendored copy is overwritten.
 
 ## Updating
 
-To upgrade the runtime, re-run from the repo root:
+Re-vendoring the FlatBuffers runtime is a maintainer task. To upgrade:
+replace the nine source files in this directory (and `LICENSE.txt`) with the
+matching files from the upstream `net/FlatBuffers/` directory at the chosen
+release tag, re-apply the **Local hardening** changes listed above, then
+regenerate the bindings under `../Generated/`.
 
-```bash
-# (1) pull the new tag into the Go module cache (re-uses the existing path)
-cd /tmp && go mod download github.com/google/flatbuffers@v<NEW_VERSION>+incompatible
-
-# (2) re-vendor the 9 files into this directory
-FB_SRC="$HOME/go/pkg/mod/github.com/google/flatbuffers@v<NEW_VERSION>+incompatible/net/FlatBuffers"
-FB_DST="clients/unity-sdk/Packages/com.rtmpe.sdk/Runtime/Infrastructure/Serialization/FlatBuffers"
-for f in ByteBuffer.cs ByteBufferUtil.cs FlatBufferBuilder.cs FlatBufferConstants.cs \
-         FlatBufferVerify.cs IFlatbufferObject.cs Offset.cs Struct.cs Table.cs; do
-  cp "$FB_SRC/$f" "$FB_DST/$f"
-done
-
-# (3) re-vendor the LICENSE
-cp "$HOME/go/pkg/mod/github.com/google/flatbuffers@v<NEW_VERSION>+incompatible/LICENSE" \
-   "$FB_DST/LICENSE.txt"
-
-# (4) regenerate the bindings under Runtime/Infrastructure/Serialization/Generated/
-make generate-contracts
-```
-
-The Rust crate (`modules/gateway/Cargo.toml`) and the Go module
-(`shared/contracts/generated/go/go.mod`) must be bumped to the same version
-so all three runtimes stay byte-compatible on the wire.
+The vendored version must stay locked to the `flatc` compiler version that
+emitted those bindings, and to the FlatBuffers version used by the gateway
+and the shared contract definitions, so every runtime stays byte-compatible
+on the wire.
 
 ## IL2CPP / AOT note
 

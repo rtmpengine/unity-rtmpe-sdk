@@ -9,7 +9,7 @@ steps and fixes. Each section leads with the symptom followed by a checklist.
 
 ## Connection issues
 
-### Symptom: `OnConnectionFailed` fires with "Connection timeout"
+### Symptom: `OnConnectionFailed` fires with "Connection timeout." or "Reconnect timeout."
 
 The handshake did not complete within `NetworkSettings.connectionTimeoutMs`
 (default 10 000 ms).
@@ -22,9 +22,9 @@ The handshake did not complete within `NetworkSettings.connectionTimeoutMs`
       RTMPE uses UDP only — TCP rules do not apply.
 - [ ] Is `Settings.pinnedServerPublicKeyHex` set to the correct 64-char hex
       key for the target environment? A key mismatch causes the Ed25519
-      signature check on the `Challenge` to fail; the SDK aborts with
-      "Ed25519 signature invalid" and the timeout coroutine fires
-      `OnConnectionFailed` shortly after.
+      signature check on the `Challenge` to fail; the SDK aborts the
+      handshake and the timeout coroutine fires `OnConnectionFailed`
+      shortly after.
 - [ ] Is `Settings.apiKeyPskHex` the 64-char hex value from the dashboard for
       the target environment? A wrong PSK means the gateway can't decrypt the
       API key in `HandshakeInit` and silently drops the packet.
@@ -36,8 +36,8 @@ The handshake did not complete within `NetworkSettings.connectionTimeoutMs`
 
 | Cause                                   | Fix |
 |-----------------------------------------|-----|
-| Wrong environment PSK                   | Verify `Settings.apiKeyPskHex` matches the server's `GATEWAY_API_KEY_ENCRYPTION_KEY_HEX`. |
-| Wrong pinned public key                 | Verify `Settings.pinnedServerPublicKeyHex` matches the server's `GATEWAY_PUBLIC_KEY`. |
+| Wrong environment PSK                   | Verify `Settings.apiKeyPskHex` matches the API-key PSK configured on the gateway. |
+| Wrong pinned public key                 | Verify `Settings.pinnedServerPublicKeyHex` matches the gateway's Ed25519 public key for the target environment. |
 | Corporate NAT drops unsolicited UDP     | Consider a WebSocket transport via `NetworkManager.SetTransportFactory` + a WebSocket-to-UDP bridge on the server side. |
 | Routing probe fell back to loopback     | Check the Unity Console for `[RTMPE] UdpTransport: routing probe failed …` — common in isolated test containers. The AEAD AAD of `HandshakeInit` will contain the loopback IP instead of the real outgoing interface, and the gateway will reject it. |
 
@@ -105,10 +105,12 @@ call `Connect(apiKey)` with fresh credentials.
 
 ### Symptom: Auth token expires during a long session
 
-The SDK does not auto-refresh tokens. Listen for
-`OnDisconnected(DisconnectReason.Kicked)` and re-authenticate from scratch via
-`Connect(apiKey)` — the reconnect token path is not sufficient for a stale
-auth context.
+The SDK does not auto-refresh the session JWT. When a token expires the
+gateway ends the session, which the SDK surfaces through `OnDisconnected` —
+typically with `DisconnectReason.ServerRequest` (or `Timeout` if a subsequent
+reconnect cannot complete). In your `OnDisconnected` handler, when
+`CanReconnect` is `false`, re-authenticate from scratch via `Connect(apiKey)`;
+the reconnect-token path does not refresh an expired auth context.
 
 ---
 
@@ -153,7 +155,7 @@ NetworkManager.Instance.Rooms.OnPlayerJoined += _ =>
       `> 200 ms` on a LAN indicates significant packet loss. Open the Unity
       Profiler's Network view for deeper analysis.
 - [ ] Is the connection operating under heavy packet loss (> 20 %)? At this
-      level even reliable (KCP) packets observe significant latency. Consider
+      level even packets marked reliable observe significant latency. Consider
       reducing tick rate or switching to a closer region.
 
 ---

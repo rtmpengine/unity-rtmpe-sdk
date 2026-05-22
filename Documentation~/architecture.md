@@ -193,8 +193,8 @@ All game traffic travels over a single **UDP socket** (`System.Net.Sockets.Socke
 | Property       | Value                                     |
 |----------------|-------------------------------------------|
 | Protocol       | UDP (unreliable, unordered)               |
-| Default port   | 7777                                      |
-| Reliable path  | KCP over UDP — port 7778                  |
+| Default port   | 7777 — single socket carries all packet types |
+| Reliable path  | Application-layer ARQ over the same UDP socket (`FLAG_RELIABLE`); see "Reliable delivery" below |
 | Send buffer    | configurable — default 262 144 bytes (256 KiB) |
 | Receive buffer | configurable — default 262 144 bytes (256 KiB) |
 | IPv6           | IPv4-preferred; falls back to IPv6 for IPv6-only hosts |
@@ -215,15 +215,20 @@ a silent timeout.
 - `SocketError.ConnectionReset` — silently ignored (ICMP port-unreachable on Windows)
 - All other socket errors — propagated to `NetworkThread.OnError`
 
-### Reliable path (KCP)
+### Reliable delivery
 
-Room management packets (CreateRoom, JoinRoom, LeaveRoom, ListRooms),
-handshake packets, RPC calls, variable updates, and spawn/despawn notifications
-travel over **KCP** (port 7778) — a reliable, ordered, congestion-controlled
-protocol built on top of UDP.
+The shipped `UdpTransport` is a **single UDP socket** (default port 7777).
+Every packet — handshake, room management, RPC, variable updates,
+spawn/despawn, and 30 Hz state sync — travels over that one socket. Packets
+that require acknowledged delivery are tagged with the `FLAG_RELIABLE` bit
+(see [Protocol §2](protocol.md#2-flag-bits)); `ReliableChannel` holds the
+client-side ARQ state for that path.
 
-Fast-path game state (position/rotation at 30 Hz) travels over the plain
-UDP socket (port 7777) for minimum latency.
+The RTMPE gateway *additionally* exposes an optional **KCP** reliable
+transport on port 7778 — a reliable, ordered, congestion-controlled protocol
+over UDP. The SDK does **not** ship a KCP client transport: a game that wants
+the KCP path must register one through `NetworkManager.SetTransportFactory`.
+With the default `UdpTransport`, all traffic uses port 7777 only.
 
 ---
 
@@ -334,10 +339,10 @@ of continuous traffic, so real games never hit this. At `2³² − 1_048_576`
 
 ### Anti-replay
 
-A **128-bit sliding window** per session (`REPLAY_WINDOW_SIZE = 128`) is
-maintained on the gateway. The SDK does not maintain a client-side window; it
-relies on the gateway to reject replayed packets. AEAD authentication failure
-causes a silent client-side packet drop.
+A sliding anti-replay window per session is maintained on the gateway. The SDK
+does not maintain a client-side window; it relies on the gateway to reject
+replayed packets. AEAD authentication failure causes a silent client-side
+packet drop.
 
 ### Payload compression
 
@@ -415,9 +420,9 @@ always present regardless of entry path:
 
 ### RoomManager
 
-Handles room CRUD over the reliable KCP channel. Exposes C# events for all
-room lifecycle outcomes. Internally maintains a FIFO `Queue<CreateRoomOptions>`
-capped at 16 pending creates (`MaxPendingCreates`).
+Handles room CRUD with `FLAG_RELIABLE` (reliable delivery). Exposes C# events
+for all room lifecycle outcomes. Internally maintains a FIFO
+`Queue<CreateRoomOptions>` capped at 16 pending creates (`MaxPendingCreates`).
 
 ### SpawnManager
 
@@ -434,8 +439,11 @@ Manages the lifecycle of networked GameObjects.
 - `OnPlayerLeftRoom` — despawns all objects with `DestroyWithOwner = true` for
   the disconnected player; non-`DestroyWithOwner` objects wait for a server
   ownership grant.
-- `GenerateObjectId` — `(playerId & 0xFFFFFFFF) << 32 | localCounter` —
-  guarantees uniqueness across players.
+- `GenerateObjectId` — the high 32 bits are an avalanche-mixed digest of the
+  64-bit gateway session id (`ObjectIdMath.MixSessionId` — a xor-fold plus
+  SplitMix64 finalizer); the low 32 bits are a per-session spawn counter.
+  The mixing spreads ids across the 64-bit space so two players' ids do not
+  collide without a server round-trip.
 
 ### OwnershipManager
 
@@ -733,11 +741,13 @@ despawn time. Apps that need to migrate live objects must `Despawn` then
 Example: owner moves the player → `NetworkTransform` sends a position update.
 
 ```
-1. NetworkTransform.LateUpdate()
+1. NetworkTransform.Update()
      position delta > threshold?  yes → send
 
-2. TransformPacketBuilder.BuildStateDelta(objectId, changedMask, pos, rot, scale)
-     → byte[] payload  (48 bytes max, little-endian floats)
+2. TransformPacketBuilder.BuildUpdatePayload(objectId, transformState)
+     → byte[] payload — fixed 48 bytes: [object_id:8][pos:12][rot:16][scale:12]
+       (little-endian floats). BuildQuantizedUpdatePayload produces a 25-byte
+       quantized variant when quantization is enabled.
 
 3. PacketBuilder.Build(PacketType.StateSync, payload)
      → byte[] rawPacket  [header:13][payload:N]

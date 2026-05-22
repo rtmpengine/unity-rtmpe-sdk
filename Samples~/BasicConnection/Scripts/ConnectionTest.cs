@@ -4,12 +4,15 @@
 // live connection status with OnGUI, and disconnect cleanly on Destroy.
 //
 // Quick Start:
-//   1. Attach this script to any GameObject in your test scene.
-//   2. Set apiKey in the Inspector (or leave blank to use the value from
-//      NetworkSettings assigned to NetworkManager).
-//   3. Fill in apiKeyPskHex inside your NetworkSettings asset to match the
+//   1. Add a NetworkManager component to a GameObject in your test scene
+//      (Component > RTMPE > NetworkManager). ConnectionTest requires one —
+//      NetworkManager.Instance returns null when the scene has none.
+//   2. Attach this script to a GameObject in the same scene.
+//   3. Set apiKey in the Inspector (or leave blank to use the value from
+//      the NetworkSettings asset assigned to NetworkManager).
+//   4. Fill in apiKeyPskHex inside your NetworkSettings asset to match the
 //      PSK configured on your gateway (required for the encrypted handshake).
-//   4. Press Play.
+//   5. Press Play.
 
 using System.Collections;
 using System.Text;
@@ -19,9 +22,10 @@ using RTMPE.Core;
 namespace RTMPE.Samples.BasicConnection
 {
     /// <summary>
-    /// Minimal RTMPE connection demo.
-    /// Attach to a scene GameObject — <see cref="NetworkManager"/> will be
-    /// auto-created as a persistent singleton if not already present.
+    /// Minimal RTMPE connection demo. Attach to a scene GameObject.
+    /// Requires a <see cref="NetworkManager"/> component to be present in the
+    /// scene — <see cref="NetworkManager.Instance"/> returns <c>null</c> (and
+    /// logs a warning) when the scene contains none.
     /// </summary>
     public sealed class ConnectionTest : MonoBehaviour
     {

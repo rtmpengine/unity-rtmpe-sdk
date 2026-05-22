@@ -1,6 +1,6 @@
 // RTMPE SDK — Runtime/Rooms/Lobbies/LobbyQueryOptions.cs
 //
-// Options for LobbyManager.ListRoomsAsync — controls sort order, filters,
+// Options for LobbyManager.ListRooms — controls sort order, filters,
 // and result cap.  Mirrors the server-side LobbyListPayload JSON.
 
 using System.Collections.Generic;
@@ -8,7 +8,7 @@ using System.Collections.Generic;
 namespace RTMPE.Rooms
 {
     /// <summary>
-    /// Sort order for <see cref="LobbyManager.ListRoomsAsync"/>.
+    /// Sort order for <see cref="LobbyManager.ListRooms"/>.
     /// Values MUST match <c>LobbySort</c> in <c>modules/room/domain/ports/room_repository.go</c>.
     /// </summary>
     public enum LobbySort : byte
@@ -51,7 +51,7 @@ namespace RTMPE.Rooms
     }
 
     /// <summary>
-    /// Options for <see cref="LobbyManager.ListRoomsAsync"/>.
+    /// Options for <see cref="LobbyManager.ListRooms"/>.
     /// </summary>
     public sealed class LobbyQueryOptions
     {

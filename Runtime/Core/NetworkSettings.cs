@@ -360,13 +360,13 @@ namespace RTMPE.Core
 
         // ── Forward-compat protocol toggles ────────────────────────────────────
         //
-        // The two toggles below gate the ARQ sub-header features whose gateway
+        // The toggles below gate the ARQ sub-header features whose gateway
         // counterpart is behind an environment variable / capability bit.
-        // Each toggle is OFF by default so existing deployments are
-        // unaffected.  The SDK mirrors the active toggles onto its
-        // CapabilityFlags advertisement during the handshake, so the
-        // negotiated session set never claims a feature the local side will
-        // not honour.
+        // The SDK mirrors the active toggles onto its CapabilityFlags
+        // advertisement during the handshake, so the negotiated session set
+        // never claims a feature the local side will not honour — a toggle
+        // the gateway has not also enabled simply stays dormant (the send
+        // safely downgrades to best-effort).
         //
         // SessionAck bootstrap encryption is NOT a toggle here: it is
         // negotiated automatically via CapabilityFlags.EncryptedSessionAck,
@@ -386,11 +386,12 @@ namespace RTMPE.Core
             "subsequent reliable sends continue to downgrade without further " +
             "logging.\n\n" +
             "On KCP and WebSocket transports the underlying stream already provides " +
-            "reliability at the segment/stream layer, so leaving this setting FALSE " +
-            "is the expected configuration there — the application-layer ARQ would " +
-            "duplicate work the transport already performs. The setting matters " +
-            "most for raw-UDP deployments.")]
-        private bool _emitArqSequence;
+            "reliability at the segment/stream layer, so this setting can be left " +
+            "FALSE there — the application-layer ARQ would duplicate work the " +
+            "transport already performs. It defaults to TRUE because the SDK ships " +
+            "a raw-UDP transport, where application-layer ARQ is the reliability " +
+            "mechanism for FLAG_RELIABLE packets.")]
+        private bool _emitArqSequence = true;
 
         /// <summary>
         /// When true, every outbound packet that carries

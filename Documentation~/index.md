@@ -14,7 +14,7 @@ Welcome to the RTMPE SDK documentation.
 - [Performance Tuning](performance-tuning.md) — tick rate, memory budget, pooling, IL2CPP tips
 - [API Reference](api/index.md) — complete C# class and method reference
 - [Samples](../Samples~/BasicConnection/README.md) — runnable example projects
-- [Changelog](../CHANGELOG.md) — version history
+- [Changelog](https://github.com/rtmpengine/unity-rtmpe-sdk/blob/main/CHANGELOG.md) — version history
 
 ## Protocol framing
 
@@ -43,4 +43,4 @@ Header layout (13 bytes, little-endian):
   `SpawnManager.SetObjectPool()` eliminate `Instantiate`/`Destroy` GC
   pressure for high-churn objects.
 
-Full detail in the [v1.1.0 CHANGELOG](../CHANGELOG.md).
+Full detail in the [v1.1.0 CHANGELOG](https://github.com/rtmpengine/unity-rtmpe-sdk/blob/main/CHANGELOG.md).

@@ -50,14 +50,29 @@ namespace RTMPE.Core
             else
             {
                 // No PSK configured.
-                // UNITY_EDITOR only: allow plaintext for local loopback development.
-                // All other build targets (DEVELOPMENT_BUILD, release) abort — a
-                // dev build can be distributed to testers who are not on a trusted
-                // LAN, so the plaintext path must not ship outside the editor.
+                // UNITY_EDITOR only: allow plaintext when the target gateway lives
+                // on a loopback address.  Targeting a remote gateway from the
+                // editor still aborts because the API key would otherwise traverse
+                // the editor host's primary network interface — typically a
+                // shared developer LAN.  All non-editor build targets
+                // (DEVELOPMENT_BUILD, release) abort unconditionally; a dev build
+                // can be distributed to testers who are not on a trusted LAN, so
+                // the plaintext path must never ship outside the editor.
 #if UNITY_EDITOR
+                if (!IsLoopbackGatewayEndpoint())
+                {
+                    Debug.LogError("[RTMPE] SendHandshakeInit: apiKeyPskHex is not configured AND " +
+                                   "the gateway endpoint is not on loopback.  Plaintext is permitted " +
+                                   "in the Unity Editor only when the gateway lives on 127.0.0.0/8 " +
+                                   "or ::1 — sending the API key unencrypted to a remote host would " +
+                                   "expose it to every observer on the editor's network path.  " +
+                                   "Aborting connection.  Set apiKeyPskHex in NetworkSettings or " +
+                                   "point gatewayEndpoint at a loopback address.");
+                    return;
+                }
                 Debug.LogWarning("[RTMPE] apiKeyPskHex is not configured — sending API key " +
-                                 "unencrypted. This path is permitted only in the Unity Editor " +
-                                 "for local loopback development. Set apiKeyPskHex in " +
+                                 "unencrypted over loopback.  This path is permitted only in the " +
+                                 "Unity Editor for local development.  Set apiKeyPskHex in " +
                                  "NetworkSettings before creating any distributable build.");
                 var keyBytes = System.Text.Encoding.UTF8.GetBytes(apiKey);
                 encryptedPayload = new byte[2 + keyBytes.Length];
@@ -86,6 +101,35 @@ namespace RTMPE.Core
             SendToWire(packet);
             LogDebug($"HandshakeInit sent ({packet.Length} B).");
         }
+
+#if UNITY_EDITOR
+        // IsLoopbackGatewayEndpoint reports whether the configured gateway
+        // host resolves to a loopback address.  Gates the editor-only
+        // plaintext handshake path: the API key may travel unencrypted only
+        // when the destination is unambiguously on the local machine and
+        // therefore unreachable from any external observer.
+        //
+        // Recognised loopback forms:
+        //   - Literal IPv4 in 127.0.0.0/8
+        //   - Literal IPv6 ::1
+        //   - The hostname "localhost" (case-insensitive)
+        //
+        // Any other shape — including unresolved hostnames and 0.0.0.0 — is
+        // treated as remote and refuses the plaintext path.  Caller already
+        // logs the refusal; this helper returns a plain bool and avoids
+        // any DNS resolution that could block the connect path.
+        private bool IsLoopbackGatewayEndpoint()
+        {
+            string host = _settings?.serverHost;
+            if (string.IsNullOrEmpty(host)) return false;
+            if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase)) return true;
+            if (System.Net.IPAddress.TryParse(host, out var addr))
+            {
+                if (System.Net.IPAddress.IsLoopback(addr)) return true;
+            }
+            return false;
+        }
+#endif
 
         private void SendDisconnect()
         {

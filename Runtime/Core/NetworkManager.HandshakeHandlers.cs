@@ -432,6 +432,21 @@ namespace RTMPE.Core
                             "outside the protocol's defined set.");
                     return;
 
+                case HeaderValidationResult.UnknownType:
+                    // The type byte does not match any defined PacketType
+                    // opcode.  The Rust gateway only ever emits bytes from its
+                    // explicit allow-list (`PacketType::try_from`), so an
+                    // off-list byte is either a tampered frame or a
+                    // version-skewed gateway running a future opcode this
+                    // build does not implement.  Drops the frame and shares
+                    // the malformed-header warning latch so a flood cannot
+                    // saturate the log pipeline.
+                    if (ShouldWarn(ref _lastBadHeaderWarnTicks))
+                        Debug.LogWarning(
+                            $"[RTMPE] Dropped packet: unknown packet type 0x" +
+                            $"{data[PacketProtocol.OFFSET_TYPE]:X2}.");
+                    return;
+
                 case HeaderValidationResult.Ok:
                     break;
             }
@@ -846,11 +861,34 @@ namespace RTMPE.Core
             // A gateway that does not understand the cap field tolerates the
             // trailing bytes (`payload[..32]` semantics are unchanged), so
             // emitting the advertisement is safe against legacy gateways.
+            //
+            // When ComputeLocalCaps signals InitHashEcho support — true on
+            // every Init-flow handshake where the Round-1 ciphertext is in
+            // scope — the SDK pairs the cap bit with the SHA-256 echo at
+            // payload[37..69].  The gateway compares it against the same
+            // hash it computed at Round-1, binding the ECDH exchange to the
+            // exact session that authenticated the API key.  Reconnect
+            // flows leave _lastHandshakeInitCiphertext null and therefore
+            // do not advertise the bit: the single-use reconnect token
+            // already provides the same binding without an echo.
             RTMPE.Core.Protocol.CapabilityFlags clientCaps = ComputeLocalCaps();
-            var response = _packetBuilder.BuildHandshakeResponse(
-                _handshakeHandler.ClientPublicKey,
-                RTMPE.Protocol.WireFormat.Default,
-                clientCaps);
+            byte[] initHashEcho = null;
+            if ((clientCaps & RTMPE.Core.Protocol.CapabilityFlags.InitHashEcho) != 0
+                && _lastHandshakeInitCiphertext != null)
+            {
+                initHashEcho = RTMPE.Protocol.PacketBuilder.ComputeInitHashEcho(
+                    _lastHandshakeInitCiphertext);
+            }
+            byte[] response = initHashEcho != null
+                ? _packetBuilder.BuildHandshakeResponse(
+                    _handshakeHandler.ClientPublicKey,
+                    RTMPE.Protocol.WireFormat.Default,
+                    clientCaps,
+                    initHashEcho)
+                : _packetBuilder.BuildHandshakeResponse(
+                    _handshakeHandler.ClientPublicKey,
+                    RTMPE.Protocol.WireFormat.Default,
+                    clientCaps);
             SendToWire(response);
             LogDebug("Sent HandshakeResponse — awaiting SessionAck.");
         }
@@ -862,15 +900,26 @@ namespace RTMPE.Core
         /// and <see cref="RTMPE.Core.Protocol.CapabilityFlags.ArqAck"/> is
         /// added only when the local <c>EmitArqSequence</c> opt-in is active,
         /// keeping the on-wire promise honest (the SDK cannot consume the
-        /// gateway's DataAck without the local opt-in).  The same value is
-        /// sent in HandshakeResponse and re-derived in OnSessionAck for the
-        /// negotiation intersection, so both call sites route through here.
+        /// gateway's DataAck without the local opt-in).
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.InitHashEcho"/> is
+        /// added on every Init-flow handshake where the Round-1 ciphertext is
+        /// still cached: only then can the SDK compute the matching echo at
+        /// <c>payload[37..69]</c>.  Reconnect flows clear the cache before
+        /// reaching this point and therefore advertise the cap as absent —
+        /// the gateway's reconnect short-circuit handles the binding
+        /// independently of the echo.
+        ///
+        /// The same value is sent in HandshakeResponse and re-derived in
+        /// OnSessionAck for the negotiation intersection, so both call sites
+        /// route through here.
         /// </summary>
         private RTMPE.Core.Protocol.CapabilityFlags ComputeLocalCaps()
         {
             var caps = RTMPE.Core.Protocol.CapabilityFlags.EncryptedSessionAck;
             if (_settings != null && _settings.EmitArqSequence)
                 caps |= RTMPE.Core.Protocol.CapabilityFlags.ArqAck;
+            if (_lastHandshakeInitCiphertext != null)
+                caps |= RTMPE.Core.Protocol.CapabilityFlags.InitHashEcho;
             return caps;
         }
 

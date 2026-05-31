@@ -216,8 +216,10 @@ namespace RTMPE.Core
 
         // Persistent server-static-key pin store, used by the Trust-On-First-Use
         // mode of NetworkSettings.serverPinningMode.  Lazily initialised to a
-        // PlayerPrefsPinStore on first read; tests inject a custom store via
-        // SetPinStore() before Connect() to avoid touching the player's prefs.
+        // MigratingPinStore on first read (hardened EncryptedFilePinStore primary
+        // + lazy migration from the legacy PlayerPrefsPinStore — see SDK-H1 fix
+        // in MigratingPinStore.cs); tests inject a custom store via
+        // SetPinStore() before Connect() to avoid touching player storage.
         private IServerKeyPinStore _pinStore;
 
         // Channel-binding context for the current handshake.
@@ -399,7 +401,10 @@ namespace RTMPE.Core
 
         /// <summary>
         /// Persistent server-static-key pin store used in Trust-On-First-Use
-        /// mode.  Lazily initialised to a <see cref="PlayerPrefsPinStore"/>;
+        /// mode.  Lazily initialised to a <see cref="MigratingPinStore"/>,
+        /// which writes through to a hardened <see cref="EncryptedFilePinStore"/>
+        /// (HMAC-bound to the device) and migrates any previously persisted
+        /// pin from a legacy <see cref="PlayerPrefsPinStore"/> on first read;
         /// tests and games with custom storage requirements may replace it
         /// via <see cref="SetPinStore"/> before calling <see cref="Connect"/>.
         /// </summary>
@@ -407,7 +412,7 @@ namespace RTMPE.Core
         {
             get
             {
-                if (_pinStore == null) _pinStore = new PlayerPrefsPinStore();
+                if (_pinStore == null) _pinStore = new MigratingPinStore();
                 return _pinStore;
             }
         }
@@ -416,7 +421,7 @@ namespace RTMPE.Core
         /// Inject a custom <see cref="IServerKeyPinStore"/>.  Must be called
         /// before <see cref="Connect"/> for the new store to be consulted on
         /// the upcoming Challenge.  Pass <see langword="null"/> to revert to
-        /// the default <see cref="PlayerPrefsPinStore"/>.
+        /// the default <see cref="MigratingPinStore"/>.
         /// </summary>
         public void SetPinStore(IServerKeyPinStore store) => _pinStore = store;
 
@@ -583,15 +588,29 @@ namespace RTMPE.Core
         }
         private NetworkSceneManager _sceneManager;
 
-        /// <summary>JWT bearer token — valid after SessionAck. Use for Room Service calls.</summary>
-        public string JwtToken => _jwtToken;
+        /// <summary>
+        /// JWT bearer token issued by the server at <c>SessionAck</c> —
+        /// valid for the lifetime of the current session and used to
+        /// authenticate Room Service calls.  Wrapped in a
+        /// <see cref="RedactedString"/> so the value cannot leak through
+        /// <c>Debug.Log</c>, string interpolation, or a default JSON
+        /// dump: those code paths see the literal <c>&lt;redacted&gt;</c>
+        /// instead.  Call <see cref="RedactedString.Reveal"/> at the
+        /// point of use, never beforehand, and never store the revealed
+        /// value in a long-lived field.
+        /// </summary>
+        public RedactedString JwtToken => new RedactedString(_jwtToken);
 
         /// <summary>
-        /// **N-1** — current reconnect token, non-null whenever a previous
-        /// session's <c>SessionAck</c> supplied one and it has not yet been
-        /// consumed.  Expose to apps that want to branch on <see cref="CanReconnect"/>.
+        /// **N-1** — current reconnect token, non-empty whenever a
+        /// previous session's <c>SessionAck</c> supplied one and it has
+        /// not yet been consumed.  Wrapped in <see cref="RedactedString"/>
+        /// for the same reason as <see cref="JwtToken"/>; use
+        /// <see cref="CanReconnect"/> for the boolean state check and
+        /// only reveal the underlying token at the point of attaching
+        /// it to an outbound request.
         /// </summary>
-        public string ReconnectToken => _reconnectToken;
+        public RedactedString ReconnectToken => new RedactedString(_reconnectToken);
 
         /// <summary>
         /// **N-1** — <see langword="true"/> when the SDK is holding a valid

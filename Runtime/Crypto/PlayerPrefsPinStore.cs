@@ -93,8 +93,28 @@ namespace RTMPE.Crypto
             // Hex-encode for human inspection in the OS-level prefs store.
             var sb = new System.Text.StringBuilder(64);
             for (int i = 0; i < 32; i++) sb.Append(pin[i].ToString("x2"));
+            string nextHex = sb.ToString();
 
-            _backend.SetString(KeyPrefix + endpoint, sb.ToString());
+            // Detect pin replacement against the existing entry.  TOFU policy
+            // captures the pin on the very first connect, so any subsequent
+            // change is either a legitimate operator rotation (a fresh key
+            // pair was deployed) or a tampering attempt (an attacker with
+            // PlayerPrefs write access swapped in a key they control).  The
+            // SDK has no out-of-band signal to distinguish those two cases,
+            // but surfacing the transition via a structured warning gives
+            // ops a forensics trail that a silent overwrite would not.
+            string priorHex = _backend.GetString(KeyPrefix + endpoint, string.Empty);
+            if (!string.IsNullOrEmpty(priorHex) &&
+                !string.Equals(priorHex, nextHex, System.StringComparison.OrdinalIgnoreCase))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] PlayerPrefsPinStore: replacing existing pin for endpoint {endpoint}. " +
+                    "This is expected after an operator-driven key rotation; an unexpected change " +
+                    "indicates either a re-installation or unauthorised modification of local " +
+                    "preferences.  Verify the new pin against the server's published key out of band.");
+            }
+
+            _backend.SetString(KeyPrefix + endpoint, nextHex);
             // Save() is required on iOS/Android to flush before app suspend;
             // skipping it would lose the pin if the OS killed the process
             // immediately after the first handshake.

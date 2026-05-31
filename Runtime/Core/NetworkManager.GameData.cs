@@ -524,6 +524,17 @@ namespace RTMPE.Core
         {
             if (_networkThread == null || _packetBuilder == null) return;
 
+            // Sender-side finiteness gate.  The gateway parser rejects any
+            // NaN/±Inf component as a malformed transform, tearing the
+            // channel down and forcing the client into a full reconnect.
+            // Surfacing the misuse at the call boundary lets the caller's
+            // own controller logic fail with a clear exception instead of
+            // silently corrupting the session.  Matches InputPayload.WriteTo.
+            if (float.IsNaN(x) || float.IsInfinity(x))
+                throw new InvalidOperationException("SendPositionUpdate: x is not finite");
+            if (float.IsNaN(y) || float.IsInfinity(y))
+                throw new InvalidOperationException("SendPositionUpdate: y is not finite");
+
             // Use SingleToInt32Bits + explicit byte extraction (same pattern as
             // TransformPacketBuilder.WriteF32LE) to avoid the two temporary byte[]
             // allocations that BitConverter.GetBytes(float) causes per call.

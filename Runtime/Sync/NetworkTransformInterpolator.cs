@@ -84,9 +84,14 @@ namespace RTMPE.Sync
                  "is pulled back along the line to the previous position, so a " +
                  "peer streaming teleported coordinates is walked toward the " +
                  "claimed point at the ceiling instead of snapping there on " +
-                 "every observer's screen.  Set to 0 to disable the gate for " +
-                 "projects whose remote objects legitimately exceed the ceiling.")]
-        [SerializeField] private float _maxInterpolatedSpeed = 100f;
+                 "every observer's screen.  The 50 m/s default covers the " +
+                 "ceiling for typical FPS / battle-royale / MMO movement " +
+                 "(roughly Bolt's 12 m/s sprint plus generous head-room for " +
+                 "vehicles, jump-pads, and grappling-style traversal); raise " +
+                 "the value for racing or aerial-vehicle games whose remote " +
+                 "objects legitimately exceed it, or set it to 0 to disable " +
+                 "the gate entirely.")]
+        [SerializeField] private float _maxInterpolatedSpeed = 50f;
 
         [Tooltip("Maximum accepted skew (seconds) into the future relative to " +
                  "the local clock.  Defends the interpolator against a hostile " +
@@ -651,7 +656,7 @@ namespace RTMPE.Sync
             float  interpolationDelay     = 0.1f,
             bool   interpolateScale       = false,
             double maxFutureSkewSeconds   = 10.0,
-            float  maxInterpolatedSpeed   = 100f)
+            float  maxInterpolatedSpeed   = 50f)
         {
             lock (_syncRoot)
             {

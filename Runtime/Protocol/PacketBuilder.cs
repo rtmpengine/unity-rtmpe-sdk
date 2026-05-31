@@ -134,19 +134,70 @@ namespace RTMPE.Protocol
 
         /// <summary>
         /// Build a <c>HandshakeResponse</c> packet (type 0x07) with an
-        /// explicit wire-format preference and a capability advertisement.
-        /// When <paramref name="clientCaps"/> is
-        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.None"/> the
-        /// trailing four bytes are omitted entirely so the on-wire size
-        /// stays compatible with the pre-capability gateway.
+        /// explicit wire-format preference and a capability advertisement,
+        /// without the Round-1 init-hash echo.  Use the four-argument
+        /// overload to include the echo when
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.InitHashEcho"/> is
+        /// part of the advertised set — without an echo at
+        /// <c>payload[37..69]</c> the gateway will reject the response as
+        /// contradictory.
         /// </summary>
         public byte[] BuildHandshakeResponse(
             byte[] clientPublicKey,
             WireFormatVersion preferredWireFormat,
             RTMPE.Core.Protocol.CapabilityFlags clientCaps)
+            => BuildHandshakeResponse(
+                clientPublicKey,
+                preferredWireFormat,
+                clientCaps,
+                initHashEcho: default);
+
+        /// <summary>
+        /// Build a <c>HandshakeResponse</c> packet (type 0x07) with an
+        /// explicit wire-format preference, a capability advertisement, and
+        /// an optional 32-byte Round-1 init-hash echo.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Wire layout decisions follow <paramref name="clientCaps"/>:
+        /// </para>
+        /// <list type="bullet">
+        /// <item><c>None</c> and empty echo → 33-byte payload (pre-capability shape).</item>
+        /// <item>Caps without <see cref="RTMPE.Core.Protocol.CapabilityFlags.InitHashEcho"/>
+        /// → 37-byte payload (caps tail at <c>payload[33..37]</c>).</item>
+        /// <item>Caps including <see cref="RTMPE.Core.Protocol.CapabilityFlags.InitHashEcho"/>
+        /// → 69-byte payload (echo at <c>payload[37..69]</c>).  The echo must
+        /// be the SHA-256 of the Round-1 <c>HandshakeInit</c> ciphertext;
+        /// callers compute it via <see cref="ComputeInitHashEcho"/>.</item>
+        /// </list>
+        /// <para>
+        /// An echo without the matching cap bit is silently dropped: the bit
+        /// is the gateway's signal that the trailing bytes are meaningful.
+        /// The reverse — cap bit advertised but echo of the wrong length —
+        /// throws so the call site catches the contradiction at build time
+        /// rather than at the gateway as an opaque <c>InvalidFormat</c>
+        /// rejection.
+        /// </para>
+        /// </remarks>
+        public byte[] BuildHandshakeResponse(
+            byte[] clientPublicKey,
+            WireFormatVersion preferredWireFormat,
+            RTMPE.Core.Protocol.CapabilityFlags clientCaps,
+            ReadOnlySpan<byte> initHashEcho)
         {
             if (clientPublicKey == null || clientPublicKey.Length != 32)
                 throw new ArgumentException("clientPublicKey must be exactly 32 bytes.", nameof(clientPublicKey));
+
+            bool advertisesEcho =
+                (clientCaps & RTMPE.Core.Protocol.CapabilityFlags.InitHashEcho) != 0;
+
+            if (advertisesEcho && initHashEcho.Length != InitHashEchoLen)
+            {
+                throw new ArgumentException(
+                    $"initHashEcho must be exactly {InitHashEchoLen} bytes when " +
+                    $"CapabilityFlags.InitHashEcho is advertised (got {initHashEcho.Length}).",
+                    nameof(initHashEcho));
+            }
 
             // Omit the cap tail when nothing is advertised so the on-wire
             // packet stays byte-identical to the pre-cap shape that the
@@ -157,9 +208,20 @@ namespace RTMPE.Protocol
             // operator sees in packet captures unchanged for the common
             // case.
             bool emitCaps = clientCaps != RTMPE.Core.Protocol.CapabilityFlags.None;
-            int payloadLen = emitCaps
-                ? 33 + RTMPE.Core.Protocol.CapabilityFlagsWire.WireSize
-                : 33;
+            int payloadLen;
+            if (advertisesEcho)
+            {
+                // 32 (pub key) + 1 (wire format) + 4 (caps) + 32 (echo)
+                payloadLen = InitHashEchoPayloadLen;
+            }
+            else if (emitCaps)
+            {
+                payloadLen = 33 + RTMPE.Core.Protocol.CapabilityFlagsWire.WireSize;
+            }
+            else
+            {
+                payloadLen = 33;
+            }
 
             // Allocating a fresh buffer keeps the caller's
             // `clientPublicKey` slice untouched (zeroising is the
@@ -172,7 +234,65 @@ namespace RTMPE.Protocol
                 RTMPE.Core.Protocol.CapabilityFlagsWire.WriteLittleEndian(
                     payload, offset: 33, clientCaps);
             }
+            if (advertisesEcho)
+            {
+                initHashEcho.CopyTo(new Span<byte>(payload, InitHashEchoOffset, InitHashEchoLen));
+            }
             return Build(PacketType.HandshakeResponse, PacketFlags.None, payload);
+        }
+
+        /// <summary>
+        /// Byte length of the Round-1 init-hash echo carried at
+        /// <c>payload[37..69]</c> of a Round-2 <see cref="PacketType.HandshakeResponse"/>.
+        /// Fixed at the SHA-256 digest size; exposed as a named constant so
+        /// every wire-layout reference reads from the same source of truth.
+        /// </summary>
+        public const int InitHashEchoLen = 32;
+
+        /// <summary>
+        /// Offset within the <see cref="PacketType.HandshakeResponse"/>
+        /// payload at which the Round-1 init-hash echo begins.  Sits
+        /// immediately after the 32-byte ephemeral public key, the 1-byte
+        /// wire-format version, and the 4-byte capability tail.
+        /// </summary>
+        public const int InitHashEchoOffset = 37;
+
+        /// <summary>
+        /// Total payload length of a Round-2 <see cref="PacketType.HandshakeResponse"/>
+        /// that carries the init-hash echo: <see cref="InitHashEchoOffset"/>
+        /// + <see cref="InitHashEchoLen"/> = 69 bytes.  Pinned so a future
+        /// reshuffle of the leading fields surfaces in one place.
+        /// </summary>
+        public const int InitHashEchoPayloadLen = InitHashEchoOffset + InitHashEchoLen;
+
+        /// <summary>
+        /// Compute the SHA-256 of the Round-1 <see cref="PacketType.HandshakeInit"/>
+        /// ciphertext, suitable for passing as the <c>initHashEcho</c> argument
+        /// to the four-argument <see cref="BuildHandshakeResponse(byte[], WireFormatVersion, RTMPE.Core.Protocol.CapabilityFlags, ReadOnlySpan{byte})"/>.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The input must be the exact byte sequence the SDK passed to
+        /// <see cref="BuildHandshakeInit"/> as <c>encryptedApiKeyPayload</c>:
+        /// the gateway computes its side of the binding by hashing the same
+        /// bytes it received as the <see cref="PacketType.HandshakeInit"/>
+        /// payload, so any per-byte divergence collapses the echo match.
+        /// The cached value lives on <c>NetworkManager._lastHandshakeInitCiphertext</c>
+        /// for the duration of the handshake.
+        /// </para>
+        /// <para>
+        /// SHA-256 is fixed-output and side-channel-irrelevant for this
+        /// public-data input, so a managed <see cref="System.Security.Cryptography.SHA256"/>
+        /// implementation is sufficient; there is no secret keying material in
+        /// scope.
+        /// </para>
+        /// </remarks>
+        public static byte[] ComputeInitHashEcho(byte[] handshakeInitCiphertext)
+        {
+            if (handshakeInitCiphertext == null)
+                throw new ArgumentNullException(nameof(handshakeInitCiphertext));
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            return sha.ComputeHash(handshakeInitCiphertext);
         }
 
         /// <summary>

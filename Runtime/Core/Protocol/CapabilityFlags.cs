@@ -115,6 +115,46 @@ namespace RTMPE.Core.Protocol
         /// regresses a legacy deployment.
         /// </summary>
         IdentitySignedJwt = 1u << 2,
+
+        /// <summary>
+        /// Bit 3 — Client commits to including the 32-byte Round-1
+        /// init-hash echo in every <see cref="PacketType.HandshakeResponse"/>
+        /// (Round-2) payload that is not a reconnect.  The echo is the
+        /// SHA-256 of the encrypted Round-1 <see cref="PacketType.HandshakeInit"/>
+        /// wire payload and is written to <c>payload[37..69]</c>, immediately
+        /// after the 4-byte capability tail at <c>payload[33..37]</c>.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Unlike <see cref="ArqAck"/> and <see cref="EncryptedSessionAck"/>,
+        /// this bit is NOT subject to a <c>min</c>-style negotiation.  When the
+        /// SDK advertises it the gateway treats Round-2 without an echo as a
+        /// protocol violation: the client has just committed to providing one,
+        /// so its absence is contradictory and the upgrade is rejected.  When
+        /// the SDK does NOT advertise it the gateway keeps accepting the
+        /// echo-less wire shape for backward compatibility with pre-extension
+        /// builds, but increments a deprecation counter so operators can see
+        /// the legacy-bypass surface shrinking to zero before the transitional
+        /// accept-path is removed.
+        /// </para>
+        /// <para>
+        /// Reconnect <see cref="PacketType.ReconnectInit"/> flows are
+        /// unaffected: the single-use reconnect token already binds Round-2
+        /// to the originating Round-1, so the echo would be redundant and the
+        /// gateway's <c>CLIENT_INIT_HASH_ABSENT</c> sentinel short-circuits
+        /// the echo check on that path.
+        /// </para>
+        /// <para>
+        /// Channel-binding rationale: an on-path attacker on a shared NAT
+        /// segment who captures the victim's Round-1 packet can otherwise
+        /// race Round-2 from the same <c>SocketAddr</c> with their own
+        /// ephemeral key.  The echo proves that the Round-2 sender observed
+        /// the same Round-1 packet the gateway holds in its pending-auth
+        /// slot, binding the ECDH key exchange to the session that
+        /// authenticated the API key.
+        /// </para>
+        /// </remarks>
+        InitHashEcho = 1u << 3,
     }
 
     /// <summary>

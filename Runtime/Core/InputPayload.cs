@@ -4,9 +4,21 @@
 //
 // Wire format (13 bytes, all little-endian):
 //  [0..3]   tick   : u32  — monotone client tick counter
-//  [4..7]   move_x : f32  — horizontal movement input, clamped to [-1, 1]
-//  [8..11]  move_y : f32  — vertical   movement input, clamped to [-1, 1]
+//  [4..7]   move_x : f32  — horizontal movement input (saturated to [-1, 1])
+//  [8..11]  move_y : f32  — vertical   movement input (saturated to [-1, 1])
 //  [12]     flags  : u8   — bit 0 = Jump, bits 1-7 reserved
+//
+// The synchronization service's input-batch parser rejects any axis value
+// outside the [-1.01, +1.01] tolerance window
+// (modules/synchronization/domain/entities/input_payload.go::isValidAxis)
+// and drops the whole batch silently on the receive side.  Saturating
+// to [-1, 1] at the sender boundary keeps every legitimate analogue-stick
+// noise (1.0001 over-shoot) inside the server's tolerance margin while
+// preventing a buggy controller that produces an out-of-range value
+// (e.g. raw mouse-delta in world units) from silently freezing player
+// movement.  NaN / ±Infinity are still rejected outright at the sender —
+// the receive-side parser rejects them as well, and the local CSP buffer
+// must not carry non-finite inputs into reconciliation replay.
 //
 // No UnityEngine dependency so this file compiles in both Unity and plain
 // .NET xunit projects without stubs.
@@ -25,10 +37,20 @@ namespace RTMPE.Core
         /// <summary>Monotone client tick at which this input was captured.</summary>
         public uint  Tick;
 
-        /// <summary>Horizontal movement input, clamped to [-1, 1].</summary>
+        /// <summary>
+        /// Horizontal movement input on the gameplay-layer [-1, 1] axis.
+        /// Values outside the envelope are silently saturated to ±1 at
+        /// serialisation time so the wire bytes always sit comfortably
+        /// inside the server-side tolerance window (see
+        /// <see cref="WriteTo"/> for the full rationale).
+        /// </summary>
         public float MoveX;
 
-        /// <summary>Vertical movement input (forward/back), clamped to [-1, 1].</summary>
+        /// <summary>
+        /// Vertical (forward/back) movement input on the gameplay-layer
+        /// [-1, 1] axis.  Same saturate-on-write contract as
+        /// <see cref="MoveX"/>.
+        /// </summary>
         public float MoveY;
 
         /// <summary>True when the jump button is pressed this frame.</summary>
@@ -77,9 +99,19 @@ namespace RTMPE.Core
                 throw new InvalidOperationException("InputPayload.MoveX is not finite");
             if (float.IsNaN(MoveY) || float.IsInfinity(MoveY))
                 throw new InvalidOperationException("InputPayload.MoveY is not finite");
+            // Saturate to the gameplay [-1, 1] envelope.  The synchronization
+            // service's ParseInputBatch (input_payload.go::isValidAxis)
+            // rejects any axis outside the [-1.01, +1.01] tolerance window
+            // and silently drops the whole batch; clamping at the sender
+            // keeps a buggy or hostile controller from forcing the player
+            // into the silent-drop failure mode.  Analogue-stick noise
+            // (1.0001 over-shoot from controller deadzone math) survives
+            // unchanged because it sits inside the saturation band.
+            float moveX = MoveX < -1f ? -1f : (MoveX > 1f ? 1f : MoveX);
+            float moveY = MoveY < -1f ? -1f : (MoveY > 1f ? 1f : MoveY);
             WriteU32LE(buf, offset,      Tick);
-            WriteF32LE(buf, offset + 4,  MoveX);
-            WriteF32LE(buf, offset + 8,  MoveY);
+            WriteF32LE(buf, offset + 4,  moveX);
+            WriteF32LE(buf, offset + 8,  moveY);
             buf[offset + 12] = Jump ? FlagJump : (byte)0;
         }
 

@@ -46,6 +46,8 @@ namespace RTMPE.Core.Protocol
         UnsupportedVersion,
         /// <summary>Flags byte at <see cref="PacketProtocol.OFFSET_FLAGS"/> carries a bit outside <see cref="PacketProtocol.KNOWN_FLAGS"/>.</summary>
         MalformedFlags,
+        /// <summary>Type byte at <see cref="PacketProtocol.OFFSET_TYPE"/> does not match any defined <see cref="PacketType"/> opcode.  Mirrors the Rust gateway's <c>PacketType::try_from</c> strict reject so the SDK and gateway agree on the set of acceptable bytes.</summary>
+        UnknownType,
     }
 
     internal static class PacketGates
@@ -163,10 +165,92 @@ namespace RTMPE.Core.Protocol
             if ((data[PacketProtocol.OFFSET_FLAGS] & ~PacketProtocol.KNOWN_FLAGS) != 0)
                 return HeaderValidationResult.MalformedFlags;
 
-            type         = (PacketType)data[PacketProtocol.OFFSET_TYPE];
+            // Refuse a type byte that does not match a defined opcode.  C# enum
+            // casts are unchecked, so without this guard `(PacketType)0x99`
+            // would surface as a valid-looking value and fall through every
+            // downstream switch's default arm.  The Rust gateway's
+            // `PacketType::try_from(u8)` strict-rejects unknown bytes at
+            // parse time; mirroring that policy here keeps the two sides in
+            // lockstep on what counts as a wire-acceptable frame.
+            type = (PacketType)data[PacketProtocol.OFFSET_TYPE];
+            if (!IsKnownPacketType(type))
+                return HeaderValidationResult.UnknownType;
+
             wasEncrypted = (data[PacketProtocol.OFFSET_FLAGS]
                             & (byte)PacketFlags.Encrypted) != 0;
             return HeaderValidationResult.Ok;
+        }
+
+        /// <summary>
+        /// Strict allow-list of every defined <see cref="PacketType"/> opcode.
+        /// MUST stay in lockstep with the enum declaration in
+        /// <c>NetworkConstants.cs</c> and with
+        /// <c>PacketType::try_from</c> in
+        /// <c>modules/gateway/src/packet/header.rs</c> — protocol-sync invariant.
+        /// A new wire-format opcode must be added here in the same commit so
+        /// the receiver does not treat the new frame as <c>UnknownType</c>.
+        /// </summary>
+        internal static bool IsKnownPacketType(PacketType type)
+        {
+            switch (type)
+            {
+                // Legacy handshake
+                case PacketType.Handshake:
+                case PacketType.HandshakeAck:
+                // Keep-alive
+                case PacketType.Heartbeat:
+                case PacketType.HeartbeatAck:
+                // ECDH 4-step handshake
+                case PacketType.HandshakeInit:
+                case PacketType.Challenge:
+                case PacketType.HandshakeResponse:
+                case PacketType.SessionAck:
+                // Reconnect
+                case PacketType.ReconnectInit:
+                case PacketType.ReconnectAck:
+                // Generic data
+                case PacketType.Data:
+                case PacketType.DataAck:
+                // Room lifecycle
+                case PacketType.RoomCreate:
+                case PacketType.RoomJoin:
+                case PacketType.RoomLeave:
+                case PacketType.RoomList:
+                // Custom properties
+                case PacketType.RoomPropertyUpdate:
+                case PacketType.PlayerPropertyUpdate:
+                // Matchmaking
+                case PacketType.MatchmakingRequest:
+                case PacketType.MatchmakingResponse:
+                // Lobby
+                case PacketType.LobbyJoin:
+                case PacketType.LobbyLeave:
+                case PacketType.LobbyList:
+                case PacketType.LobbyRoomListUpdate:
+                // Room management
+                case PacketType.MasterClientChanged:
+                case PacketType.MasterClientTransfer:
+                case PacketType.KickPlayer:
+                case PacketType.SceneLoaded:
+                // Networked-object lifecycle
+                case PacketType.Spawn:
+                case PacketType.Despawn:
+                // State sync + variable updates
+                case PacketType.StateSync:
+                case PacketType.VariableUpdate:
+                case PacketType.PositionUpdate:
+                case PacketType.InputPayload:
+                case PacketType.VariableBatchUpdate:
+                // RPC
+                case PacketType.Rpc:
+                case PacketType.RpcResponse:
+                case PacketType.RpcBufferReplay:
+                // Session termination
+                case PacketType.Disconnect:
+                    return true;
+                default:
+                    return false;
+            }
         }
     }
 }

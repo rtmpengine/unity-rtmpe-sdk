@@ -22,18 +22,15 @@ namespace RTMPE.Events
             public Core.NetworkState Current;
         }
 
-        /// <summary>Raised when the connection is fully established (<c>SessionAck</c> received).</summary>
-        public struct ConnectedArgs
-        {
-            /// <summary>Server-issued JWT bearer token.</summary>
-            public string JwtToken;
-            /// <summary>Reconnect token (opaque; store for reconnect attempts).</summary>
-            public string ReconnectToken;
-            /// <summary>Crypto session ID assigned by the server.</summary>
-            public uint CryptoId;
-            /// <summary>Round-trip time in milliseconds at the time of connection.</summary>
-            public float RttMs;
-        }
+        // The OnConnected event is raised as a bare `Action` (see
+        // NetworkManager.Events.cs).  Apps that need the session-issued
+        // tokens read them directly from NetworkManager.Instance.JwtToken
+        // / .ReconnectToken at the moment they need them, where the
+        // RedactedString wrapper enforces the no-accidental-leak contract
+        // at compile time.  No structured event payload is exposed for
+        // this transition; if a future flow surfaces additional connect-
+        // time fields, define a fresh args struct alongside the typed
+        // event declaration so the two stay co-located.
 
         // ── Disconnection ─────────────────────────────────────────────────────
 

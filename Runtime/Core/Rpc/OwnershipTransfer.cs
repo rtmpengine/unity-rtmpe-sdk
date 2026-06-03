@@ -71,9 +71,31 @@ namespace RTMPE.Core.Rpc
             ushort ownerLen = (ushort)(p[8] | (p[9] << 8));
             if (request.Payload.Length < 10 + ownerLen) return;
 
-            string newOwner = ownerLen > 0
-                ? System.Text.Encoding.UTF8.GetString(request.Payload, 10, ownerLen)
-                : string.Empty;
+            // Strict UTF-8 decoder — consistent with SpawnPacketParser and JwtValidator
+            // throughout the SDK.  The lenient System.Text.Encoding.UTF8 decoder
+            // silently replaces invalid bytes with U+FFFD, so two distinct on-wire byte
+            // sequences could decode to the same string, defeating the roster-membership
+            // identity check below (SDKR-01).  A strict decoder throws on any malformed
+            // byte so the packet is treated as a protocol violation and dropped.
+            string newOwner;
+            if (ownerLen > 0)
+            {
+                try
+                {
+                    newOwner = new System.Text.UTF8Encoding(
+                        encoderShouldEmitUTF8Identifier: false,
+                        throwOnInvalidBytes: true
+                    ).GetString(request.Payload, 10, ownerLen);
+                }
+                catch (System.Exception)
+                {
+                    return; // malformed UTF-8 — treat as protocol violation, drop silently
+                }
+            }
+            else
+            {
+                newOwner = string.Empty;
+            }
 
             if (!IsAuthorized(
                     objectId, newOwner, request.SenderId,

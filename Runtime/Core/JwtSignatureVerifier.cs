@@ -145,7 +145,7 @@ namespace RTMPE.Core
             using var rsa = RSA.Create();
             try
             {
-                rsa.ImportFromPem(keyPem.AsSpan());
+                ImportRsaPublicKey(rsa, keyPem);
             }
             catch (Exception ex)
             {
@@ -165,6 +165,47 @@ namespace RTMPE.Core
                 RSASignaturePadding.Pkcs1);
             if (!ok) error = "RS256 signature did not verify";
             return ok;
+        }
+
+        // Import an RSA SubjectPublicKeyInfo ("PUBLIC KEY") PEM into rsa.
+        // RSA.ImportFromPem is .NET 5+ and is absent from the .NET Standard 2.1
+        // BCL surface (Unity's declared minimum, 2022.3).  The fallback strips
+        // the PEM armor and base64-decodes the body to DER, then delegates the
+        // SubjectPublicKeyInfo parse to RSA.ImportSubjectPublicKeyInfo — a vetted
+        // BCL method that IS available on netstandard2.1 — so no hand-rolled
+        // ASN.1 is introduced (SDKC-01).
+        private static void ImportRsaPublicKey(RSA rsa, string keyPem)
+        {
+#if NET5_0_OR_GREATER
+            rsa.ImportFromPem(keyPem.AsSpan());
+#else
+            rsa.ImportSubjectPublicKeyInfo(DecodeSpkiPem(keyPem), out _);
+#endif
+        }
+
+        /// <summary>
+        /// Decode a SubjectPublicKeyInfo ("-----BEGIN PUBLIC KEY-----") PEM to
+        /// its DER bytes: strip the armor lines and all whitespace, then
+        /// base64-decode.  This mirrors exactly what RSA.ImportFromPem does for
+        /// the "PUBLIC KEY" label; the structural parse is left to the BCL.
+        /// Always compiled so it is unit-tested on .NET 5+ even though only the
+        /// netstandard2.1 build path calls it.  Throws on a non-SPKI or
+        /// malformed block so VerifyRs256's catch surfaces a parse failure.
+        /// </summary>
+        internal static byte[] DecodeSpkiPem(string keyPem)
+        {
+            if (keyPem == null) throw new ArgumentNullException(nameof(keyPem));
+            const string begin = "-----BEGIN PUBLIC KEY-----";
+            const string end = "-----END PUBLIC KEY-----";
+            int b = keyPem.IndexOf(begin, StringComparison.Ordinal);
+            int e = keyPem.IndexOf(end, StringComparison.Ordinal);
+            if (b < 0 || e < 0 || e <= b)
+                throw new FormatException("PEM is not a SubjectPublicKeyInfo (\"PUBLIC KEY\") block");
+            string body = keyPem.Substring(b + begin.Length, e - (b + begin.Length));
+            var sb = new System.Text.StringBuilder(body.Length);
+            foreach (char ch in body)
+                if (!char.IsWhiteSpace(ch)) sb.Append(ch);
+            return Convert.FromBase64String(sb.ToString());
         }
     }
 }

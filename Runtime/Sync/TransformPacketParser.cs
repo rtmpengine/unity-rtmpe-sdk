@@ -8,14 +8,16 @@
 //  [opt]   position     : 3 × f32 LE   (12 bytes; present iff bit 0x01 set)
 //  [opt]   rotation     : 4 × f32 LE   (16 bytes; present iff bit 0x02 set)
 //  [opt]   scale        : 3 × f32 LE   (12 bytes; present iff bit 0x04 set)
+//  [opt]   input_tick   : u32 LE       (4 bytes;  present iff bit 0x08 set; SDKS-01)
 //
 // Changed-field bit constants MUST match Go's state_delta.go:
-//  ChangedPosition byte = 1 << 0  // 0x01
-//  ChangedRotation byte = 1 << 1  // 0x02
-//  ChangedScale    byte = 1 << 2  // 0x04
-//  knownMask       byte = 0x07
+//  ChangedPosition  byte = 1 << 0  // 0x01
+//  ChangedRotation  byte = 1 << 1  // 0x02
+//  ChangedScale     byte = 1 << 2  // 0x04
+//  ChangedInputTick byte = 1 << 3  // 0x08  (SDKS-01)
+//  knownMask        byte = 0x0F
 //
-// Unknown bits (bits 3..7) are rejected → TryParseStateDelta returns false.
+// Unknown bits (bits 4..7) are rejected → TryParseStateDelta returns false.
 // This prevents silent field misalignment when the protocol adds new fields.
 //
 // Caller responsibility:
@@ -39,10 +41,11 @@ namespace RTMPE.Sync
         // ── Changed-field bit flags ────────────────────────────────────────────
         //
        // SYNC RULE: These values must equal the Go constants in state_delta.go.
-        //  ChangedPosition byte = 1 << 0  // 0x01
-        //  ChangedRotation byte = 1 << 1  // 0x02
-        //  ChangedScale    byte = 1 << 2  // 0x04
-        //  knownMask       byte = 0x07
+        //  ChangedPosition  byte = 1 << 0  // 0x01
+        //  ChangedRotation  byte = 1 << 1  // 0x02
+        //  ChangedScale     byte = 1 << 2  // 0x04
+        //  ChangedInputTick byte = 1 << 3  // 0x08  (SDKS-01)
+        //  knownMask        byte = 0x0F
         //
        // A mismatch causes the parser to silently decode wrong fields.
 
@@ -55,8 +58,29 @@ namespace RTMPE.Sync
         /// <summary>Bit indicating the Scale field is present in the delta.</summary>
         public const byte ChangedScale = 0x04;
 
-        /// <summary>All currently known field bits.  Any bits outside this mask are unknown.</summary>
-        public const byte KnownMask = 0x07;
+        /// <summary>
+        /// Convenience mask covering the three transform fields (position,
+        /// rotation, scale) — <b>not</b> the input-tick bit.  Mirrors Go's
+        /// <c>ChangedAll</c> (0x07) in <c>state_delta.go</c>; use this when a
+        /// caller or test means "all transform fields" as distinct from
+        /// <see cref="KnownMask"/> (which also includes <see cref="ChangedInputTick"/>).
+        /// </summary>
+        public const byte ChangedAll = (byte)(ChangedPosition | ChangedRotation | ChangedScale); // 0x07
+
+        /// <summary>
+        /// Bit indicating an <c>InputTick</c> (u32 LE) trailing field is present
+        /// (SDKS-01).  Set by the Sync Service on incremental deltas so the
+        /// owning client can acknowledge its input buffer up to that tick.
+        /// MUST equal <c>ChangedInputTick</c> in Go's <c>state_delta.go</c>.
+        /// </summary>
+        public const byte ChangedInputTick = 0x08;
+
+        /// <summary>
+        /// All currently known field bits.  Any bits outside this mask are
+        /// unknown and cause a parse rejection.  MUST equal <c>knownMask</c>
+        /// (0x0F) in Go's <c>state_delta.go</c>.
+        /// </summary>
+        public const byte KnownMask = 0x0F;
 
         /// <summary>
         /// Total wire size of a client-to-server quantized transform-update
@@ -77,9 +101,10 @@ namespace RTMPE.Sync
         /// </summary>
         public const int DELTA_MIN_SIZE = 9;
 
-        private const int POSITION_SIZE = 12; // 3 × f32
-        private const int ROTATION_SIZE = 16; // 4 × f32 (x y z w)
-        private const int SCALE_SIZE    = 12; // 3 × f32
+        private const int POSITION_SIZE   = 12; // 3 × f32
+        private const int ROTATION_SIZE   = 16; // 4 × f32 (x y z w)
+        private const int SCALE_SIZE      = 12; // 3 × f32
+        private const int INPUT_TICK_SIZE = 4;  // 1 × u32 LE (SDKS-01)
 
         // ── Parser ─────────────────────────────────────────────────────────────
 
@@ -237,7 +262,28 @@ namespace RTMPE.Sync
                 if (!IsFinite(scale.x) || !IsFinite(scale.y) || !IsFinite(scale.z)) return false;
             }
 
-            state = new TransformState { Position = pos, Rotation = rot, Scale = scale };
+            // InputTick (u32 LE) — conditional on bit 0x08 (SDKS-01).  The
+            // server appends this LAST, after every transform field, so the
+            // offsets above are byte-identical to a record without the tick.
+            // Tick 0 is a legitimate value; presence is carried by the bit, not
+            // a sentinel, so HasConfirmedInputTick mirrors the mask exactly.
+            uint confirmedInputTick   = 0u;
+            bool hasConfirmedInputTick = false;
+            if ((changedMask & ChangedInputTick) != 0)
+            {
+                if (INPUT_TICK_SIZE > payload.Length - off) return false;
+                confirmedInputTick   = ReadU32LE(payload, off); off += 4;
+                hasConfirmedInputTick = true;
+            }
+
+            state = new TransformState
+            {
+                Position              = pos,
+                Rotation              = rot,
+                Scale                 = scale,
+                ConfirmedInputTick    = confirmedInputTick,
+                HasConfirmedInputTick = hasConfirmedInputTick,
+            };
             offset = off;
             return true;
         }
@@ -305,6 +351,14 @@ namespace RTMPE.Sync
              | ((ulong)buf[off + 5] << 40)
              | ((ulong)buf[off + 6] << 48)
              | ((ulong)buf[off + 7] << 56);
+
+        // ReadU32LE reads four consecutive bytes as a little-endian u32.
+        // Used for the SDKS-01 InputTick trailing field.
+        private static uint ReadU32LE(byte[] buf, int off)
+            =>  (uint)buf[off + 0]
+             | ((uint)buf[off + 1] <<  8)
+             | ((uint)buf[off + 2] << 16)
+             | ((uint)buf[off + 3] << 24);
 
         // ReadF32LE reads four consecutive bytes as a little-endian IEEE 754 f32.
         // BitConverter.Int32BitsToSingle performs zero-allocation bit reinterpretation

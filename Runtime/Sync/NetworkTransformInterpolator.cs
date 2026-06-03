@@ -447,6 +447,14 @@ namespace RTMPE.Sync
                     || timestamp - UnityEngine.Time.timeAsDouble > _maxFutureSkewSeconds)
                     return;
 
+                // Reject non-finite transform components before they reach the
+                // buffer or the downstream Lerp/Slerp paths.  AddState enforces
+                // this at line 284; AddStateFromSenderTick is an alternate entry
+                // point that must apply the same guard to preserve the invariant
+                // that the buffer never holds NaN/Inf components (SDKS-03).
+                if (!IsFiniteSnapshot(state))
+                    return;
+
                 // Bound an implausible position jump before the snapshot
                 // enters the buffer — identical displacement gate as the
                 // receiver-clock AddState path.

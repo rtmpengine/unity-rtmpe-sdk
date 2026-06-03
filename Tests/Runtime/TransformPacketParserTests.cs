@@ -114,13 +114,14 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        [Description("Unknown mask bit 0x08 (outside KnownMask=0x07) must cause rejection.")]
+        [Description("Unknown mask bit 0x10 (outside KnownMask=0x0F) must cause rejection. " +
+                     "Bit 0x08 is now ChangedInputTick (SDKS-01); the first genuinely-unknown bit is 0x10.")]
         public void TryParseStateDelta_UnknownMaskBit_ReturnsFalse()
         {
-            // Build a minimal 9-byte payload (no fields) but with bit 0x08 set.
+            // Build a minimal 9-byte payload (no fields) but with bit 0x10 set.
             var payload = new byte[9];
             WriteU64LE(payload, 0, 1UL);
-            payload[8] = 0x08; // unknown bit
+            payload[8] = 0x10; // unknown bit (first bit outside KnownMask=0x0F)
 
             bool ok = TransformPacketParser.TryParseStateDelta(payload, out _, out _, out _);
             Assert.IsFalse(ok);

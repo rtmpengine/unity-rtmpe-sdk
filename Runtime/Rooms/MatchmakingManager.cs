@@ -423,11 +423,22 @@ namespace RTMPE.Rooms
             return Encoding.UTF8.GetBytes(sb.ToString());
         }
 
-        // ── Minimal JSON helpers ──────────────────────────────────────────────
+        // ── JSON helper ──────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Serialises <paramref name="s"/> as a JSON string, using the
+        /// canonical <see cref="PropertyJson.AppendJsonString"/> helper that
+        /// escapes backslash, double-quote, AND all control characters
+        /// (&#x3c; 0x20) as \uXXXX sequences.  The previous hand-rolled
+        /// implementation escaped only backslash and double-quote, so a
+        /// developer-supplied string containing a tab or newline produced
+        /// malformed JSON that was silently rejected by the server (SDKR-03).
+        /// </summary>
         private static string JsonString(string s)
         {
-            return "\"" + (s ?? string.Empty).Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+            var sb = new System.Text.StringBuilder();
+            PropertyJson.AppendJsonString(sb, s ?? string.Empty);
+            return sb.ToString();
         }
 
     }

@@ -440,6 +440,16 @@ namespace RTMPE.Sync
             if (_syncRotation) transform.rotation = _reconcileStartRotation;
 
             _reconcileTimeLeft = ReconcileDuration;
+
+            // Mark the restored pose as clean so the next frame's change-
+            // detection compares against _reconcileStart (the current visible
+            // position), not the pre-correction stale baseline.  Without this
+            // call the outbound StateSync deltas computed during the lerp
+            // reference the old _lastPosition and look like intentional owner
+            // movement to the server — causing a rubber-band feedback loop on
+            // lossy links (SDKS-02).  The snap branch already calls MarkClean()
+            // at the equivalent point (line 398); this mirrors that pattern.
+            MarkClean();
         }
 
         // ── Unity lifecycle ────────────────────────────────────────────────────
@@ -689,14 +699,14 @@ namespace RTMPE.Sync
             }
 
             // ── Pooled transform send path (GC Round 2, 2026-05-02) ─────
-            // Rent the maximum possible size (full-precision = 48 B); the
-            // quantized builder writes 25 B into the same buffer when
-            // enabled.  ArrayPool.Rent may return a buffer larger than the
+            // Rent the maximum possible size (full-precision + input tick =
+            // 52 B); the quantized builder writes 29 B into the same buffer
+            // when enabled.  ArrayPool.Rent may return a buffer larger than the
             // requested size, so we always pass the *exact* written length
-            // (PAYLOAD_SIZE or QUANTIZED_PAYLOAD_SIZE) to SendStateSync so
-            // the wire frame's payload_len matches the bytes we actually
-            // wrote.  Renting always at the larger size keeps the rent path
-            // single-bucket and lets the quantized fallback path reuse the
+            // (PAYLOAD_SIZE_WITH_TICK or QUANTIZED_PAYLOAD_SIZE_WITH_TICK) to
+            // SendStateSync so the wire frame's payload_len matches the bytes we
+            // actually wrote.  Renting always at the larger size keeps the rent
+            // path single-bucket and lets the quantized fallback path reuse the
             // same buffer without a second rent.
             //
             // The send target is PacketType.StateSync (0x40), not
@@ -707,15 +717,23 @@ namespace RTMPE.Sync
             // wiring; the gateway echoes Data packets back to the sender, so
             // a transform sent under that type would never reach other
             // clients and would produce a self-feedback loop on the owner.
+            //
+            // SDKS-01: the current LocalTick is the client prediction tick that
+            // produced this pose; it rides on the uplink so the server can echo
+            // it back on the object's StateDelta as the reconciliation
+            // watermark.  Trailing-field layout keeps the 48/25-byte prefixes
+            // byte-identical, and the gateway accepts both the extended and
+            // legacy lengths.
+            uint inputTick = manager.LocalTick;
             var pool   = ArrayPool<byte>.Shared;
-            var buffer = pool.Rent(TransformPacketBuilder.PAYLOAD_SIZE);
+            var buffer = pool.Rent(TransformPacketBuilder.PAYLOAD_SIZE_WITH_TICK);
             try
             {
                 int written = 0;
                 if (settings != null && settings.quantizeTransforms)
                 {
                     written = TransformPacketBuilder.BuildQuantizedUpdatePayloadInto(
-                        buffer, 0, NetworkObjectId, state);
+                        buffer, 0, NetworkObjectId, state, inputTick);
                     // Quantized builder returns 0 on a degenerate / non-finite
                     // input.  Fall back to the full-precision encoder so the
                     // peer still receives a coherent update; the legacy
@@ -724,7 +742,7 @@ namespace RTMPE.Sync
                 if (written == 0)
                 {
                     written = TransformPacketBuilder.BuildUpdatePayloadInto(
-                        buffer, 0, NetworkObjectId, state);
+                        buffer, 0, NetworkObjectId, state, inputTick);
                 }
 
                 manager.SendStateSync(buffer, written);
@@ -816,6 +834,42 @@ namespace RTMPE.Sync
             _lastSentTimeUnscaled = timeUnscaled;
             _hasLastSent          = true;
         }
+
+        /// <summary>
+        /// Test seam — enables client-side prediction so the medium-error
+        /// reconciliation path (lerp scheduling + <see cref="MarkClean"/>)
+        /// can be exercised without the Unity Inspector.
+        /// Compiled only when <c>UNITY_INCLUDE_TESTS</c> is defined.
+        /// </summary>
+        internal void EnablePredictionForTest()
+        {
+            _enablePrediction = true;
+        }
+
+        /// <summary>
+        /// Test seam — exposes the current value of <c>_reconcileTimeLeft</c>
+        /// so tests can verify that a medium-error reconciliation actually
+        /// scheduled a lerp (non-zero value) rather than snapping or no-oping.
+        /// Compiled only when <c>UNITY_INCLUDE_TESTS</c> is defined.
+        /// </summary>
+        internal float ReconcileTimeLeftForTest => _reconcileTimeLeft;
+
+        /// <summary>
+        /// Test seam — pushes a synthetic input stamped with <paramref name="tick"/>
+        /// into the CSP input buffer so tests can verify that reconciliation
+        /// trims it against a server-supplied confirmed tick (SDKS-01).
+        /// Compiled only when <c>UNITY_INCLUDE_TESTS</c> is defined.
+        /// </summary>
+        internal void PushInputForTest(uint tick) =>
+            _inputBuffer.Push(new RTMPE.Core.InputPayload { Tick = tick });
+
+        /// <summary>
+        /// Test seam — number of unacknowledged inputs still buffered.  Used to
+        /// assert the reconciliation watermark trimmed exactly the confirmed
+        /// prefix and left the in-flight tail intact.
+        /// Compiled only when <c>UNITY_INCLUDE_TESTS</c> is defined.
+        /// </summary>
+        internal int UnackedInputCountForTest => _inputBuffer.Count;
 #endif // UNITY_INCLUDE_TESTS
 
         /// <summary>

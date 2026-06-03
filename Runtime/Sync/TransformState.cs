@@ -34,14 +34,36 @@ namespace RTMPE.Sync
         public Vector3 Scale;
 
         /// <summary>
+        /// The highest client input tick the server has incorporated into this
+        /// transform (SDKS-01).  Meaningful only when
+        /// <see cref="HasConfirmedInputTick"/> is true — tick 0 is a legitimate
+        /// value, so presence is tracked by the flag rather than a zero
+        /// sentinel.  On a server-authoritative <c>StateDelta</c> this is the
+        /// watermark the owning client passes to the replay-aware
+        /// <c>NetworkTransform.ApplyReconciliation</c> overload so it can trim
+        /// its input buffer and replay only still-in-flight inputs.
+        /// </summary>
+        public uint ConfirmedInputTick;
+
+        /// <summary>
+        /// Whether <see cref="ConfirmedInputTick"/> carries a server-supplied
+        /// value.  False for transforms that arrived without the SDKS-01
+        /// input-tick field (legacy server, quantized relay, or local state),
+        /// in which case reconciliation falls back to its local watermark.
+        /// </summary>
+        public bool HasConfirmedInputTick;
+
+        /// <summary>
         /// A <see cref="TransformState"/> at the world origin with identity
         /// rotation and unit scale.  Useful as a safe default.
         /// </summary>
         public static TransformState Identity => new TransformState
         {
-            Position = Vector3.zero,
-            Rotation = Quaternion.identity,
-            Scale    = Vector3.one,
+            Position              = Vector3.zero,
+            Rotation              = Quaternion.identity,
+            Scale                 = Vector3.one,
+            ConfirmedInputTick    = 0u,
+            HasConfirmedInputTick = false,
         };
     }
 }

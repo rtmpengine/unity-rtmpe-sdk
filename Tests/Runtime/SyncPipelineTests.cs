@@ -192,10 +192,12 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        [Description("A full delta (0x07) is 9 + 12 + 16 + 12 = 49 bytes (maximum).")]
+        [Description("A full transform delta (0x07) is 9 + 12 + 16 + 12 = 49 bytes. " +
+                     "Uses ChangedAll (transform fields), not KnownMask (which now also " +
+                     "includes the 0x08 input-tick bit, SDKS-01).")]
         public void DeltaPayload_AllFields_Is49Bytes()
         {
-            var bytes = BuildDeltaPayload(1UL, TransformPacketParser.KnownMask);
+            var bytes = BuildDeltaPayload(1UL, TransformPacketParser.ChangedAll);
 
             Assert.AreEqual(49, bytes.Length);
         }
@@ -246,13 +248,13 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        [Description("A full-mask delta (0x07) is decoded with all three transform fields.")]
+        [Description("A full transform delta (0x07) is decoded with all three transform fields.")]
         public void ParseFullDelta_AllFieldsDecoded()
         {
             var q = Quaternion.Euler(0f, 90f, 0f);
             var bytes = BuildDeltaPayload(
                 2UL,
-                TransformPacketParser.KnownMask,
+                TransformPacketParser.ChangedAll,
                 px: 1f, py: 2f, pz: 3f,
                 rx: q.x, ry: q.y, rz: q.z, rw: q.w,
                 sx: 2f, sy: 2f, sz: 2f);
@@ -262,7 +264,7 @@ namespace RTMPE.Tests
 
             Assert.IsTrue(ok);
             Assert.AreEqual(2UL, id);
-            Assert.AreEqual(TransformPacketParser.KnownMask, mask);
+            Assert.AreEqual(TransformPacketParser.ChangedAll, mask);
 
             Assert.AreEqual(1f, state.Position.x, 0.0001f, "Pos X");
             Assert.AreEqual(2f, state.Position.y, 0.0001f, "Pos Y");
@@ -279,11 +281,12 @@ namespace RTMPE.Tests
         }
 
         [Test]
-        [Description("A delta with unknown bits (0x08) is rejected by the parser.")]
+        [Description("A delta with unknown bits (0x10) is rejected by the parser. " +
+                     "0x08 is now ChangedInputTick (SDKS-01); 0x10 is the first unknown bit.")]
         public void ParseDelta_UnknownBit_ReturnsFalse()
         {
             var bytes = BuildDeltaPayload(1UL, 0x00);
-            bytes[8] = 0x08; // inject an unknown bit into the ChangedMask byte
+            bytes[8] = 0x10; // inject an unknown bit (outside KnownMask=0x0F) into the ChangedMask byte
 
             bool ok = TransformPacketParser.TryParseStateDelta(bytes, out _, out _, out _);
 
@@ -364,11 +367,11 @@ namespace RTMPE.Tests
             var q0 = Quaternion.identity;
             var q1 = Quaternion.Euler(0f, 180f, 0f);
 
-            var b0 = BuildDeltaPayload(1UL, TransformPacketParser.KnownMask,
+            var b0 = BuildDeltaPayload(1UL, TransformPacketParser.ChangedAll,
                 px:0f, py:0f, pz:0f,
                 rx:q0.x, ry:q0.y, rz:q0.z, rw:q0.w,
                 sx:1f, sy:1f, sz:1f);
-            var b1 = BuildDeltaPayload(1UL, TransformPacketParser.KnownMask,
+            var b1 = BuildDeltaPayload(1UL, TransformPacketParser.ChangedAll,
                 px:10f, py:0f, pz:0f,
                 rx:q1.x, ry:q1.y, rz:q1.z, rw:q1.w,
                 sx:2f, sy:2f, sz:2f);
@@ -694,11 +697,14 @@ namespace RTMPE.Tests
         [SetUp]
         public void SetUp()
         {
-            // Full-mask delta: worst-case parse (most bytes to read).
+            // Full transform delta: worst-case transform parse (most bytes to read).
+            // ChangedAll (0x07) covers the three transform fields; BuildDeltaPayload
+            // does not emit the SDKS-01 input-tick field, so the helper's mask must
+            // not include the 0x08 bit (which would make the parser expect a tick).
             var q = Quaternion.Euler(30f, 60f, 90f);
             _deltaPayload = BuildDeltaPayload(
                 0xDEADBEEFCAFEBABEUL,
-                TransformPacketParser.KnownMask,
+                TransformPacketParser.ChangedAll,
                 px: 1f, py: 2f, pz: 3f,
                 rx: q.x, ry: q.y, rz: q.z, rw: q.w,
                 sx: 1f, sy: 1f, sz: 1f);

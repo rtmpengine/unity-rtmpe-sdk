@@ -93,6 +93,20 @@ namespace RTMPE.Core
         /// </summary>
         public bool Push(InputPayload payload)
         {
+            // Reject non-finite movement axes before they enter the rollback
+            // buffer.  WriteTo enforces finiteness at the wire boundary and
+            // throws, but an unfinished/buggy GatherInput callback can still
+            // push NaN into the local CSP simulation where it poisons predicted
+            // transforms for every subsequent replay tick (SDKS-04).  Mirroring
+            // the WriteTo guard here keeps the buffer free of non-finite inputs
+            // regardless of whether the packet ever reaches the wire.
+            if (float.IsNaN(payload.MoveX)      || float.IsInfinity(payload.MoveX)
+                || float.IsNaN(payload.MoveY)   || float.IsInfinity(payload.MoveY))
+            {
+                unchecked { _droppedInputCount++; }
+                return false;
+            }
+
             if (_count >= Capacity)
             {
                 // Saturated: refuse the newest write.  The oldest entry is

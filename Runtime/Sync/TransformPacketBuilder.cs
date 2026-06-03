@@ -67,6 +67,17 @@ namespace RTMPE.Sync
         /// </summary>
         public const int PAYLOAD_SIZE = 48;
 
+        /// <summary>
+        /// Size of a full-precision transform payload extended with the SDKS-01
+        /// trailing input tick: <see cref="PAYLOAD_SIZE"/> + 4 (u32 LE) = 52.
+        /// The gateway accepts both 48- and 52-byte forms; the SDK send path
+        /// always emits this extended form so the server can echo the tick.
+        /// </summary>
+        public const int PAYLOAD_SIZE_WITH_TICK = PAYLOAD_SIZE + INPUT_TICK_SIZE;
+
+        /// <summary>Width of the trailing <c>input_tick</c> field (u32 LE).</summary>
+        internal const int INPUT_TICK_SIZE = 4;
+
         /// <summary>Byte offset of <c>object_id</c> within the payload.</summary>
         internal const int OFFSET_OBJECT_ID = 0;
 
@@ -85,6 +96,12 @@ namespace RTMPE.Sync
         /// + half-float scale(6) = 25 bytes.
         /// </summary>
         public const int QUANTIZED_PAYLOAD_SIZE = 25;
+
+        /// <summary>
+        /// Size of a quantized transform payload extended with the SDKS-01
+        /// trailing input tick: <see cref="QUANTIZED_PAYLOAD_SIZE"/> + 4 = 29.
+        /// </summary>
+        public const int QUANTIZED_PAYLOAD_SIZE_WITH_TICK = QUANTIZED_PAYLOAD_SIZE + INPUT_TICK_SIZE;
 
         /// <summary>
         /// Bit set in the <c>flags</c> byte of a quantized payload.  A future
@@ -114,6 +131,20 @@ namespace RTMPE.Sync
         {
             var payload = new byte[PAYLOAD_SIZE];
             BuildUpdatePayloadInto(payload, 0, objectId, state);
+            return payload;
+        }
+
+        /// <summary>
+        /// Build a 52-byte full-precision payload that appends the SDKS-01
+        /// <paramref name="inputTick"/> (u32 LE) after the transform fields.
+        /// The server echoes the tick back on the object's <c>StateDelta</c> so
+        /// the owning client can acknowledge its input buffer up to that
+        /// watermark and replay only still-in-flight inputs.
+        /// </summary>
+        public static byte[] BuildUpdatePayload(ulong objectId, TransformState state, uint inputTick)
+        {
+            var payload = new byte[PAYLOAD_SIZE_WITH_TICK];
+            BuildUpdatePayloadInto(payload, 0, objectId, state, inputTick);
             return payload;
         }
 
@@ -156,6 +187,29 @@ namespace RTMPE.Sync
         }
 
         /// <summary>
+        /// Pooled-buffer variant that appends the SDKS-01 <paramref name="inputTick"/>
+        /// (u32 LE) after the 48-byte transform body, writing 52 bytes total.
+        /// Returns <see cref="PAYLOAD_SIZE_WITH_TICK"/>.  The tick is strictly
+        /// trailing, so the 48-byte prefix is byte-identical to the legacy
+        /// layout and a legacy decoder ignores the extra bytes.
+        /// </summary>
+        public static int BuildUpdatePayloadInto(
+            byte[] dest, int destOffset, ulong objectId, TransformState state, uint inputTick)
+        {
+            if (dest == null) throw new ArgumentNullException(nameof(dest));
+            if (destOffset < 0 || (long)destOffset + PAYLOAD_SIZE_WITH_TICK > dest.Length)
+                throw new ArgumentOutOfRangeException(nameof(destOffset),
+                    "dest is too small for a transform payload with input tick at the given offset.");
+
+            // Write the 48-byte transform core (its own bounds check is a
+            // subset of the one above and therefore passes), then append the
+            // tick at the fixed trailing offset.
+            BuildUpdatePayloadInto(dest, destOffset, objectId, state);
+            WriteU32LE(dest, destOffset + PAYLOAD_SIZE, inputTick);
+            return PAYLOAD_SIZE_WITH_TICK;
+        }
+
+        /// <summary>
         /// Build the 25-byte quantized variant of the transform-update payload.
         /// Encodes position and scale as half-precision floats and rotation as
         /// a smallest-three packed quaternion.  Returns <see langword="null"/>
@@ -168,6 +222,20 @@ namespace RTMPE.Sync
         {
             var payload = new byte[QUANTIZED_PAYLOAD_SIZE];
             int written = BuildQuantizedUpdatePayloadInto(payload, 0, objectId, state);
+            return written > 0 ? payload : null;
+        }
+
+        /// <summary>
+        /// Build a 29-byte quantized payload that appends the SDKS-01
+        /// <paramref name="inputTick"/> (u32 LE) after the quantized body.
+        /// Returns <see langword="null"/> when the source state is non-finite or
+        /// the rotation is degenerate (matching the tick-less factory), so the
+        /// caller can fall back to the full-precision encoder.
+        /// </summary>
+        public static byte[] BuildQuantizedUpdatePayload(ulong objectId, TransformState state, uint inputTick)
+        {
+            var payload = new byte[QUANTIZED_PAYLOAD_SIZE_WITH_TICK];
+            int written = BuildQuantizedUpdatePayloadInto(payload, 0, objectId, state, inputTick);
             return written > 0 ? payload : null;
         }
 
@@ -212,6 +280,28 @@ namespace RTMPE.Sync
             return QUANTIZED_PAYLOAD_SIZE;
         }
 
+        /// <summary>
+        /// Pooled-buffer variant that appends the SDKS-01 <paramref name="inputTick"/>
+        /// (u32 LE) after the 25-byte quantized body, writing 29 bytes total.
+        /// Returns <see cref="QUANTIZED_PAYLOAD_SIZE_WITH_TICK"/> on success, or
+        /// <c>0</c> when the source state is non-finite or the rotation is
+        /// degenerate (no tick is written in that case, mirroring the tick-less
+        /// overload's contract so the caller's fallback is unchanged).
+        /// </summary>
+        public static int BuildQuantizedUpdatePayloadInto(
+            byte[] dest, int destOffset, ulong objectId, TransformState state, uint inputTick)
+        {
+            if (dest == null) throw new ArgumentNullException(nameof(dest));
+            if (destOffset < 0 || (long)destOffset + QUANTIZED_PAYLOAD_SIZE_WITH_TICK > dest.Length)
+                throw new ArgumentOutOfRangeException(nameof(destOffset),
+                    "dest is too small for a quantized transform payload with input tick at the given offset.");
+
+            int core = BuildQuantizedUpdatePayloadInto(dest, destOffset, objectId, state);
+            if (core == 0) return 0; // non-finite / degenerate → caller falls back
+            WriteU32LE(dest, destOffset + QUANTIZED_PAYLOAD_SIZE, inputTick);
+            return QUANTIZED_PAYLOAD_SIZE_WITH_TICK;
+        }
+
         private static bool IsFinite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
 
         // ── Private write helpers ─────────────────────────────────────────────
@@ -227,6 +317,16 @@ namespace RTMPE.Sync
             buf[off + 5] = (byte)(v >> 40);
             buf[off + 6] = (byte)(v >> 48);
             buf[off + 7] = (byte)(v >> 56);
+        }
+
+        // WriteU32LE writes an unsigned 32-bit integer in little-endian byte
+        // order.  Used for the SDKS-01 trailing input-tick field.
+        private static void WriteU32LE(byte[] buf, int off, uint v)
+        {
+            buf[off + 0] = (byte) v;
+            buf[off + 1] = (byte)(v >>  8);
+            buf[off + 2] = (byte)(v >> 16);
+            buf[off + 3] = (byte)(v >> 24);
         }
 
         // WriteF32LE writes an IEEE 754 single-precision float in little-endian

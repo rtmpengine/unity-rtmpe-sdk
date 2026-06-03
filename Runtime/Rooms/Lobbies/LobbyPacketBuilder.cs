@@ -76,12 +76,19 @@ namespace RTMPE.Rooms
 
         // ── Helpers ──────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Serialises <paramref name="s"/> as a JSON string, delegating to
+        /// <see cref="PropertyJson.AppendJsonString"/> which escapes backslash,
+        /// double-quote, AND all control characters (&#x3c; 0x20) as \uXXXX.
+        /// The previous hand-rolled implementation escaped only \\ and \",
+        /// producing malformed JSON for any lobby name or key containing a
+        /// tab, newline, or other control character (SDKR-03).
+        /// </summary>
         private static string JsonString(string s)
         {
-            // Minimal JSON string escaping for keys and lobby names.
-            // Full escaping is not needed here because lobby names and
-            // property keys are restricted to ASCII alphanumerics + underscore.
-            return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+            var sb = new StringBuilder();
+            PropertyJson.AppendJsonString(sb, s ?? string.Empty);
+            return sb.ToString();
         }
 
         private static string JsonValue(object v)

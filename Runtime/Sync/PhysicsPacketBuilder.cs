@@ -7,8 +7,8 @@
 //
 // ── Disambiguation from TransformPacketParser ─────────────────────────────────
 //
-// TransformPacketParser rejects any changed_mask byte with bits outside 0x07
-// set (KnownMask = 0x07).  Physics payloads always have bit 0x40 (3-D) or
+// TransformPacketParser rejects any changed_mask byte with bits outside 0x0F
+// set (KnownMask = 0x0F).  Physics payloads always have bit 0x40 (3-D) or
 // 0x80 (2-D) set as a type marker, guaranteeing the transform parser returns
 // false and falls through to PhysicsPacketParser.
 //
@@ -103,7 +103,7 @@ namespace RTMPE.Sync
         /// Type-marker bit that is ALWAYS set in 3-D physics payloads.
         /// <para>
         /// Because <see cref="TransformPacketParser"/> rejects any changed_mask byte
-        /// with bits outside its KnownMask (0x07) set, every 3-D physics payload is
+        /// with bits outside its KnownMask (0x0F) set, every 3-D physics payload is
         /// guaranteed to fall through to <see cref="PhysicsPacketParser"/> without
         /// ambiguity.
         /// </para>

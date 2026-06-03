@@ -3,7 +3,7 @@
 // Parses physics-state payloads received as PacketType.StateSync (0x40) by
 // NetworkManager.HandleStateSyncPacket after TransformPacketParser has already
 // rejected the packet (because physics payloads always carry type-marker bits
-// outside the transform parser's KnownMask of 0x07).
+// outside the transform parser's KnownMask of 0x0F).
 //
 // ── Disambiguation logic ──────────────────────────────────────────────────────
 //

@@ -30,7 +30,7 @@ namespace RTMPE.Core
         ///
        /// <para>Dispatch priority:</para>
         /// <list type="number">
-        ///  <item><see cref="TransformPacketParser"/> — handles transform deltas (changed_mask bits 0x01–0x07 only).</item>
+        ///  <item><see cref="TransformPacketParser"/> — handles transform deltas (changed_mask bits within 0x0F: position/rotation/scale + the SDKS-01 input-tick bit 0x08).</item>
         ///  <item><see cref="PhysicsPacketParser.IsPhysics2D"/> — handles 2-D Rigidbody2D packets (bit 0x80 set).</item>
         ///  <item><see cref="PhysicsPacketParser.IsPhysics3D"/> — handles 3-D Rigidbody packets (bit 0x40 set, bit 0x80 clear).</item>
         /// </list>
@@ -106,7 +106,7 @@ namespace RTMPE.Core
 
             // ── 1b. Physics dispatch (mutually exclusive with StateDelta) ────
             // Physics frames set discriminator bits in byte 8 (bit 0x80 for
-            // 2-D, bit 0x40 for 3-D) outside the StateDelta KnownMask of 0x07.
+            // 2-D, bit 0x40 for 3-D) outside the StateDelta KnownMask of 0x0F.
             // Dispatching them BEFORE the StateDelta iteration removes the
             // ambiguity that would otherwise arise on the very first parse
             // attempt — the StateDelta parser would reject a physics frame on
@@ -226,11 +226,28 @@ namespace RTMPE.Core
                                ? state.Rotation : current.Rotation,
                 Scale    = (changedMask & TransformPacketParser.ChangedScale) != 0
                                ? state.Scale : current.Scale,
+                // SDKS-01: carry the server-confirmed input tick through to the
+                // owner reconciliation branch.  Presence mirrors the delta's
+                // ChangedInputTick bit exactly (tick 0 is valid, so we trust the
+                // parsed flag rather than the value).
+                ConfirmedInputTick    = state.ConfirmedInputTick,
+                HasConfirmedInputTick = (changedMask & TransformPacketParser.ChangedInputTick) != 0,
             };
 
             if (nb.IsOwner)
             {
-                cachedNetTransform?.ApplyReconciliation(blended);
+                // When the server supplied an authoritative input-tick watermark
+                // (SDKS-01), drive the replay-aware reconciliation overload with
+                // it so the input buffer is trimmed to exactly what the server
+                // confirmed.  Absent the watermark (legacy server, quantized
+                // relay) fall back to the single-argument overload, which
+                // derives a conservative (LocalTick - 1) watermark — preserving
+                // the prior behaviour byte-for-byte.
+                if (blended.HasConfirmedInputTick)
+                    cachedNetTransform?.ApplyReconciliation(
+                        blended, blended.ConfirmedInputTick, true);
+                else
+                    cachedNetTransform?.ApplyReconciliation(blended);
                 return;
             }
 

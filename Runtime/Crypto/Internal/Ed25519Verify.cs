@@ -173,9 +173,9 @@ namespace RTMPE.Crypto.Internal
             // implementations used `(int)BigInteger.Log(n, 2) + 1` which for
             // certain near-power-of-two scalars rounds the IEEE-754 double
             // result down by one ULP, dropping the high bit of the scalar
-            // and silently producing the wrong point. `GetBitLength()`
-            // (.NET 5+) is integer-exact.
-            int bits = (int)n.GetBitLength();
+            // and silently producing the wrong point. `BitLength` is
+            // integer-exact on every target (see below).
+            int bits = BitLength(n);
 
             var Q = Point.Identity;
             for (int i = bits - 1; i >= 0; i--)
@@ -185,6 +185,39 @@ namespace RTMPE.Crypto.Internal
                     Q = PointAdd(Q, pt);
             }
             return Q;
+        }
+
+        /// <summary>
+        /// Exact bit length of a non-negative <see cref="BigInteger"/>.
+        /// <c>BigInteger.GetBitLength()</c> is .NET 5+ and is absent from the
+        /// .NET Standard 2.1 BCL surface (Unity's declared minimum, 2022.3), so
+        /// the portable shift-count fallback is used there.  Both are
+        /// integer-exact — unlike the older <c>(int)BigInteger.Log(n, 2) + 1</c>,
+        /// whose IEEE-754 rounding could drop the scalar's high bit and silently
+        /// produce the wrong point (SDKC-01).
+        /// </summary>
+        internal static int BitLength(BigInteger n)
+        {
+#if NET5_0_OR_GREATER
+            return (int)n.GetBitLength();
+#else
+            return BitLengthPortable(n);
+#endif
+        }
+
+        /// <summary>
+        /// .NET Standard 2.1-compatible bit length: <c>floor(log2(n)) + 1</c> for
+        /// <c>n &gt; 0</c>, and 0 otherwise — identical to
+        /// <c>BigInteger.GetBitLength()</c> for non-negative input.  Always
+        /// compiled (not behind the <c>#if</c>) so it is unit-tested against the
+        /// BCL on .NET 5+ even though only the netstandard2.1 build path calls it.
+        /// </summary>
+        internal static int BitLengthPortable(BigInteger n)
+        {
+            if (n.Sign <= 0) return 0;
+            int bits = 0;
+            for (BigInteger v = n; v > BigInteger.Zero; v >>= 1) bits++;
+            return bits;
         }
 
         // ── Point encoding / decoding ─────────────────────────────────────────

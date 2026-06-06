@@ -73,9 +73,12 @@ namespace RTMPE.Core.Sync
         public bool HasPending => _pending.Count > 0;
 
         /// <summary>
-        /// Apply the per-tick cap (clamped externally to [1, MaxEntries]).
-        /// Must be set before <see cref="CollectIntoBatch"/> is used; the
-        /// collector consults the cap to decide when to eagerly flush.
+        /// Apply the per-tick cap (clamped externally by
+        /// <see cref="RTMPE.Sync.VariableBatchBuilder.ClampBatchCap"/> to
+        /// [1, GatewayEntryCap] so an over-cap batch the gateway would drop is
+        /// never produced).  Must be set before <see cref="CollectIntoBatch"/>
+        /// is used; the collector consults the cap to decide when to eagerly
+        /// flush.
         /// </summary>
         public void SetActiveCap(int cap) => _activeCap = cap;
 

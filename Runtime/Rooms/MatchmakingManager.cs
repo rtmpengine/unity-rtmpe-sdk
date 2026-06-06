@@ -67,6 +67,11 @@ namespace RTMPE.Rooms
         // Service can record roster membership atomically.
         private readonly Func<string> _getPlayerId;
 
+        // Optional callback to record the server-derived player_id echoed in a
+        // matchmaking reply (A5-2), mirroring the JoinRoom path.  Null in unit
+        // tests that do not exercise identity propagation.
+        private readonly Action<string> _setPlayerId;
+
         // Current in-flight request — null when no matchmaking is pending.
         // The sentinel doubles as the once-only-delivery latch: any inbound
         // response or cancel/timeout transition first checks this is non-null
@@ -114,12 +119,14 @@ namespace RTMPE.Rooms
             PacketBuilder     builder,
             Action<byte[]>    sendPacket,
             Func<NetworkState> getState,
-            Func<string>      getPlayerId)
+            Func<string>      getPlayerId,
+            Action<string>    setPlayerId = null)
         {
             _builder     = builder     ?? throw new ArgumentNullException(nameof(builder));
             _sendPacket  = sendPacket  ?? throw new ArgumentNullException(nameof(sendPacket));
             _getState    = getState    ?? throw new ArgumentNullException(nameof(getState));
             _getPlayerId = getPlayerId ?? throw new ArgumentNullException(nameof(getPlayerId));
+            _setPlayerId = setPlayerId; // optional — see field doc (A5-2)
         }
 
         // ── Public API ────────────────────────────────────────────────────────
@@ -339,12 +346,21 @@ namespace RTMPE.Rooms
             string roomId   = string.Empty;
             string roomCode = string.Empty;
             bool   created  = false;
+            string playerId = string.Empty;
             if (dto.data != null)
             {
                 roomId   = dto.data.room_id   ?? string.Empty;
                 roomCode = dto.data.room_code ?? string.Empty;
                 created  = dto.data.created;
+                playerId = dto.data.player_id ?? string.Empty;
             }
+
+            // A5-2: record the server-derived player_id (parity with JoinRoom) so
+            // the SDK's local identity is correct after a matchmaking-only flow.
+            // Previously it stayed empty, which also fed an empty player_id into
+            // any subsequent MatchmakingRequest.
+            if (!string.IsNullOrEmpty(playerId))
+                _setPlayerId?.Invoke(playerId);
 
             OnMatchmakingComplete?.Invoke(new MatchmakingResult(roomId, roomCode, created));
         }
@@ -367,6 +383,7 @@ namespace RTMPE.Rooms
             public string room_id;
             public string room_code;
             public bool   created;
+            public string player_id; // A5-2: server-derived authoritative id
         }
 
         // ── Latch ──────────────────────────────────────────────────────────────

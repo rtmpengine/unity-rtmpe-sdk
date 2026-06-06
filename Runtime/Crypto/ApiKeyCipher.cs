@@ -6,21 +6,22 @@
 //  [nonce:12][ChaCha20-Poly1305([api_key_len:2 LE][api_key:N]) + tag:16]
 //  = 12 + 2 + N + 16 bytes total
 //
-// AAD: canonical serialisation of the client's source IP:port.
-//  IPv4: [0x04][ip:4 octets, network order][port:2 LE]  = 7 bytes
-//  IPv6: [0x06][ip:16 octets, network order][port:2 LE] = 19 bytes
+// AAD: empty.  An earlier design bound the blob to the client's source IP:port,
+// but a NAT'd client cannot observe its own post-NAT address, so the gateway
+// (which sees only the post-NAT source) could never reproduce that AAD and
+// rejected every real-world (NAT'd) handshake — see audit H-1.  Channel
+// authentication does NOT depend on this AAD: it is established by the Ed25519
+// signature over the handshake transcript, which already mixes in
+// SHA-256(HandshakeInit ciphertext) and is verified on Challenge receipt.
 //
-// Network order ("big-endian") matches IPAddress.GetAddressBytes() on the
-// client and Ipv4Addr::octets() / Ipv6Addr::octets() on the gateway (Rust).
-// The port, by contrast, is serialised little-endian on both sides.
-//
-// The gateway performs the matching decryption using the same PSK and AAD.
+// The gateway decrypts with an empty AAD as its primary path and keeps the
+// legacy source-address AAD only as a fallback for already-shipped clients on
+// directly-routable (loopback / LAN) networks.
 //
 // Key distribution: the 32-byte PSK (as a 64-char hex string) is configured
 // once per deployment and distributed to SDK users via the developer dashboard.
 
 using System;
-using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using RTMPE.Crypto.Internal;
@@ -79,22 +80,18 @@ namespace RTMPE.Crypto
         /// register as policy events on the receiver.
         /// </para>
         /// <para>
-        /// <b>AAD:</b> the AAD is the canonical encoding of the source
-        /// <see cref="IPEndPoint"/> only; it does not include a transcript hash
-        /// of the surrounding handshake, because at this point in the protocol
-        /// no transcript has yet been constructed.  Channel binding is
-        /// established later by the Ed25519 signature over the full
-        /// transcript (see <see cref="HandshakeHandler.ComputeTranscript"/>),
+        /// <b>AAD:</b> empty.  Address binding was removed (audit H-1) because a
+        /// NAT'd client cannot observe its post-NAT source address, so the
+        /// gateway — which sees only the post-NAT source — could never reproduce
+        /// an address-derived AAD and rejected every real-world handshake.
+        /// Channel binding is instead established by the Ed25519 signature over
+        /// the full transcript (see <see cref="HandshakeHandler.ComputeTranscript"/>),
         /// which already mixes in <c>SHA-256(HandshakeInit ciphertext)</c>.
         /// </para>
         /// </remarks>
         /// <param name="psk">32-byte pre-shared key (from developer dashboard).</param>
         /// <param name="apiKey">UTF-8 API key string.</param>
-        /// <param name="sourceAddress">
-        /// The client's local socket endpoint used as AAD.
-        /// Must match the source address the gateway will see in the UDP header.
-        /// </param>
-        public static byte[] Encrypt(byte[] psk, string apiKey, IPEndPoint sourceAddress)
+        public static byte[] Encrypt(byte[] psk, string apiKey)
         {
             if (psk == null || psk.Length != 32)
                 throw new ArgumentException("PSK must be exactly 32 bytes.", nameof(psk));
@@ -129,11 +126,10 @@ namespace RTMPE.Crypto
                 // the threat-model rationale.
                 var nonce = NextNonce();
 
-                // Compute AAD from the source address.
-                var aad = AddrAad(sourceAddress);
-
-                // Encrypt (returns ciphertext + 16-byte tag).
-                var sealedPayload = ChaCha20Poly1305Impl.Seal(psk, nonce, plaintext, aad);
+                // Seal with an empty AAD (see remarks / audit H-1).  Channel
+                // authentication is provided by the Ed25519 transcript signature,
+                // not by an AAD over the (NAT-unobservable) source address.
+                var sealedPayload = ChaCha20Poly1305Impl.Seal(psk, nonce, plaintext, Array.Empty<byte>());
 
                 // Prepend the nonce: [nonce:12][ciphertext+tag].
                 var result = new byte[NonceLen + sealedPayload.Length];
@@ -172,50 +168,6 @@ namespace RTMPE.Crypto
                 key[i] = (byte)((HexNibble(hex[i * 2]) << 4) | HexNibble(hex[i * 2 + 1]));
             }
             return key;
-        }
-
-        // ── AAD serialisation ──────────────────────────────────────────
-
-        /// <summary>
-        /// Serialise the client source address to the canonical AAD byte sequence.
-        /// IPv4: <c>[0x04][ip:4 octets, network order][port:2 LE]</c> = 7 bytes.
-        /// IPv6: <c>[0x06][ip:16 octets, network order][port:2 LE]</c> = 19 bytes.
-        /// Null endpoint: returns empty array (empty AAD — for unit tests only).
-        /// </summary>
-        /// <remarks>
-        /// IP octets are emitted in network order (big-endian) — matching
-        /// <see cref="System.Net.IPAddress.GetAddressBytes"/> on the client and
-        /// <c>Ipv4Addr::octets()</c> / <c>Ipv6Addr::octets()</c> on the gateway.
-        /// The port is little-endian on both sides.
-        /// </remarks>
-        public static byte[] AddrAad(IPEndPoint endpoint)
-        {
-            if (endpoint == null) return Array.Empty<byte>();
-
-            var addr  = endpoint.Address;
-            var port  = (ushort)endpoint.Port;
-
-            if (addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-            {
-                var ipBytes = addr.GetAddressBytes(); // 4 bytes, big-endian octets
-                var aad = new byte[7];
-                aad[0] = 0x04;
-                aad[1] = ipBytes[0]; aad[2] = ipBytes[1];
-                aad[3] = ipBytes[2]; aad[4] = ipBytes[3];
-                aad[5] = (byte)(port & 0xFF);
-                aad[6] = (byte)(port >> 8);
-                return aad;
-            }
-            else // IPv6
-            {
-                var ipBytes = addr.GetAddressBytes(); // 16 bytes
-                var aad = new byte[19];
-                aad[0] = 0x06;
-                Buffer.BlockCopy(ipBytes, 0, aad, 1, 16);
-                aad[17] = (byte)(port & 0xFF);
-                aad[18] = (byte)(port >> 8);
-                return aad;
-            }
         }
 
         // ── Nonce derivation ──────────────────────────────────────────────────

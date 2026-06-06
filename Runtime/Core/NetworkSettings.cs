@@ -7,7 +7,13 @@
 //
 // If no asset is assigned at runtime, NetworkManager.Awake() calls
 // NetworkSettings.CreateDefault() to produce a runtime-only instance with the
-// defaults defined here — zero configuration needed for local development.
+// defaults defined here.  NOTE (audit S3-3): the default server-pinning mode is
+// Strict with no pin configured, so a fresh zero-config instance deliberately
+// REFUSES every connection (fail-closed — the correct security default) until
+// you EITHER set pinnedServerPublicKeyHex to the gateway's static key OR choose
+// a relaxed serverPinningMode (TrustOnFirstUse for first-run capture, or
+// InsecureNoPinning for trusted local development).  "Zero configuration" does
+// not mean "connects out of the box" — pin configuration is required first.
 
 using UnityEngine;
 using RTMPE.Crypto;
@@ -302,9 +308,12 @@ namespace RTMPE.Core
         public bool enableVariableBatching = false;
 
         [Tooltip("Maximum number of variable updates packed into a single " +
-                 "VariableBatchUpdate.  Excess updates split into a second " +
-                 "batch packet rather than exceeding the per-datagram MTU.")]
-        [Range(1, 256)]
+                 "VariableBatchUpdate.  Excess updates split into additional " +
+                 "batch packets rather than exceeding the per-datagram MTU.  " +
+                 "Hard-capped at the gateway's server-side limit of 64 " +
+                 "(VariableBatchBuilder.GatewayEntryCap): the gateway silently " +
+                 "drops any batch exceeding it, so larger values are clamped.")]
+        [Range(1, 64)] // VariableBatchBuilder.GatewayEntryCap — gateway drops batches above this
         public int maxVariablesPerBatch = 32;
 
         // ── Spawn hardening ────────────────────────────────────────────────────

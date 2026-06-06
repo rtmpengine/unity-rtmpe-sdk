@@ -255,7 +255,7 @@ namespace RTMPE.Core
             // VariableBatchManager.CollectIntoBatch.
             bool batching = _settings != null && _settings.enableVariableBatching;
             int  batchCap = batching && _settings != null
-                ? UnityEngine.Mathf.Clamp(_settings.maxVariablesPerBatch, 1, VariableBatchBuilder.MaxEntries)
+                ? VariableBatchBuilder.ClampBatchCap(_settings.maxVariablesPerBatch)
                 : 0;
 
             // Snapshot the cap onto the manager so its cached collector

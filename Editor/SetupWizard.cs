@@ -342,6 +342,18 @@ namespace RTMPE.Editor
 
             if (settings != null)
             {
+                // S3-4: copy the wizard's gateway host/port/tick into the resolved
+                // NetworkSettings asset and persist them.  Previously these were
+                // written only to EditorPrefs keys that nothing at runtime reads,
+                // so a developer who pointed the wizard at a non-default /
+                // self-hosted gateway got a NetworkManager that silently fell back
+                // to the factory default 127.0.0.1:7777.  (_maxPlayers has no
+                // asset home — rooms set it per-call via CreateRoomOptions — so it
+                // is intentionally not copied here.)
+                ApplyConnectionConfig(settings, _gatewayHost, _gatewayPort, _tickRate);
+                EditorUtility.SetDirty(settings);
+                AssetDatabase.SaveAssets();
+
                 var so = new SerializedObject(nm);
                 var prop = so.FindProperty("_settings");
                 if (prop != null)
@@ -382,6 +394,20 @@ namespace RTMPE.Editor
             AssetDatabase.CreateAsset(created, assetPath);
             AssetDatabase.SaveAssets();
             return created;
+        }
+
+        // S3-4: pure helper (no UnityEditor dependency) that copies the wizard's
+        // gateway connection config onto a NetworkSettings asset.  Extracted from
+        // AddNetworkManagerToScene so the field-propagation contract is unit-testable
+        // without a live Editor scene; the caller persists the result via
+        // EditorUtility.SetDirty + AssetDatabase.SaveAssets.
+        internal static void ApplyConnectionConfig(
+            NetworkSettings settings, string host, int port, int tickRate)
+        {
+            if (settings == null) return;
+            settings.serverHost = host;
+            settings.serverPort = port;
+            settings.tickRate   = tickRate;
         }
 
         private void ValidateConfiguration()

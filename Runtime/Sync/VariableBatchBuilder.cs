@@ -37,6 +37,34 @@ namespace RTMPE.Sync
         public const int MaxEntries = byte.MaxValue;
 
         /// <summary>
+        /// The gateway's server-side per-batch entry cap (A6-5).  Mirrors the
+        /// authoritative <c>BATCH_COUNT_CAP</c> in
+        /// <c>modules/gateway/src/nats/forwarder.rs</c> and the wire contract
+        /// documented at <c>packet/header.rs</c> for VariableBatchUpdate (0x44).
+        /// The gateway SILENTLY DROPS any 0x44 batch whose entry count exceeds
+        /// this value (an amplification guard), so the client must never pack
+        /// more than this into one batch.  <see cref="MaxEntries"/> (255) is the
+        /// absolute wire limit imposed by the u8 count byte; this is the tighter
+        /// server policy the client honours to avoid silent data loss.
+        /// </summary>
+        public const int GatewayEntryCap = 64;
+
+        /// <summary>
+        /// Clamp a configured per-tick batch size to the protocol-valid range
+        /// [1, <see cref="GatewayEntryCap"/>].  A value above the gateway cap
+        /// would be silently dropped on the wire; a value below 1 is
+        /// meaningless.  Updates beyond the cap are not lost — they are split
+        /// across multiple batches by the eager flush in
+        /// <c>VariableBatchManager.CollectIntoBatch</c>.
+        /// </summary>
+        public static int ClampBatchCap(int configured)
+        {
+            if (configured < 1) return 1;
+            if (configured > GatewayEntryCap) return GatewayEntryCap;
+            return configured;
+        }
+
+        /// <summary>
         /// Working ceiling on a single legacy 0x41 entry payload inside a
         /// batch, enforced symmetrically on both the build and parse paths.
         /// The wire-format length prefix permits up to 65 535 bytes per

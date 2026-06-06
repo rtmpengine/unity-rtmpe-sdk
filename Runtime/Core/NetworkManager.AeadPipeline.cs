@@ -38,14 +38,16 @@ namespace RTMPE.Core
             byte[] encryptedPayload;
             if (psk != null)
             {
-                var localEp = _transport.LocalEndPoint;
-                if (localEp == null)
-                {
-                    RtmpeLog.Error("[RTMPE] SendHandshakeInit: transport not yet bound, aborting.");
-                    return;
-                }
-                encryptedPayload = ApiKeyCipher.Encrypt(psk, apiKey, localEp);
-                LogDebug($"SendHandshakeInit: API key encrypted with PSK, source={localEp}");
+                // H-1: the API-key blob is sealed with an EMPTY AAD.  The previous
+                // design bound it to _transport.LocalEndPoint (the client's
+                // locally observed address), but a NAT'd client cannot observe
+                // its post-NAT source, so the gateway — which sees the post-NAT
+                // address — could never reproduce the AAD and rejected every
+                // real-world (NAT'd) handshake.  Channel authentication is
+                // provided independently by the Ed25519 transcript signature over
+                // SHA-256(HandshakeInit ciphertext), verified on Challenge receipt.
+                encryptedPayload = ApiKeyCipher.Encrypt(psk, apiKey);
+                LogDebug("SendHandshakeInit: API key encrypted with PSK (empty AAD).");
             }
             else
             {

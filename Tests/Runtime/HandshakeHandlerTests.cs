@@ -646,10 +646,9 @@ namespace RTMPE.Tests
         public void ApiKeyCipher_Encrypt_ProducesNonDeterministicOutput()
         {
             var psk = new byte[32];
-            var ep  = new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 7777);
 
-            var ct1 = ApiKeyCipher.Encrypt(psk, "my-api-key", ep);
-            var ct2 = ApiKeyCipher.Encrypt(psk, "my-api-key", ep);
+            var ct1 = ApiKeyCipher.Encrypt(psk, "my-api-key");
+            var ct2 = ApiKeyCipher.Encrypt(psk, "my-api-key");
 
             // Each call uses a fresh random nonce → ciphertexts must differ.
             Assert.IsFalse(BytesEqual(ct1, ct2),
@@ -662,12 +661,11 @@ namespace RTMPE.Tests
         {
             var psk    = new byte[32];
             var apiKey = "hello";
-            var ep     = new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 12345);
             var keyBytes = Encoding.UTF8.GetBytes(apiKey);
 
             // Expected layout: [nonce:12][key_len:2][apiKey:N][Poly1305Tag:16]
             // Minimum output = 12 (nonce) + 2 (len) + 1 (key min) + 16 (tag) = 31
-            var ct = ApiKeyCipher.Encrypt(psk, apiKey, ep);
+            var ct = ApiKeyCipher.Encrypt(psk, apiKey);
             int expectedMin = 12 + 2 + keyBytes.Length + 16;
             Assert.AreEqual(expectedMin, ct.Length,
                 $"Encrypted payload must be nonce(12) + len(2) + key({keyBytes.Length}) + tag(16) = {expectedMin} bytes.");

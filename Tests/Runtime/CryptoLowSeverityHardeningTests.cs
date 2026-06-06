@@ -20,7 +20,6 @@
 // Pure C# — runs in Edit Mode Test Runner.
 
 using System;
-using System.Net;
 using NUnit.Framework;
 using RTMPE.Crypto;
 using RTMPE.Crypto.Internal;
@@ -257,9 +256,8 @@ namespace RTMPE.Tests
             var psk = new byte[32];
             for (int i = 0; i < 32; i++) psk[i] = (byte)(i ^ 0x5A);
             const string apiKey = "RTMPE-test-leakage-canary-9f8e7d6c";
-            var ep = new IPEndPoint(IPAddress.Loopback, 1234);
 
-            byte[] ct = ApiKeyCipher.Encrypt(psk, apiKey, ep);
+            byte[] ct = ApiKeyCipher.Encrypt(psk, apiKey);
 
             // The ciphertext MUST NOT contain the plaintext API key as a
             // contiguous run of bytes.  This is a sanity check for both the

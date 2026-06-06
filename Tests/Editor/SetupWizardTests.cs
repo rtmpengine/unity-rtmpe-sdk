@@ -13,6 +13,8 @@ using System;
 using System.Text;
 using NUnit.Framework;
 using UnityEditor;
+using UnityEngine;
+using RTMPE.Core;
 using RTMPE.Editor;
 
 namespace RTMPE.Tests.Editor
@@ -340,6 +342,37 @@ namespace RTMPE.Tests.Editor
                 EditorPrefs.DeleteKey(FallbackIkmPrefKey);
                 if (hadPrior) EditorPrefs.SetString(FallbackIkmPrefKey, priorValue);
             }
+        }
+
+        // ── S3-4: wizard connection config propagates to the asset ───────────
+
+        [Test]
+        [Description(
+            "S3-4: ApplyConnectionConfig copies the wizard's gateway host/port/tick " +
+            "onto the NetworkSettings asset, so a developer who points the wizard at " +
+            "a non-default gateway no longer silently falls back to 127.0.0.1:7777.")]
+        public void ApplyConnectionConfig_CopiesHostPortTickToAsset()
+        {
+            var settings = ScriptableObject.CreateInstance<NetworkSettings>();
+            try
+            {
+                SetupWizard.ApplyConnectionConfig(settings, "10.0.0.5", 9000, 45);
+
+                Assert.AreEqual("10.0.0.5", settings.serverHost, "serverHost must be copied from the wizard");
+                Assert.AreEqual(9000, settings.serverPort, "serverPort must be copied from the wizard");
+                Assert.AreEqual(45, settings.tickRate, "tickRate must be copied from the wizard");
+            }
+            finally
+            {
+                Object.DestroyImmediate(settings);
+            }
+        }
+
+        [Test]
+        [Description("S3-4: ApplyConnectionConfig is null-safe (no throw on a null asset).")]
+        public void ApplyConnectionConfig_NullAsset_DoesNotThrow()
+        {
+            Assert.DoesNotThrow(() => SetupWizard.ApplyConnectionConfig(null, "h", 1, 2));
         }
     }
 }

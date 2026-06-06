@@ -262,7 +262,11 @@ namespace RTMPE.Core
                     _packetBuilder,
                     packet => EncryptAndSend(packet),
                     () => _state,
-                    () => _localPlayerStringId ?? string.Empty);
+                    () => _localPlayerStringId ?? string.Empty,
+                    // A5-2: record the server-derived player_id from the
+                    // matchmaking reply, mirroring the JoinRoom path so the
+                    // SDK's local identity is correct after a matchmake.
+                    id => SetLocalRoomPlayerId(id));
 
                 var registry  = new NetworkObjectRegistry();
                 var ownership = new OwnershipManager(registry, this);

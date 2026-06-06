@@ -422,5 +422,47 @@ namespace RTMPE.Core
         /// </summary>
         public void ApplyOwnershipGrant(ulong objectId, string newOwnerPlayerId)
             => ApplyOwnershipGrant(objectId, newOwnerPlayerId, serverAttested: false);
+
+        /// <summary>
+        /// Reassign every surviving object owned by <paramref name="fromPlayerId"/>
+        /// to <paramref name="toOwnerId"/> (NEW-OWNERSHIP-1 host migration).
+        ///
+        /// <para>"Surviving" means <see cref="NetworkBehaviour.DestroyWithOwner"/>
+        /// is <see langword="false"/>; objects with <c>DestroyWithOwner=true</c>
+        /// are destroyed on owner-leave by
+        /// <see cref="SpawnManager.OnPlayerLeftRoom"/> and so are absent here.
+        /// Without this, a non-destroy object owned by a departed player would
+        /// freeze — owned by someone who is gone and updatable by no one.</para>
+        ///
+        /// <para>The grant is applied <c>serverAttested: true</c>: the new owner
+        /// is the server-elected room host (<c>CurrentRoom.MasterId</c>) and the
+        /// departed-owner / roster facts driving the call are server-broadcast
+        /// replicated state, so this is a deterministic, locally-computed
+        /// application of server authority — every client converges to the same
+        /// owner with no per-object wire grant.  The caller decides whether the
+        /// reassignment is warranted via
+        /// <see cref="OwnershipReassignmentPolicy.ShouldReassign"/>; the guards
+        /// here are a defensive second line only.</para>
+        /// </summary>
+        /// <param name="fromPlayerId">Room UUID of the departed/replaced owner.</param>
+        /// <param name="toOwnerId">Room UUID of the new owner (the room host).</param>
+        public void ReassignObjectsToNewOwner(string fromPlayerId, string toOwnerId)
+        {
+            if (string.IsNullOrEmpty(fromPlayerId) ||
+                string.IsNullOrEmpty(toOwnerId) ||
+                fromPlayerId == toOwnerId)
+            {
+                return;
+            }
+
+            var owned = GetObjectsOwnedBy(fromPlayerId);
+            for (int i = 0; i < owned.Count; i++)
+            {
+                var obj = owned[i];
+                // Unity null check guards destroyed-but-not-unregistered objects.
+                if (obj == null || obj.DestroyWithOwner) continue;
+                ApplyOwnershipGrant(obj.NetworkObjectId, toOwnerId, serverAttested: true);
+            }
+        }
     }
 }

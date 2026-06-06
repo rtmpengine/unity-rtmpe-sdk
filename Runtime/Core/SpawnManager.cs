@@ -648,9 +648,15 @@ namespace RTMPE.Core
         /// Handle a player leaving the room.
         /// Destroys all objects owned by <paramref name="playerId"/> that
         /// have <see cref="NetworkBehaviour.DestroyWithOwner"/> set to
-        /// <see langword="true"/>. Objects with <c>DestroyWithOwner=false</c>
-        /// are left intact — the server will send ownership grant packets
-        /// to reassign them (server-authoritative).
+        /// <see langword="true"/>.
+        ///
+        /// <para>Objects with <c>DestroyWithOwner=false</c> are left intact
+        /// HERE — they are reassigned to the room host by the caller
+        /// (<c>NetworkManager.OnRoomManagerPlayerLeft</c> →
+        /// <see cref="OwnershipManager.ReassignObjectsToNewOwner"/>,
+        /// NEW-OWNERSHIP-1).  Reassignment is orchestrated there rather than in
+        /// this method because the host (CurrentRoom.MasterId) and roster live
+        /// on the RoomManager, not on the SpawnManager.</para>
         /// </summary>
         /// <param name="playerId">Room player UUID of the player who left.</param>
         public void OnPlayerLeftRoom(string playerId)
@@ -668,8 +674,8 @@ namespace RTMPE.Core
                     try { DestroyLocal(obj.NetworkObjectId); }
                     catch (Exception ex) { Debug.LogException(ex); }
                 }
-                // Non-DestroyWithOwner objects: server sends ownership grants.
-                // No local mutation — server-authoritative ownership.
+                // DestroyWithOwner=false objects are reassigned to the room host
+                // by the caller via OwnershipManager.ReassignObjectsToNewOwner.
             }
         }
 

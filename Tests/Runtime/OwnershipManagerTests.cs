@@ -428,6 +428,84 @@ namespace RTMPE.Tests
             Assert.AreEqual(0, _ownership.OutstandingCount);
         }
 
+        // ── ReassignObjectsToNewOwner (NEW-OWNERSHIP-1) ────────────────────────
+
+        [Test]
+        [Description("Reassigns a departed owner's DestroyWithOwner=false object to the new host.")]
+        public void ReassignObjectsToNewOwner_SurvivingObject_MovesToNewHost()
+        {
+            var nb = RegisterObject(200UL, "leaver");
+            nb.DestroyWithOwner = false;
+
+            _ownership.ReassignObjectsToNewOwner("leaver", "host");
+
+            Assert.AreEqual("host", nb.OwnerPlayerId);
+        }
+
+        [Test]
+        [Description("Does NOT move DestroyWithOwner=true objects (those are destroyed on leave, not reassigned).")]
+        public void ReassignObjectsToNewOwner_DestroyWithOwnerTrue_NotReassigned()
+        {
+            var nb = RegisterObject(201UL, "leaver");
+            nb.DestroyWithOwner = true;
+
+            _ownership.ReassignObjectsToNewOwner("leaver", "host");
+
+            Assert.AreEqual("leaver", nb.OwnerPlayerId, "DestroyWithOwner=true object must not be reassigned.");
+        }
+
+        [Test]
+        [Description("Reassigns every surviving object owned by the leaver.")]
+        public void ReassignObjectsToNewOwner_MultipleObjects_AllMove()
+        {
+            var a = RegisterObject(202UL, "leaver"); a.DestroyWithOwner = false;
+            var b = RegisterObject(203UL, "leaver"); b.DestroyWithOwner = false;
+
+            _ownership.ReassignObjectsToNewOwner("leaver", "host");
+
+            Assert.AreEqual("host", a.OwnerPlayerId);
+            Assert.AreEqual("host", b.OwnerPlayerId);
+        }
+
+        [Test]
+        [Description("Does not touch objects owned by players other than the leaver.")]
+        public void ReassignObjectsToNewOwner_OtherOwner_Untouched()
+        {
+            var mine  = RegisterObject(204UL, "leaver");  mine.DestroyWithOwner  = false;
+            var other = RegisterObject(205UL, "bystander"); other.DestroyWithOwner = false;
+
+            _ownership.ReassignObjectsToNewOwner("leaver", "host");
+
+            Assert.AreEqual("host", mine.OwnerPlayerId);
+            Assert.AreEqual("bystander", other.OwnerPlayerId, "Bystander's object must be untouched.");
+        }
+
+        [Test]
+        [Description("Reassigning to self is a no-op (guards against MasterId == leaver before promotion).")]
+        public void ReassignObjectsToNewOwner_SameFromAndTo_NoOp()
+        {
+            var nb = RegisterObject(206UL, "leaver");
+            nb.DestroyWithOwner = false;
+
+            _ownership.ReassignObjectsToNewOwner("leaver", "leaver");
+
+            Assert.AreEqual("leaver", nb.OwnerPlayerId);
+        }
+
+        [Test]
+        [Description("Null/empty parties are a safe no-op.")]
+        public void ReassignObjectsToNewOwner_EmptyParties_NoOp()
+        {
+            var nb = RegisterObject(207UL, "leaver");
+            nb.DestroyWithOwner = false;
+
+            Assert.DoesNotThrow(() => _ownership.ReassignObjectsToNewOwner(null, "host"));
+            Assert.DoesNotThrow(() => _ownership.ReassignObjectsToNewOwner("leaver", null));
+            Assert.DoesNotThrow(() => _ownership.ReassignObjectsToNewOwner("", ""));
+
+            Assert.AreEqual("leaver", nb.OwnerPlayerId, "No reassignment should occur for empty parties.");
+        }
+
         // ── Eviction defence-in-depth (V3 audit, fix #1) ───────────────────────
         //
         // When AllocateOutstandingRequestId saturates, it evicts the

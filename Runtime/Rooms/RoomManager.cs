@@ -775,6 +775,23 @@ namespace RTMPE.Rooms
                 return;
             }
 
+            // Prune the departed player from the local roster BEFORE notifying,
+            // so CurrentRoom.MasterId / IsMasterClient / roster queries reflect
+            // the post-leave state.  This mirrors the kick path
+            // (HandlePlayerKicked) exactly.  Without it a leaver — including a
+            // departing host — lingers in Players with a stale IsHost flag,
+            // which (a) leaves IsMasterClient/MasterId wrong after any leave and
+            // (b) breaks host-migration ownership reassignment (NEW-OWNERSHIP-1):
+            // a departed host still reporting IsHost=true makes MasterId resolve
+            // to the gone player, so the reassignment guards skip and the
+            // orphaned objects freeze.  RemovePlayerFromRoom is a no-op when the
+            // id is absent (e.g. a player who joined after this client's roster
+            // snapshot), so this is always safe.
+            if (_currentRoom != null)
+            {
+                _currentRoom = RemovePlayerFromRoom(_currentRoom, playerId);
+            }
+
             SafeRaise(OnPlayerLeft, playerId);
         }
 

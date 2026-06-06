@@ -135,11 +135,12 @@ namespace RTMPE.Core
             // the component's lifetime if we did not clean them up here.
             if (_roomManager != null)
             {
-                _roomManager.OnRoomJoined   -= OnRoomManagerJoined;
-                _roomManager.OnRoomLeft     -= OnRoomManagerLeft;
-                _roomManager.OnRoomCreated  -= OnRoomManagerCreated;
-                _roomManager.OnPlayerLeft   -= OnRoomManagerPlayerLeft;
-                _roomManager.OnPlayerJoined -= OnRoomManagerPlayerJoined;
+                _roomManager.OnRoomJoined          -= OnRoomManagerJoined;
+                _roomManager.OnRoomLeft            -= OnRoomManagerLeft;
+                _roomManager.OnRoomCreated         -= OnRoomManagerCreated;
+                _roomManager.OnPlayerLeft          -= OnRoomManagerPlayerLeft;
+                _roomManager.OnPlayerJoined        -= OnRoomManagerPlayerJoined;
+                _roomManager.OnMasterClientChanged -= OnRoomManagerMasterClientChanged;
                 _roomManager = null;
             }
             _spawnManager       = null;
@@ -239,6 +240,7 @@ namespace RTMPE.Core
                     _roomManager.OnRoomCreated         -= OnRoomManagerCreated;
                     _roomManager.OnPlayerLeft          -= OnRoomManagerPlayerLeft;
                     _roomManager.OnPlayerJoined        -= OnRoomManagerPlayerJoined;
+                    _roomManager.OnMasterClientChanged -= OnRoomManagerMasterClientChanged;
                 }
 
                 // RoomManager shares PacketBuilder with the rest of the outbound
@@ -313,18 +315,66 @@ namespace RTMPE.Core
                 // capture `this` implicitly and prevent the JIT from
                 // caching the delegate; method-group references hit the
                 // delegate cache and are emitted as a static field by Roslyn.
-                _roomManager.OnPlayerLeft   += OnRoomManagerPlayerLeft;
-                _roomManager.OnPlayerJoined += OnRoomManagerPlayerJoined;
+                _roomManager.OnPlayerLeft          += OnRoomManagerPlayerLeft;
+                _roomManager.OnPlayerJoined        += OnRoomManagerPlayerJoined;
+                _roomManager.OnMasterClientChanged += OnRoomManagerMasterClientChanged;
             }
         }
 
         // Event handlers wired in RecreateRoomAndSpawnManagers — named here
         // to avoid per-subscription delegate allocation on every room join.
         private void OnRoomManagerPlayerLeft(string playerId)
-            => _spawnManager?.OnPlayerLeftRoom(playerId);
+        {
+            // Destroy the leaver's DestroyWithOwner=true objects (existing contract).
+            _spawnManager?.OnPlayerLeftRoom(playerId);
+
+            // NEW-OWNERSHIP-1: reassign the leaver's surviving
+            // (DestroyWithOwner=false) objects to the current room host so they
+            // do not freeze owned by a player who is gone.  A leaver is, by
+            // definition, no longer in the room, so formerStillInRoom = false.
+            // If the host itself just left, MasterId may briefly be empty here
+            // (the new host arrives via MasterClientChanged) — ShouldReassign
+            // then returns false and OnRoomManagerMasterClientChanged completes
+            // the reassignment once the new host is known.
+            string host = _roomManager?.CurrentRoom?.MasterId;
+            if (OwnershipReassignmentPolicy.ShouldReassign(playerId, host, formerStillInRoom: false))
+            {
+                _spawnManager?.Ownership?.ReassignObjectsToNewOwner(playerId, host);
+            }
+        }
 
         private void OnRoomManagerPlayerJoined(PlayerInfo _)
             => _spawnManager?.MarkAllVariablesDirtyForResync();
+
+        // NEW-OWNERSHIP-1 (host-migration ordering safety net).  When the host
+        // leaves, the RoomLeave packet can be processed before
+        // MasterClientChanged updates MasterId, so OnRoomManagerPlayerLeft sees
+        // no valid host and skips.  This path reassigns the departed host's
+        // surviving objects to the newly-promoted host — but ONLY when the
+        // previous master has actually left the room.  A voluntary in-room
+        // master transfer (the old master stays) must NOT move its objects, so
+        // we gate on live roster membership.
+        private void OnRoomManagerMasterClientChanged(string previousMasterId, string newMasterId)
+        {
+            bool prevStillInRoom = IsPlayerInCurrentRoom(previousMasterId);
+            if (OwnershipReassignmentPolicy.ShouldReassign(previousMasterId, newMasterId, prevStillInRoom))
+            {
+                _spawnManager?.Ownership?.ReassignObjectsToNewOwner(previousMasterId, newMasterId);
+            }
+        }
+
+        // True iff playerId is a current member of the joined room's roster.
+        private bool IsPlayerInCurrentRoom(string playerId)
+        {
+            if (string.IsNullOrEmpty(playerId)) return false;
+            PlayerInfo[] players = _roomManager?.CurrentRoom?.Players;
+            if (players == null) return false;
+            for (int i = 0; i < players.Length; i++)
+            {
+                if (players[i] != null && players[i].PlayerId == playerId) return true;
+            }
+            return false;
+        }
 
         // One-time advisory state for the in-room peer-admission fallback.
         // The roster-anchored sender verifier consults this predicate when a

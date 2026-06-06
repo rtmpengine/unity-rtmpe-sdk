@@ -308,6 +308,55 @@ namespace RTMPE.Tests
             Assert.AreEqual("player-99", leftPlayerId);
         }
 
+        [Test]
+        [Description("player_left prunes the leaver from the local roster (mirrors the kick path) — NEW-OWNERSHIP-1 precondition.")]
+        public void HandlePlayerLeft_PrunesLeaverFromRoster()
+        {
+            _currentState = NetworkState.InRoom;
+            JoinRoomAs(localPlayerId: "me",
+                       players: new[] { ("host", "Host", true, true),
+                                        ("a",    "A",    false, true),
+                                        ("me",   "Me",   false, true) });
+
+            _roomManager.HandleRoomPacket(PacketType.RoomLeave, BuildPlayerLeftNotification("a"));
+
+            var ids = System.Array.ConvertAll(_roomManager.CurrentRoom.Players, p => p.PlayerId);
+            Assert.AreEqual(2, _roomManager.CurrentRoom.Players.Length, "Leaver must be pruned.");
+            CollectionAssert.DoesNotContain(ids, "a");
+        }
+
+        [Test]
+        [Description("When the host leaves, pruning clears the stale IsHost so MasterId no longer resolves to the gone player.")]
+        public void HandlePlayerLeft_DepartingHost_ClearsStaleMasterId()
+        {
+            _currentState = NetworkState.InRoom;
+            JoinRoomAs(localPlayerId: "me",
+                       players: new[] { ("host", "Host", true, true),
+                                        ("me",   "Me",   false, true) });
+            Assert.AreEqual("host", _roomManager.CurrentRoom.MasterId);
+
+            _roomManager.HandleRoomPacket(PacketType.RoomLeave, BuildPlayerLeftNotification("host"));
+
+            Assert.AreEqual(1, _roomManager.CurrentRoom.Players.Length);
+            Assert.IsTrue(string.IsNullOrEmpty(_roomManager.CurrentRoom.MasterId),
+                "Departed host must no longer be reported as MasterId.");
+        }
+
+        [Test]
+        [Description("Pruning an id that is not on the roster is a safe no-op.")]
+        public void HandlePlayerLeft_AbsentPlayer_RosterUnchanged()
+        {
+            _currentState = NetworkState.InRoom;
+            JoinRoomAs(localPlayerId: "me",
+                       players: new[] { ("host", "Host", true, true),
+                                        ("me",   "Me",   false, true) });
+
+            _roomManager.HandleRoomPacket(PacketType.RoomLeave, BuildPlayerLeftNotification("ghost"));
+
+            Assert.AreEqual(2, _roomManager.CurrentRoom.Players.Length,
+                "Pruning an absent id must be a no-op.");
+        }
+
         // ── HandleRoomPacket: RoomList Response ────────────────────────────────
 
         [Test]

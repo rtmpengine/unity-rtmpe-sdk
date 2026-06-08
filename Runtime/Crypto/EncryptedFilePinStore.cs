@@ -269,10 +269,16 @@ namespace RTMPE.Crypto
             }
             catch (IOException)
             {
-                // Best-effort cleanup of the staging file on failure so a
-                // partial write does not leave orphaned bytes behind.
+                // Clean up the staging file so a failed write leaves no
+                // orphaned bytes behind, then propagate.  Callers — notably
+                // MigratingPinStore — distinguish a durable write from a failed
+                // one solely by whether Save throws: swallowing the failure
+                // here would report a non-durable write as success, scrubbing
+                // the legacy fallback pin and silently downgrading pinning to a
+                // fresh trust-on-first-use capture on the next connect.
                 try { if (File.Exists(tmpPath)) File.Delete(tmpPath); }
                 catch (IOException) { }
+                throw;
             }
         }
 

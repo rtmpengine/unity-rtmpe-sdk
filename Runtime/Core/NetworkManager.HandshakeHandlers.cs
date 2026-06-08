@@ -277,12 +277,15 @@ namespace RTMPE.Core
         // closes any future state-machine refactor that decouples the two.
         // Set in OnSessionAck; cleared in TransitionTo(Disconnected).
         //
-        // The volatile modifier guarantees that a write on one thread is
-        // observable on every other thread on its next read.  Writes happen
-        // on the Unity main thread (post-dispatch handlers); reads happen on
-        // the network-receive thread inside the pre-dispatch admission gate.
-        // Without the barrier the C# memory model permits a stale-cached
-        // read that admits a packet whose session has just been torn down.
+        // All accesses run on the Unity main thread: the witness is written in
+        // OnSessionAck and cleared in TransitionTo, and the admission gate that
+        // reads it sits inside ProcessPacket — which the network-receive thread
+        // reaches only after marshalling the packet through the main-thread
+        // dispatcher (network-thread teardown events are likewise re-dispatched
+        // before touching state).  The volatile qualifier is therefore not
+        // load-bearing for the current single-threaded access pattern; it is
+        // retained as a low-cost barrier so the witness stays correctly
+        // published if a later refactor ever observes it off the main thread.
         private volatile bool _sessionEstablished;
 
         /// <summary>

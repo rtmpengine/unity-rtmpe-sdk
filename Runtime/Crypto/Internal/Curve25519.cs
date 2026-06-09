@@ -217,7 +217,18 @@ namespace RTMPE.Crypto.Internal
             using var rng = RandomNumberGenerator.Create();
             rng.GetBytes(privateKey);
 
-            // Public key = ScalarMult(private, base_point_u=9)
+            // RFC 7748 §5: the X25519 secret scalar is clamped before any
+            // scalar multiplication. Applying the clamp to the stored bytes
+            // keeps the returned private key in its canonical form — ScalarMult
+            // clamps a working copy regardless, so the public key and every
+            // derived shared secret are identical either way, but a caller that
+            // inspects or persists the private scalar observes the value the
+            // curve actually uses.
+            privateKey[0]  &= 248;
+            privateKey[31] &= 127;
+            privateKey[31] |= 64;
+
+            // Public key = ScalarMult(private, base_point_u = 9).
             var basePoint = new byte[32];
             basePoint[0] = 9;
             var publicKey = ScalarMult(privateKey, basePoint);

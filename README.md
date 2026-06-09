@@ -94,9 +94,11 @@ Import samples from **Window → Package Manager → RTMPE SDK → Samples**:
 | BasicConnection | Minimal connect / disconnect loop (UPM-importable via the Package Manager → Samples panel) |
 
 Two additional, **larger demos** — `BasicMovement` and `SimpleFPS` —
-ship alongside the SDK as standalone Unity projects (not inside the
-package, so they are *not* listed in the Package Manager Samples
-panel). Open each demo as its own Unity project.
+live under the repository's `Samples/` folder, outside the UPM package
+(so they are *not* listed in the Package Manager Samples panel). Each is
+a set of scripts plus a scene rather than a self-contained Unity project:
+copy its `Scripts/` and `Scenes/` into a project that already has the SDK
+installed.
 
 ## Documentation
 

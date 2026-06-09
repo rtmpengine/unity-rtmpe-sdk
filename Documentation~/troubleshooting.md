@@ -91,8 +91,9 @@ call `Connect(apiKey)` with fresh credentials.
 
 ### Symptom: Handshake succeeds but the first room call fails with "invalid token"
 
-- [ ] Is the JWT valid? Log `NetworkManager.Instance.JwtToken` and decode the
-      `exp` claim (`jwt.io` or equivalent). A `401` from the Room Service
+- [ ] Is the JWT valid? `NetworkManager.Instance.JwtToken` is a `RedactedString`
+      that logs as `<redacted>`; call `.Reveal()` to obtain the raw token, then
+      decode the `exp` claim (`jwt.io` or equivalent). A `401` from the Room Service
       REST API indicates expiration or a signing-key mismatch between the
       gateway and Room Service.
 - [ ] Is the system clock synchronised? Token TTLs default to 5 minutes. A
@@ -193,25 +194,29 @@ takes care of retry cadence automatically.
 
 ### IL2CPP: `MissingMethodException` at runtime
 
-Unity AOT code stripping removes unused methods. Add the SDK assemblies to
-your project's `link.xml`:
+Unity AOT code stripping removes members it cannot prove are reached from a
+static call site. The SDK ships a `link.xml` that preserves its own runtime
+assembly (`RTMPE.SDK.Runtime`), so the SDK's reflective RPC and variable paths
+survive stripping with no action on your part.
+
+Your game's `[RtmpeRpc]` methods and any custom `NetworkVariable<T>` closed
+types live in your own assembly, which the SDK cannot preserve for you. When
+the **Managed Stripping Level** is above **Low**, add a `link.xml` under your
+project's `Assets/` folder that preserves them:
 
 ```xml
 <linker>
-    <assembly fullname="RTMPE.SDK.Runtime" preserve="all" />
+    <assembly fullname="Assembly-CSharp">
+        <type fullname="MyGame.PlayerController" preserve="all" />
+        <type fullname="MyGame.MyCustomState" preserve="all" />
+    </assembly>
 </linker>
 ```
 
-Place `link.xml` in the `Assets/` folder. If you use a stripping level higher
-than **Low**, also add any custom `NetworkVariable<T>` types where `T` is not
-one of the pre-referenced types (`int`, `float`, `bool`, `Vector3`,
-`Quaternion`, `string`):
-
-```xml
-<assembly fullname="Assembly-CSharp">
-    <type fullname="MyGame.MyCustomState" preserve="all" />
-</assembly>
-```
+Replace `Assembly-CSharp` with your gameplay assembly name if you use an
+`.asmdef`. The built-in `NetworkVariable<T>` closures for `int`, `float`,
+`bool`, `Vector3`, `Quaternion`, and `string` are already preserved by the
+SDK's own `link.xml`.
 
 ---
 

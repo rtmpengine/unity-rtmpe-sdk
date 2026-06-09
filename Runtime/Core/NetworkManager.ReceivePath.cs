@@ -435,14 +435,44 @@ namespace RTMPE.Core
         internal const int MaxRpcBufferReplayEvents = 4096;
 
         // RPC replay state owned by RTMPE.Core.Rpc.RpcReplayBuffer.
-        // The CAS re-entry guard, the pending-live queue, the running byte
-        // counter, and the dropped-count atomic live there.
-        // The cap constants below are passthroughs so callers can reference
-        // them without a direct dependency on RpcReplayBuffer.
+        // The ordering barrier, the historical (buffered) and live (pending)
+        // queues, the running byte counter, and the dropped-count atomic live
+        // there.  The cap constants below are passthroughs so callers can
+        // reference them without a direct dependency on RpcReplayBuffer.
 
         internal const int MaxPendingLiveRpcsDuringReplay   = RpcReplayBuffer.MaxPendingDuringReplay;
         internal const int MaxPendingLiveRpcPayloadBytes    = RpcReplayBuffer.MaxPayloadBytes;
         internal const int MaxPendingLiveRpcCumulativeBytes = RpcReplayBuffer.MaxCumulativeBytes;
+
+        /// <summary>
+        /// Wall-clock budget for a single catch-up replay drain pump, in
+        /// milliseconds.  A late-join frame is already heavy (object spawns,
+        /// full state sync), so a large pre-loaded RPC buffer is drained across
+        /// a few frames under this budget rather than dispatched all at once —
+        /// each catch-up event invokes arbitrary game code, and a peer that
+        /// filled the room's buffer could otherwise stall a joining client's
+        /// main thread for seconds.  At 30 Hz a frame is ~33 ms, so this slice
+        /// stays well under one frame.
+        /// </summary>
+        internal const double ReplayDrainBudgetMillis = 4.0;
+
+        /// <summary>
+        /// Hard per-pump dispatch ceiling backing the wall-clock budget: a
+        /// monotonic clock that fails to advance (or a non-positive budget)
+        /// must not let one pump spin without bound.  Sized to the sum of both
+        /// queue caps so a fast drain still completes in a single pump.
+        /// </summary>
+        internal const int MaxReplayDrainPerPump =
+            MaxRpcBufferReplayEvents + RpcReplayBuffer.MaxPendingDuringReplay;
+
+        // Monotonic clock for the drain budget and the budget precomputed in
+        // Stopwatch ticks.  Stopwatch.Frequency is fixed per process, so the
+        // tick budget is computed once; the delegate is cached to keep the
+        // per-frame drain path allocation-free.
+        private static readonly System.Func<long> ReplayDrainClock =
+            System.Diagnostics.Stopwatch.GetTimestamp;
+        private static readonly long ReplayDrainBudgetTicks =
+            (long)(ReplayDrainBudgetMillis * System.Diagnostics.Stopwatch.Frequency / 1000.0);
 
         /// <summary>
         /// Handle an <c>RpcBufferReplay</c> (0x52) packet delivered immediately after joining a room.
@@ -468,6 +498,11 @@ namespace RTMPE.Core
                 return;
             }
 
+            // Raise the ordering barrier for this frame.  A second frame
+            // arriving while a prior replay is still draining (it may span
+            // several pumps) is dropped to avoid double-dispatching its
+            // catch-up RPCs; the gateway emits exactly one replay frame per
+            // join, so this only fires on a hostile/buggy retry.
             if (!_rpcReplayBuffer.TryEnterDrain())
             {
                 LogDebug("RpcBufferReplay: replay already in progress, dropping concurrent frame.");
@@ -488,13 +523,21 @@ namespace RTMPE.Core
                     return;
                 }
 
+                // Decode each catch-up event and queue it in server-emitted
+                // order.  Dispatch is deferred to DrainReplayQueue so the
+                // historical events share one bounded, resumable drain with any
+                // live RPCs that arrive during the window — both run in the
+                // correct order (buffered before live) without freezing the
+                // main thread when the buffer is large.  Per-event parse,
+                // registry lookup, and audience checks happen at dispatch time
+                // inside DispatchEnhancedRpcPayload.
                 for (int i = 0; i < eventCount; i++)
                 {
                     if (offset + 2 > payload.Length)
                     {
                         if (IsDebugLogEnabled)
-                            LogDebug($"RpcBufferReplay: truncated at event {i}/{eventCount}, aborting replay.");
-                        return;
+                            LogDebug($"RpcBufferReplay: truncated at event {i}/{eventCount}, stopping decode.");
+                        break;
                     }
                     ushort payloadLen = (ushort)(payload[offset] | (payload[offset + 1] << 8));
                     offset += 2;
@@ -502,115 +545,74 @@ namespace RTMPE.Core
                     if (offset + payloadLen > payload.Length)
                     {
                         if (IsDebugLogEnabled)
-                            LogDebug($"RpcBufferReplay: event {i} payload truncated ({payloadLen} bytes), aborting.");
-                        return;
+                            LogDebug($"RpcBufferReplay: event {i} payload truncated ({payloadLen} bytes), stopping decode.");
+                        break;
                     }
 
                     var eventPayload = new byte[payloadLen];
                     Array.Copy(payload, offset, eventPayload, 0, payloadLen);
                     offset += payloadLen;
 
-                    if (!EnhancedRpcPacketParser.TryParse(eventPayload, out var request))
-                    {
-                        if (IsDebugLogEnabled)
-                            LogDebug($"RpcBufferReplay: failed to parse event {i}, skipped.");
-                        continue;
-                    }
-
-                    var nb = _spawnManager?.Registry?.Get(request.ObjectId);
-                    if (nb == null)
-                    {
-                        if (IsDebugLogEnabled)
-                            LogDebug($"RpcBufferReplay: no spawned object {request.ObjectId} for event {i}, skipped.");
-                        continue;
-                    }
-
-                    // DispatchEnhancedRpc consults the per-type RpcRegistry; an unknown
-                    // methodId or mismatched argument count is rejected inside the
-                    // registry's TryInvoke gate without throwing back to this loop.
-                    // We still wrap defensively so a single buggy [RtmpeRpc] handler
-                    // cannot abort the rest of the replay.
-                    try
-                    {
-                        nb.DispatchEnhancedRpc(request.MethodId, request.Target, request.Args);
-                    }
-                    catch (Exception ex)
-                    {
-                        LogDebug(
-                            $"RpcBufferReplay: dispatch threw for method {request.MethodId} on " +
-                            $"object {request.ObjectId}: {ex.GetType().Name}: {ex.Message}");
-                    }
+                    _rpcReplayBuffer.EnqueueBuffered(eventPayload);
                 }
+
+                // Dispatch as much as this frame's time budget allows.
+                // DrainReplayQueue lowers the ordering barrier once the queues
+                // are empty; otherwise the per-frame Update continuation
+                // finishes the remainder in order.
+                DrainReplayQueue();
             }
             finally
             {
-                // Drain inside the flag window so re-entrant inbound packets
-                // continue to queue rather than bypass the FIFO.  If a queued
-                // RPC's [RtmpeRpc] handler synchronously dispatches another
-                // inbound packet, the OnEnhancedRpcRequest fast path observes
-                // _replayInProgress = 1 and appends the new payload to the
-                // tail of _pendingLiveRpcs — exactly the desired arrival
-                // ordering.  Clearing the flag first would let the nested
-                // dispatch run immediately and stomp on the remaining queued
-                // items, breaking FIFO.
-                try
-                {
-                    // Bounded outer loop.  A drained payload's [RtmpeRpc]
-                    // handler may synchronously dispatch more inbound packets
-                    // through OnEnhancedRpcRequest, which (with
-                    // _replayInProgress still set) re-enqueues onto
-                    // _pendingLiveRpcs.  We re-check the queue after the inner
-                    // drain finishes so those late arrivals are not stranded
-                    // until the next replay.  The outer iteration count is
-                    // capped at 4 to prevent a pathological handler from
-                    // turning the drain into an infinite loop.
-                    const int MaxDrainIterations = 4;
-                    for (int iter = 0; iter < MaxDrainIterations; iter++)
-                    {
-                        if (_rpcReplayBuffer.PendingCount == 0)
-                            break;
-
-                        // Snapshot the count for the inner loop so a handler
-                        // that synchronously re-enqueues during dispatch
-                        // cannot turn this loop into an infinite drain.  Late
-                        // arrivals are picked up on the next outer iteration
-                        // (and the outer iteration cap is the final ceiling).
-                        int innerBudget = _rpcReplayBuffer.PendingCount;
-                        for (int j = 0; j < innerBudget; j++)
-                        {
-                            if (!_rpcReplayBuffer.TryDequeue(out var pending)) break;
-                            try
-                            {
-                                DispatchEnhancedRpcPayload(pending);
-                            }
-                            catch (Exception ex)
-                            {
-                                LogDebug(
-                                    "RpcBufferReplay: post-replay drain dispatch threw: " +
-                                    $"{ex.GetType().Name}: {ex.Message}");
-                            }
-                        }
-                    }
-
-                    if (_rpcReplayBuffer.PendingCount > 0)
-                    {
-                        LogDebug(
-                            "RpcBufferReplay: drain iteration cap reached with " +
-                            $"{_rpcReplayBuffer.PendingCount} payload(s) still queued; " +
-                            "remaining items will be dispatched on the next live RPC.");
-                    }
-                }
-                finally
-                {
-                    // The flag clear is the very last act so any payload
-                    // enqueued mid-drain has already been picked up by the
-                    // surrounding loop's Count check.  ExitDrain calls
-                    // Interlocked.Exchange under the hood so the producer-side
-                    // Volatile.Read sees the flag clear with full release
-                    // semantics — the producer-side Volatile.Read sees the
-                    // flag clear with full release ordering.
+                // On the normal path DrainReplayQueue has already lowered the
+                // barrier if everything drained.  If an exception escaped the
+                // decode, any events queued so far stay enqueued and the Update
+                // continuation will deliver them — release the barrier only
+                // when nothing is outstanding, so a thrown decode can never
+                // strand it raised forever.
+                if (!_rpcReplayBuffer.HasPendingWork)
                     _rpcReplayBuffer.ExitDrain();
-                }
+            }
+        }
+
+        /// <summary>
+        /// Drain queued catch-up RPCs — historical (buffered) first, then live
+        /// (pending) — within this frame's wall-clock budget.  Invoked from
+        /// <see cref="HandleRpcBufferReplay"/> when a replay frame arrives and
+        /// again each frame from <c>Update</c> while work remains, so a large
+        /// catch-up buffer is delivered in order across a few frames instead of
+        /// stalling the main thread in one.
+        /// </summary>
+        private void DrainReplayQueue()
+        {
+            // The cached delegate is bound in Start(); the method-group fallback
+            // only materialises before Start has run (e.g. an EditMode test that
+            // invokes the receive path directly) and never allocates in
+            // production, where Start always precedes the first inbound packet.
+            _rpcReplayBuffer.DrainBounded(
+                _drainReplayDispatch ?? SafeDispatchReplayPayload,
+                MaxReplayDrainPerPump,
+                ReplayDrainBudgetTicks,
+                ReplayDrainClock);
+        }
+
+        /// <summary>
+        /// Dispatch one drained catch-up payload, isolating a throwing
+        /// <c>[RtmpeRpc]</c> handler so a single bad event cannot abort the
+        /// rest of the drain.  Bound once to <see cref="_drainReplayDispatch"/>
+        /// so the per-frame drain pump stays allocation-free.
+        /// </summary>
+        private void SafeDispatchReplayPayload(byte[] payload)
+        {
+            try
+            {
+                DispatchEnhancedRpcPayload(payload);
+            }
+            catch (Exception ex)
+            {
+                LogDebug(
+                    "RpcBufferReplay: drain dispatch threw: " +
+                    $"{ex.GetType().Name}: {ex.Message}");
             }
         }
 

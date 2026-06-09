@@ -711,6 +711,44 @@ namespace RTMPE.Core
         /// 3. Derive session keys via X25519 ECDH + HKDF-SHA256.
         /// 4. Send <c>HandshakeResponse</c> containing the client public key.
         /// </summary>
+        // Abort an in-flight handshake synchronously with a specific failure
+        // reason — used when the attempt can never succeed (e.g. a Strict-pin
+        // refusal) so the cause surfaces immediately rather than after the
+        // connection-timeout window.  Mirrors the teardown
+        // ConnectionTimeoutRoutine performs so the next retry starts from an
+        // identical clean baseline (terminated thread, closed socket, stopped
+        // coroutines).  Stopping the timeout coroutine is the load-bearing
+        // step: it prevents a second OnConnectionFailed (with the generic
+        // "Connection timeout." reason) from firing later, and the Disconnected
+        // transition makes any other failure site a no-op via TransitionTo's
+        // prev==next guard.
+        private void FailHandshake(string failureReason, DisconnectReason reason)
+        {
+            SafeRaise(OnConnectionFailed, failureReason, nameof(OnConnectionFailed));
+
+            if (_timeoutCoroutine != null)
+            {
+                StopCoroutine(_timeoutCoroutine);
+                _timeoutCoroutine = null;
+            }
+            if (_connectCoroutine != null)
+            {
+                StopCoroutine(_connectCoroutine);
+                _connectCoroutine = null;
+            }
+
+            _networkThread?.Stop();
+            _networkThread = null;
+            try { _transport?.Disconnect(); }
+            catch (Exception ex)
+            {
+                RtmpeLog.Warning($"[NM] Transport disconnect on handshake-failure teardown threw: {ex.Message}");
+            }
+            _heartbeatManager?.Stop();
+            ClearSessionData(preserveReconnectToken: false);
+            TransitionTo(NetworkState.Disconnected, reason);
+        }
+
         private void OnChallenge(byte[] data)
         {
             // Guard: only process Challenge while we are actively connecting
@@ -758,6 +796,14 @@ namespace RTMPE.Core
                         "pin via IServerKeyPinStore (TrustOnFirstUse + " +
                         "requireFirstUseProvisioned), or relax requireFirstUseProvisioned " +
                         "if first-flight TOFU capture is acceptable for this deployment.");
+                    // This refusal is deterministic — the handshake can never
+                    // succeed under the current configuration — so fail it now
+                    // with a pin-specific reason instead of leaving an event-only
+                    // caller to wait out the connection timeout and receive the
+                    // generic "Connection timeout." reason.
+                    FailHandshake(
+                        "Server not pinned — refusing handshake (Strict pinning, no pin configured).",
+                        DisconnectReason.ProtocolError);
                     return;
 
                 case PinDecision.ProceedUnpinned:

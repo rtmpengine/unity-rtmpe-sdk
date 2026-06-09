@@ -100,6 +100,19 @@ namespace RTMPE.Core
                 Array.Clear(_sessionAckKey, 0, _sessionAckKey.Length);
                 _sessionAckKey = null;
             }
+            // Release the session bearer credentials too.  Cleanup is reached on
+            // OnDestroy / OnApplicationQuit without routing through
+            // ClearSessionData — the only other site that clears them — so a
+            // manager destroyed mid-session would otherwise leave the JWT and
+            // reconnect token referenced for the rest of the heap's lifetime.
+            _jwtToken       = null;
+            _reconnectToken = null;
+            // Detach the process-static RPC-verifier hooks here too: OnDestroy /
+            // OnApplicationQuit reach Cleanup without routing through
+            // ClearSessionData, so a manager destroyed while still connected
+            // would otherwise leave closures over its torn-down state live on
+            // the verifier.
+            DetachRpcVerifierHooks();
             _sessionKeyStore.ResetReplayWindow();
             // Detach scene manager BEFORE tearing down the network thread so
             // any in-flight SceneLoaded callbacks don't fire into a disposed manager.
@@ -401,6 +414,27 @@ namespace RTMPE.Core
                     "SetServerAttestedSenderVerifier for stricter admission.");
             }
             return true;
+        }
+
+        // Detach the static EnhancedRpcVerifier hooks installed by
+        // RecreateRoomAndSpawnManagers and restore the conservative self-only
+        // defaults.  Invoked from BOTH session-teardown paths — ClearSessionData
+        // (Disconnect / reconnect) and Cleanup (OnDestroy / OnApplicationQuit) —
+        // so neither a disconnected nor a destroyed manager leaves a captured
+        // registry / session-id closure live on the process-static verifier, and
+        // a subsequent session that boots without RecreateRoomAndSpawnManagers
+        // inherits the self-only policy rather than a stale roster-anchored one.
+        private void DetachRpcVerifierHooks()
+        {
+            // Reset every verifier hook to the conservative self-only default and
+            // re-arm the verifier's own warn-once latches, so the next session
+            // re-emits the roster-anchor / permissive-fallback advisories instead
+            // of inheriting a latched-quiet state from the session just torn down.
+            RTMPE.Rpc.EnhancedRpcVerifier.Reset();
+            // NetworkManager owns a separate peer-admission advisory latch (the
+            // in-room non-zero-sender fallback); re-arm it on the same teardown so
+            // each session likewise gets its one-time warning.
+            System.Threading.Interlocked.Exchange(ref _peerAdmissionAdvisoryEmitted, 0);
         }
 
         /// <summary>
@@ -763,23 +797,31 @@ namespace RTMPE.Core
 
             bool reliableEnabled = reliable && emitArqSequence && peerSupportsArqAck;
 
-            if (reliableEnabled
-                && _outboundReliableChannel.TryRegisterOutbound(
-                    copy,
-                    (float)UnityEngine.Time.unscaledTimeAsDouble,
-                    out uint arqSeq))
+            if (reliableEnabled)
             {
-                // The retransmit table holds the original packet bytes; a
-                // resend re-runs EncryptAndSendInternal with the same arqSeq
-                // so the receiver observes a stable sequence across retries.
-                EncryptAndSendInternal(copy, hasFixedArqSeq: true, fixedArqSeq: arqSeq);
-                return;
+                if (_outboundReliableChannel.TryRegisterOutbound(
+                        copy,
+                        (float)UnityEngine.Time.unscaledTimeAsDouble,
+                        out uint arqSeq))
+                {
+                    // The retransmit table holds the original packet bytes; a
+                    // resend re-runs EncryptAndSendInternal with the same arqSeq
+                    // so the receiver observes a stable sequence across retries.
+                    EncryptAndSendInternal(copy, hasFixedArqSeq: true, fixedArqSeq: arqSeq);
+                    return;
+                }
+
+                // Reliability is fully engaged for this session, but the in-flight
+                // retransmit window is full: the packet ships once with no retry.
+                // Surface the back-pressure once per process — a distinct,
+                // individually-actionable cause from the predicate-level downgrades
+                // (this one means the link is saturated, not misconfigured).
+                RTMPE.Core.Diagnostics.ReliableSaturationAdvisory.NotifyOnSaturation();
             }
 
-            // Unreliable path (or saturated retransmit table) — caller has
-            // already accepted "best effort" semantics.  When the table is
-            // saturated the caller is implicitly back-pressured: the packet
-            // still goes out once, but no retry will happen if it is lost.
+            // Best-effort path: reliability was not engaged for this send, or the
+            // retransmit window was saturated above.  The packet still goes out
+            // once; a loss on raw UDP is not recovered.
             EncryptAndSend(copy);
         }
 

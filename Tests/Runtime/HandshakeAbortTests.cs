@@ -126,5 +126,46 @@ namespace RTMPE.Tests
             Assert.AreEqual(1, disconnectedCount,
                 "OnDisconnected must not fire a second time for the late HandshakeAck.");
         }
+
+        [Test]
+        [Description("FailHandshake — the synchronous fast-fail used by a Strict-pin refusal — " +
+                     "surfaces the failure once via OnConnectionFailed with the supplied reason and " +
+                     "leaves the manager Disconnected instead of waiting out the connection timeout.")]
+        public void FailHandshake_FiresOnConnectionFailedOnce_WithReason_AndDisconnects()
+        {
+            const string reason = "Server not pinned — refusing handshake (Strict pinning, no pin configured).";
+
+            int failedCount = 0;
+            string observedReason = null;
+            _nm.OnConnectionFailed += r =>
+            {
+                Interlocked.Increment(ref failedCount);
+                observedReason = r;
+            };
+
+            _nm.ForceConnectingStateForTests();
+            Assert.AreEqual(NetworkState.Connecting, _nm.State,
+                "precondition: must be Connecting before the refusal.");
+
+            InvokeFailHandshake(_nm, reason, DisconnectReason.ProtocolError);
+
+            Assert.AreEqual(1, failedCount,
+                "OnConnectionFailed must fire exactly once for a strict-pin refusal.");
+            Assert.AreEqual(reason, observedReason,
+                "OnConnectionFailed must carry the pin-specific reason, not the generic timeout reason.");
+            Assert.AreEqual(NetworkState.Disconnected, _nm.State,
+                "FailHandshake must leave the manager Disconnected so the next attempt starts clean.");
+        }
+
+        // FailHandshake is a private teardown helper on NetworkManager; invoke
+        // it via reflection (matching the SDK's other internal-path fixtures).
+        private static void InvokeFailHandshake(NetworkManager nm, string reason, DisconnectReason code)
+        {
+            var mi = typeof(NetworkManager).GetMethod(
+                "FailHandshake",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            Assert.IsNotNull(mi, "FailHandshake must exist as a private method on NetworkManager.");
+            mi.Invoke(nm, new object[] { reason, code });
+        }
     }
 }

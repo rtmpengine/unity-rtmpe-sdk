@@ -22,6 +22,7 @@ using NUnit.Framework;
 using UnityEngine;
 using UnityEngine.TestTools;
 using RTMPE.Core;
+using RTMPE.Core.Rpc;
 using RTMPE.Rpc;
 
 namespace RTMPE.Tests
@@ -240,44 +241,62 @@ namespace RTMPE.Tests
         // their position in the frame; a live RPC arriving on the dispatcher
         // during the replay window must NOT interleave with the buffered
         // sequence — its state mutation could otherwise be overwritten by an
-        // older buffered handler.  The ordering invariant is enforced by the
-        // _replayInProgress flag: while the flag is set, OnEnhancedRpcRequest
-        // queues live payloads to _pendingLiveRpcs and the queue is drained
-        // in arrival order from the replay's finally block.
+        // older buffered handler.  The ordering invariant is owned by the
+        // RpcReplayBuffer (NetworkManager._rpcReplayBuffer): while its barrier
+        // is raised, OnEnhancedRpcRequest defers live payloads to the buffer's
+        // pending queue, and that queue is drained in arrival order — after the
+        // buffered events — by the replay's bounded drain.
+
+        // Reflection seams: the replay state lives in the internal
+        // RpcReplayBuffer instance, and the connection-state gate that
+        // OnEnhancedRpcRequest checks lives in the private _state field.
+        private RpcReplayBuffer ReplayBuffer()
+        {
+            var f = typeof(NetworkManager).GetField(
+                "_rpcReplayBuffer",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            Assert.IsNotNull(f, "_rpcReplayBuffer field must exist on NetworkManager.");
+            return (RpcReplayBuffer)f.GetValue(_manager);
+        }
+
+        private void SetConnectionState(NetworkState state)
+        {
+            var f = typeof(NetworkManager).GetField(
+                "_state",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            Assert.IsNotNull(f, "_state field must exist on NetworkManager.");
+            f.SetValue(_manager, state);
+        }
+
+        private void InvokeOnEnhancedRpcRequest(byte[] payload)
+        {
+            var mi = typeof(NetworkManager).GetMethod(
+                "OnEnhancedRpcRequest",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            Assert.IsNotNull(mi, "OnEnhancedRpcRequest must exist as a private method.");
+            mi.Invoke(_manager, new object[] { payload });
+        }
 
         [Test]
-        [Description("A live Enhanced RPC dispatched while _replayInProgress is set is " +
+        [Description("A live Enhanced RPC dispatched while the replay barrier is raised is " +
                      "deferred to the pending queue rather than processed inline.")]
         public void LiveRpc_DuringReplay_QueuedNotDispatched()
         {
-            // Set the replay flag manually to simulate "we are inside the for
-            // loop of HandleRpcBufferReplay".  In the full pipeline this is
-            // exactly the situation a buffered handler creates if it
-            // synchronously calls into the dispatcher.
-            var flagField = typeof(NetworkManager).GetField(
-                "_replayInProgress",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            flagField.SetValue(_manager, 1);
+            // Live RPCs are accepted only in-room; raise the barrier to mark a
+            // replay in progress, then deliver a live RPC.  This is exactly the
+            // situation a buffered handler creates if it synchronously feeds an
+            // inbound packet back through the dispatcher.
+            SetConnectionState(NetworkState.InRoom);
+            var buffer = ReplayBuffer();
+            Assert.IsTrue(buffer.TryEnterDrain(), "barrier should raise on first enter.");
 
-            // Invoke OnEnhancedRpcRequest with a live payload via reflection.
             var liveEv = BuildEnhancedRpcEvent(methodId: 0xDEADBEEF, objectId: 42UL);
-            var dispatchMi = typeof(NetworkManager).GetMethod(
-                "OnEnhancedRpcRequest",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            Assert.IsNotNull(dispatchMi, "OnEnhancedRpcRequest must exist as a private method.");
-            Assert.DoesNotThrow(() => dispatchMi.Invoke(_manager, new object[] { liveEv }));
+            Assert.DoesNotThrow(() => InvokeOnEnhancedRpcRequest(liveEv));
 
-            // Pending queue must now hold one entry (queued, not dispatched).
-            var queueField = typeof(NetworkManager).GetField(
-                "_pendingLiveRpcs",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var queue = (System.Collections.Generic.Queue<byte[]>)queueField.GetValue(_manager);
-            Assert.IsNotNull(queue, "Pending-live-RPC queue must be allocated on first deferral.");
-            Assert.AreEqual(1, queue.Count,
+            Assert.AreEqual(1, buffer.PendingCount,
                 "A live RPC arriving during a replay window must be queued, not processed inline.");
 
-            // Reset the flag so subsequent fixtures observe a clean state.
-            flagField.SetValue(_manager, 0);
+            buffer.Clear();   // reset barrier + queues for the next fixture.
         }
 
         [Test]
@@ -285,28 +304,26 @@ namespace RTMPE.Tests
                      "so the buffered (historical) handlers run BEFORE the live handlers.")]
         public void LiveRpc_AfterReplay_DrainedInOrder()
         {
-            // 1. Pre-seed the pending queue with two live payloads, simulating
-            //    that two live RPCs arrived during the replay window.
-            var queueField = typeof(NetworkManager).GetField(
-                "_pendingLiveRpcs",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var queue = new System.Collections.Generic.Queue<byte[]>();
-            queue.Enqueue(BuildEnhancedRpcEvent(methodId: 0xAAAAAAAA, objectId: 1UL));
-            queue.Enqueue(BuildEnhancedRpcEvent(methodId: 0xBBBBBBBB, objectId: 2UL));
-            queueField.SetValue(_manager, queue);
+            SetConnectionState(NetworkState.InRoom);
+            var buffer = ReplayBuffer();
 
-            // 2. Run a zero-event replay frame.  The drain in finally must
-            //    consume both pending entries.
+            // Pre-seed two live payloads (barrier down, so they sit in the
+            // pending queue) — simulating two live RPCs that arrived during a
+            // replay window.
+            Assert.AreEqual(RpcReplayBuffer.EnqueueResult.Ok,
+                buffer.TryEnqueue(BuildEnhancedRpcEvent(0xAAAAAAAA, 1UL)));
+            Assert.AreEqual(RpcReplayBuffer.EnqueueResult.Ok,
+                buffer.TryEnqueue(BuildEnhancedRpcEvent(0xBBBBBBBB, 2UL)));
+
+            // A zero-event replay frame's bounded drain must consume both
+            // pending entries (the no-spawned-object path logs+returns inside
+            // DispatchEnhancedRpcPayload — the expected outcome for these
+            // synthetic events).
             var frame = BuildReplayFrame(eventCount: 0);
             Assert.DoesNotThrow(() => _manager.HandleRpcBufferReplay(frame));
 
-            // 3. Queue must be empty post-drain — both live RPCs dispatched
-            //    in arrival order (the missing-handler / no-spawned-object
-            //    paths log+return inside DispatchEnhancedRpcPayload, which
-            //    is the expected outcome for these synthetic events).
-            var drained = (System.Collections.Generic.Queue<byte[]>)queueField.GetValue(_manager);
-            Assert.AreEqual(0, drained.Count,
-                "Replay finally block must drain every pending live RPC.");
+            Assert.AreEqual(0, buffer.PendingCount,
+                "The replay drain must consume every pending live RPC.");
         }
 
         [Test]
@@ -315,32 +332,21 @@ namespace RTMPE.Tests
                      "unboundedly under a hostile / flooded network.")]
         public void LiveRpc_DuringReplay_QueueCappedToMax()
         {
-            var flagField = typeof(NetworkManager).GetField(
-                "_replayInProgress",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            flagField.SetValue(_manager, 1);
-
-            var dispatchMi = typeof(NetworkManager).GetMethod(
-                "OnEnhancedRpcRequest",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            SetConnectionState(NetworkState.InRoom);
+            var buffer = ReplayBuffer();
+            Assert.IsTrue(buffer.TryEnterDrain());
 
             // Push MaxPendingLiveRpcsDuringReplay + a few extras.  The queue
             // must cap exactly at the documented constant.
             int max = NetworkManager.MaxPendingLiveRpcsDuringReplay;
             var liveEv = BuildEnhancedRpcEvent(methodId: 0x12345678, objectId: 7UL);
             for (int i = 0; i < max + 25; i++)
-                dispatchMi.Invoke(_manager, new object[] { liveEv });
+                InvokeOnEnhancedRpcRequest(liveEv);
 
-            var queueField = typeof(NetworkManager).GetField(
-                "_pendingLiveRpcs",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var queue = (System.Collections.Generic.Queue<byte[]>)queueField.GetValue(_manager);
-            Assert.AreEqual(max, queue.Count,
+            Assert.AreEqual(max, buffer.PendingCount,
                 "Pending-live queue must not exceed MaxPendingLiveRpcsDuringReplay.");
 
-            // Reset state for the next fixture.
-            flagField.SetValue(_manager, 0);
-            queue.Clear();
+            buffer.Clear();
         }
     }
 }

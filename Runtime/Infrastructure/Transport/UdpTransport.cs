@@ -188,6 +188,15 @@ namespace RTMPE.Transport
             if (_disposed)
                 throw new ObjectDisposedException(nameof(UdpTransport));
 
+            // Connect is re-callable across reconnect attempts.  Close any socket
+            // left bound by a prior attempt before binding a new one, so a caller
+            // that re-enters Connect without an intervening Disconnect cannot
+            // orphan the previous OS file descriptor.  The same atomic exchange as
+            // Disconnect is used so a concurrent teardown still nulls the field
+            // exactly once and the loser disposes nothing.
+            var stale = System.Threading.Interlocked.Exchange(ref _socket, null);
+            stale?.Dispose();
+
             // Resolve once per UdpTransport lifetime.  Reusing the cached IP across
             // reconnects keeps the captive-portal stall (where Dns.GetHostAddresses
             // can block 5–30s) bounded to the very first Connect of this instance.

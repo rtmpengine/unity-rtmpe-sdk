@@ -203,11 +203,12 @@ namespace RTMPE.Core
         // contract.
         private readonly SessionKeyStore _sessionKeyStore = new SessionKeyStore();
 
-        // RpcReplayBuffer owns the CAS re-entry guard (_replayInProgress),
-        // the pending-live-RPC queue (_pendingLiveRpcs), the running byte
-        // counter, and the dropped-count atomic. Centralising these in one
-        // class makes the ordering invariant (replay drains BEFORE live RPCs
-        // from the same delivery window) reviewable in isolation. See
+        // RpcReplayBuffer owns the ordering barrier / re-entry guard, the
+        // historical (buffered) and live (pending) catch-up queues, the running
+        // byte counter, and the dropped-count atomic, plus the bounded,
+        // resumable drain. Centralising these in one class makes the ordering
+        // invariant (historical events drain BEFORE live RPCs from the same
+        // delivery window) reviewable in isolation. See
         // Runtime/Core/Rpc/RpcReplayBuffer.cs for the threading + caps.
         private readonly RpcReplayBuffer _rpcReplayBuffer = new RpcReplayBuffer();
 
@@ -270,6 +271,11 @@ namespace RTMPE.Core
         // GC Round 2 (2026-05-02): now bound to the (byte[], int) overload
         // so callers can pass an oversized cached/pooled buffer + length.
         private System.Action<byte[], int> _sendVariableUpdateDelegate;
+
+        // Cached per-payload dispatch delegate for the catch-up replay drain —
+        // stored so the per-frame DrainReplayQueue continuation does not
+        // allocate a method-group delegate while a large buffer is draining.
+        private System.Action<byte[]> _drainReplayDispatch;
 
         // GC Round 3 (2026-05-02) — per-direction 12-byte AEAD nonce
         // scratch buffers reused across packets.  Replaces the per-packet
@@ -467,6 +473,31 @@ namespace RTMPE.Core
         /// <summary>Total wire-level bytes received since process start.</summary>
         public long BytesInCounter =>
             System.Threading.Interlocked.Read(ref _bytesIn);
+
+        /// <summary>
+        /// Outbound packets dropped because the network thread's send queue was
+        /// at its cap (drop-newest under sustained back-pressure).  Sustained
+        /// growth signals the producer rate exceeds the drain rate — surface it
+        /// in telemetry.  Reads <c>0</c> before the first connect and after the
+        /// session is torn down.
+        /// </summary>
+        public long SendQueueDroppedCount =>
+            _networkThread?.SendQueueDroppedCount ?? 0L;
+
+        /// <summary>
+        /// ENOBUFS events the send loop has absorbed (the kernel send buffer was
+        /// momentarily full).  A companion saturation signal to
+        /// <see cref="SendQueueDroppedCount"/>.  Reads <c>0</c> with no live thread.
+        /// </summary>
+        public long EnobufsCount =>
+            _networkThread?.EnobufsCount ?? 0L;
+
+        /// <summary>
+        /// Approximate current depth of the outbound send queue.  Useful for
+        /// saturation dashboards.  Reads <c>0</c> with no live thread.
+        /// </summary>
+        public int SendQueueCount =>
+            _networkThread?.SendQueueCount ?? 0;
 
         /// <summary>
         /// Local player's room-level UUID — set by RoomManager when JoinRoom succeeds.

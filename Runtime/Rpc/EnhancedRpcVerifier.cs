@@ -37,9 +37,11 @@
 // Extension hooks:
 //  • SenderVerifier  — integrators set this delegate to gate inbound
 //                      senderId values against their own room/session
-//                      roster.  Default: accept any non-zero senderId
-//                      (zero is structurally rejected because it is the
-//                      SDK's "uninitialised session" sentinel).
+//                      roster.  Default: self-only — DefaultSenderVerifier
+//                      admits ONLY the local session id (the gateway's
+//                      echo of the client's own RPCs); peers must be opted
+//                      in explicitly, because AEAD authenticates the
+//                      gateway as relay, not the originating peer.
 //  • ObjectExistsVerifier — optional sanity hook.  NetworkManager
 //                      already gates dispatch on the spawn registry,
 //                      so the default returns true (no extra check

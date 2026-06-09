@@ -249,4 +249,68 @@ namespace RTMPE.Core.Diagnostics
             Interlocked.Exchange(ref _emitted, 0);
 #endif // UNITY_INCLUDE_TESTS
     }
+
+    /// <summary>
+    /// Process-scoped warn-once advisory that fires when a caller invokes
+    /// <see cref="RTMPE.Core.NetworkManager.Send"/> with <c>reliable: true</c>
+    /// on a session where the ARQ contract is fully engaged, but the outbound
+    /// retransmit window is saturated, so the packet ships once with no retry.
+    /// Distinct from <see cref="ReliableSendAdvisory"/> and
+    /// <see cref="PeerCapabilityAdvisory"/>: those report a *misconfiguration*
+    /// (reliability is not in force at all), whereas this reports *runtime
+    /// back-pressure* (reliability is in force but the in-flight window is
+    /// momentarily full).  A separate latch keeps the saturation signal from
+    /// being conflated with the two configuration signals.
+    /// </summary>
+    internal static class ReliableSaturationAdvisory
+    {
+        /// <summary>
+        /// Canonical message text, centralised as a constant so the test
+        /// project asserts on a stable string and a future wording edit is a
+        /// single reviewed location.
+        /// </summary>
+        internal const string MessageText =
+            "[RTMPE] NetworkManager.Send(reliable: true) — the outbound ARQ " +
+            "retransmit window is full, so this packet (and further reliable sends " +
+            "while it stays saturated) is delivered best-effort with no retransmit.  " +
+            "This is runtime back-pressure, not a misconfiguration: the producer is " +
+            "outpacing acknowledgement.  Lower the reliable send rate, or watch " +
+            "NetworkManager.SendQueueDroppedCount to track saturation.  Logged once " +
+            "per process; the downgrade continues silently for subsequent saturated " +
+            "sends.";
+
+        // 0 = advisory pending, 1 = already emitted.  Independent latch from the
+        // two configuration advisories so a saturated link surfaces its own
+        // distinct, individually-actionable line.
+        private static int _emitted;
+
+        /// <summary>
+        /// Emit the advisory at most once per process.  Called only from the
+        /// saturation branch of the send path, where reliability is engaged but
+        /// <c>ReliableChannel.TryRegisterOutbound</c> reported a full window.
+        /// </summary>
+        public static void NotifyOnSaturation()
+        {
+            if (Interlocked.CompareExchange(ref _emitted, 1, 0) != 0) return;
+
+            UnityEngine.Debug.LogWarning(MessageText);
+        }
+
+        /// <summary>
+        /// Snapshot of the latch.  <see langword="true"/> once the advisory has
+        /// been emitted in the current process.  For internal observers (test
+        /// fixtures, editor diagnostics) only.
+        /// </summary>
+        internal static bool WasEmitted =>
+            Volatile.Read(ref _emitted) != 0;
+
+#if UNITY_INCLUDE_TESTS
+        /// <summary>
+        /// Resets the latch so the next <see cref="NotifyOnSaturation"/> call
+        /// emits again.  Test-only seam; production code must not call this.
+        /// </summary>
+        internal static void ResetForTests() =>
+            Interlocked.Exchange(ref _emitted, 0);
+#endif // UNITY_INCLUDE_TESTS
+    }
 }

@@ -45,6 +45,11 @@ namespace RTMPE.Core
                 _instance              = null;
                 System.Threading.Volatile.Write(ref _applicationIsQuitting, false);
                 _missingInstanceWarned = 0;
+                // Re-arm the peer-admission advisory across an editor domain
+                // reload that bypasses ClearSessionData, so the first session of
+                // a fresh Play run still emits the one-time roster-anchor warning
+                // instead of inheriting a latched-quiet state from the prior run.
+                System.Threading.Interlocked.Exchange(ref _peerAdmissionAdvisoryEmitted, 0);
                 // Do NOT clear _transportFactory here — tests and WebGL bootstraps
                 // install it once at module init, before any singleton is created.
                 // Clearing would break that install-then-play sequence.  Users

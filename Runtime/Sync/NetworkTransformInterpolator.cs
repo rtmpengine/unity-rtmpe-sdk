@@ -409,51 +409,47 @@ namespace RTMPE.Sync
                 // to uint.MaxValue does not overflow during the conversion.
                 double senderTime = (double)senderTick * tickIntervalSeconds;
 
-                // ── Clock-offset EMA ─────────────────────────────────────────
-                // Sample = receiver_now - sender_time.  Initial sample is
+                // ── Candidate clock-offset (not yet committed) ───────────────
+                // Sample = receiver_now - sender_time.  The first sample is
                 // adopted directly (no warm-up bias); subsequent samples are
                 // low-pass filtered with ClockOffsetAlpha so a single jittery
-                // packet does not yank the render cursor.
+                // packet does not yank the render cursor.  Compute the offset
+                // this packet WOULD adopt without writing it, so a packet
+                // rejected by the gates below leaves the EMA untouched.
                 double sample = receiverNow - senderTime;
-                if (!_hasClockOffset)
-                {
-                    _clockOffset    = sample;
-                    _hasClockOffset = true;
-                }
-                else
-                {
-                    _clockOffset += ClockOffsetAlpha * (sample - _clockOffset);
-                }
+                double candidateOffset = _hasClockOffset
+                    ? _clockOffset + ClockOffsetAlpha * (sample - _clockOffset)
+                    : sample;
 
                 // Stored timestamp lives in the receiver wall-clock domain so
                 // the existing TryInterpolate(renderTime) path — which reads
                 // Time.timeAsDouble - delay — needs no changes.
-                double timestamp = senderTime + _clockOffset;
+                double timestamp = senderTime + candidateOffset;
 
-                // The interpolator's AddState(state, timestamp) path enforces
-                // strict monotonic timestamps; the sender-tick path enforces
-                // strict monotonic ticks instead.  Persist the high-water
-                // tick FIRST so a duplicate timestamp (rare under EMA) does
-                // not block subsequent tick-strict-greater states.
-                _latestSenderTick = senderTick;
-                _hasSenderTick    = true;
-
-                // Bypass the per-timestamp monotonicity guard inside
-                // AddState — the sender-tick guard above is the authoritative
-                // ordering signal here.  Inline the buffer push so two
-                // adjacent ticks whose receiver-domain timestamps round to
-                // the same EMA value do not silently drop the second.
+                // Validate BEFORE mutating any state.  A non-finite or
+                // far-future timestamp, or a non-finite transform component,
+                // must not advance the sender-tick high-water — doing so would
+                // strand every later in-range tick as "stale" (line 404) — nor
+                // poison the clock-offset EMA.  AddState applies the same
+                // finiteness/skew (and NaN/Inf, line 284) guards on the
+                // receiver-clock path; this alternate entry point mirrors them
+                // to preserve the invariant that the buffer never holds NaN/Inf
+                // components (SDKS-03).
                 if (!double.IsFinite(timestamp)
                     || timestamp - UnityEngine.Time.timeAsDouble > _maxFutureSkewSeconds)
                     return;
-
-                // Reject non-finite transform components before they reach the
-                // buffer or the downstream Lerp/Slerp paths.  AddState enforces
-                // this at line 284; AddStateFromSenderTick is an alternate entry
-                // point that must apply the same guard to preserve the invariant
-                // that the buffer never holds NaN/Inf components (SDKS-03).
                 if (!IsFiniteSnapshot(state))
                     return;
+
+                // Packet accepted — commit the clock-offset EMA and the
+                // high-water tick.  The tick is the authoritative ordering
+                // signal on this path (the inlined buffer push below bypasses
+                // AddState's per-timestamp monotonicity guard), so a duplicate
+                // EMA-rounded timestamp cannot block a later tick-greater state.
+                _clockOffset      = candidateOffset;
+                _hasClockOffset   = true;
+                _latestSenderTick = senderTick;
+                _hasSenderTick    = true;
 
                 // Bound an implausible position jump before the snapshot
                 // enters the buffer — identical displacement gate as the

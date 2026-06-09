@@ -270,7 +270,11 @@ namespace RTMPE.Crypto.Internal
         /// The destination must have at least 16 bytes available from that
         /// offset; bounds are not re-checked inside the hot loop.
         /// </summary>
-        private static void Poly1305MacInto(
+        // internal (not private) so the crypto test project can pin the
+        // key32Offset contract directly via InternalsVisibleTo — the AEAD
+        // callers only ever pass offset 0, so the offset path is otherwise
+        // unexercised.
+        internal static void Poly1305MacInto(
             byte[] msg, int msgOffset, int msgLen,
             byte[] key32, int key32Offset,
             byte[] tag, int tagOffset)
@@ -296,11 +300,14 @@ namespace RTMPE.Crypto.Internal
             uint s3 = r3 * 5;
             uint s4 = r4 * 5;
 
-            // s = key32[16..31] (the one-time pad added at finalisation).
-            uint pad0 = ReadLE32(key32, 16);
-            uint pad1 = ReadLE32(key32, 20);
-            uint pad2 = ReadLE32(key32, 24);
-            uint pad3 = ReadLE32(key32, 28);
+            // s = key32[off+16..off+31] (the one-time pad added at
+            // finalisation), read at the same key32Offset as the r limbs above
+            // so the MAC is correct for callers that point at a sub-range of a
+            // larger buffer (e.g. the leading 32 bytes of a ChaCha20 block).
+            uint pad0 = ReadLE32(key32, key32Offset + 16);
+            uint pad1 = ReadLE32(key32, key32Offset + 20);
+            uint pad2 = ReadLE32(key32, key32Offset + 24);
+            uint pad3 = ReadLE32(key32, key32Offset + 28);
 
             // ── 2. Accumulator h, initialised to zero.
             uint h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0;

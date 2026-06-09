@@ -322,6 +322,15 @@ namespace RTMPE.Editor
                         $"{nm.PacketsOutCounter:N0} pkt   {FormatBytes(nm.BytesOutCounter)}");
                     EditorGUILayout.LabelField("Total In ",
                         $"{nm.PacketsInCounter:N0} pkt   {FormatBytes(nm.BytesInCounter)}");
+
+                    EditorGUILayout.Space(2);
+                    // Saturation / back-pressure: a non-zero drop or ENOBUFS
+                    // count means the producer is outpacing the uplink — the
+                    // signal an integrator must watch under sustained load.
+                    EditorGUILayout.LabelField(
+                        new GUIContent("Send Queue",
+                            "Outbound queue depth · packets dropped at the cap · ENOBUFS events."),
+                        $"{nm.SendQueueCount:N0} queued   {nm.SendQueueDroppedCount:N0} dropped   {nm.EnobufsCount:N0} ENOBUFS");
                 }
             }
             EditorGUILayout.EndFoldoutHeaderGroup();

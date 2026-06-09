@@ -111,6 +111,10 @@ namespace RTMPE.Core
             // per-tick allocation on the 30 Hz flush path.
             _sendVariableUpdateDelegate = SendVariableUpdate;
 
+            // Cache the replay-drain dispatch delegate so the bounded catch-up
+            // drain pumped from Update() does not allocate while it runs.
+            _drainReplayDispatch = SafeDispatchReplayPayload;
+
             // VariableBatchManager owns the per-tick accumulator, scratch buffer,
             // active-cap setting, and cached collector delegate.
             // Initialised here so the SendVariableBatchUpdate / SendVariableUpdate
@@ -230,6 +234,15 @@ namespace RTMPE.Core
                 if (_spawnManager != null)
                     _spawnManager.PruneIfStale(_spawnManager.PendingDespawnNowMillis());
             }
+
+            // Resume the late-join catch-up replay drain. A large pre-loaded
+            // RPC buffer is delivered across a few frames under a wall-clock
+            // budget rather than dispatched all at once, so a peer that filled
+            // the room's buffer cannot freeze a joining client's main thread.
+            // The ordering barrier stays raised until the queues are empty, so
+            // live RPCs keep deferring and the catch-up order is preserved.
+            if (_rpcReplayBuffer.IsReplayInProgress)
+                DrainReplayQueue();
         }
 
         /// <summary>

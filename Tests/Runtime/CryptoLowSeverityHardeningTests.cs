@@ -15,7 +15,7 @@
 //  • L BuildReconnectInit(token, null) throws ArgumentNullException.
 //  • L ChaCha20Poly1305Impl.Open returns null (not throws) on every
 //          failure mode, including wrong-length nonce / key.
-//  • L TryExtractPayload reports the discriminated failure mode.
+//  • L ExtractPayload discriminates malformed frames via the Dropped* counters.
 //
 // Pure C# — runs in Edit Mode Test Runner.
 
@@ -164,56 +164,80 @@ namespace RTMPE.Tests
             Assert.IsNull(result);
         }
 
-        // ── TryExtractPayload reports a discriminated failure mode ─────
+        // ── ExtractPayload discriminates malformed frames via drop counters ──
+        //
+        // The parser returns an empty payload on any malformed frame and routes
+        // the reason to one of three process-wide observability counters.  Each
+        // test snapshots its target counter and asserts a single increment, so
+        // the discrimination is verified independently of test ordering.
 
         [Test]
         [Category("Protocol")]
-        public void TryExtractPayload_TooShort_ReportsTooShort()
+        public void ExtractPayload_TooShort_ReturnsEmpty()
         {
-            var ok = PacketParser.TryExtractPayload(
-                new byte[5], out var payload, out var err);
-            Assert.IsFalse(ok);
-            Assert.AreEqual(PacketParseError.TooShort, err);
+            // Shorter than the 13-byte header — rejected before magic/version
+            // are read, so no discriminating counter is touched.
+            var payload = PacketParser.ExtractPayload(new byte[5]);
             Assert.AreEqual(0, payload.Length);
         }
 
         [Test]
         [Category("Protocol")]
-        public void TryExtractPayload_PayloadLengthOverCap_ReportsBadLength()
+        public void ExtractPayload_HeaderMagicMismatch_CountsHeaderInvalid()
         {
-            // Fabricate a header with payload_len = 0x7FFFFFFF.
-            var pkt = new byte[13];
-            pkt[9]  = 0xFF; pkt[10] = 0xFF; pkt[11] = 0xFF; pkt[12] = 0x7F;
-            var ok = PacketParser.TryExtractPayload(pkt, out _, out var err);
-            Assert.IsFalse(ok);
-            Assert.AreEqual(PacketParseError.BadLength, err);
+            long before = PacketParser.DroppedHeaderInvalidCount;
+            // Full-length header with zeroed magic — non-RTMPE framing.
+            var payload = PacketParser.ExtractPayload(new byte[13]);
+            Assert.AreEqual(0, payload.Length);
+            Assert.AreEqual(before + 1, PacketParser.DroppedHeaderInvalidCount);
         }
 
         [Test]
         [Category("Protocol")]
-        public void TryExtractPayload_BodyTruncated_ReportsTruncated()
+        public void ExtractPayload_PayloadLengthOverCap_CountsOversized()
         {
-            // Header declares 100 bytes but only 13 + 50 are present.
-            var pkt = new byte[13 + 50];
-            pkt[9]  = 100; pkt[10] = 0; pkt[11] = 0; pkt[12] = 0;
-            var ok = PacketParser.TryExtractPayload(pkt, out _, out var err);
-            Assert.IsFalse(ok);
-            Assert.AreEqual(PacketParseError.Truncated, err);
+            long before = PacketParser.DroppedOversizedCount;
+            // Valid header; payload_len = 0x7FFFFFFF exceeds the 1 MiB cap.
+            var pkt = NewRtmpeHeader();
+            pkt[9] = 0xFF; pkt[10] = 0xFF; pkt[11] = 0xFF; pkt[12] = 0x7F;
+            var payload = PacketParser.ExtractPayload(pkt);
+            Assert.AreEqual(0, payload.Length);
+            Assert.AreEqual(before + 1, PacketParser.DroppedOversizedCount);
         }
 
         [Test]
         [Category("Protocol")]
-        public void TryExtractPayload_WellFormed_ReportsOk()
+        public void ExtractPayload_BodyTruncated_CountsTruncated()
         {
-            var pkt = new byte[13 + 4];
-            pkt[9]  = 4; pkt[10] = 0; pkt[11] = 0; pkt[12] = 0;
+            long before = PacketParser.DroppedTruncatedCount;
+            // Valid header declares 100 payload bytes; only 50 are present.
+            var pkt = NewRtmpeHeader(payloadBytes: 50);
+            pkt[9] = 100;
+            var payload = PacketParser.ExtractPayload(pkt);
+            Assert.AreEqual(0, payload.Length);
+            Assert.AreEqual(before + 1, PacketParser.DroppedTruncatedCount);
+        }
+
+        [Test]
+        [Category("Protocol")]
+        public void ExtractPayload_WellFormed_ReturnsPayload()
+        {
+            var pkt = NewRtmpeHeader(payloadBytes: 4);
+            pkt[9]  = 4;
             pkt[13] = 0xDE; pkt[14] = 0xAD; pkt[15] = 0xBE; pkt[16] = 0xEF;
+            var payload = PacketParser.ExtractPayload(pkt);
+            CollectionAssert.AreEqual(new byte[] { 0xDE, 0xAD, 0xBE, 0xEF }, payload);
+        }
 
-            var ok = PacketParser.TryExtractPayload(pkt, out var payload, out var err);
-            Assert.IsTrue(ok);
-            Assert.AreEqual(PacketParseError.Ok, err);
-            CollectionAssert.AreEqual(
-                new byte[] { 0xDE, 0xAD, 0xBE, 0xEF }, payload);
+        // Build a 13-byte RTMPE-v3 header (magic 0x5254 "RT", version 3),
+        // optionally followed by `payloadBytes` zeroed body bytes.
+        private static byte[] NewRtmpeHeader(int payloadBytes = 0)
+        {
+            var pkt = new byte[13 + payloadBytes];
+            pkt[0] = 0x54;  // magic low  byte ('T')
+            pkt[1] = 0x52;  // magic high byte ('R')
+            pkt[2] = 0x03;  // protocol version
+            return pkt;
         }
 
         [Test]

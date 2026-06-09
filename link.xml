@@ -1,0 +1,17 @@
+<!--
+  IL2CPP managed-code stripping preservation for the RTMPE SDK runtime.
+
+  The SDK locates [RtmpeRpc] handlers and [NetworkVariable] members by
+  reflection and invokes them through MethodInfo.Invoke. The stripper cannot
+  prove those members are reachable from a static call site, so on an AOT
+  (iOS / IL2CPP) build it would remove them and the corresponding RPCs and
+  replicated variables would silently stop firing on device. Preserving the
+  runtime assembly keeps that reflective surface intact.
+
+  Game-side [RtmpeRpc] methods and custom NetworkVariable<T> closed types live
+  in the consumer's own assembly and must be preserved there as well — see
+  Documentation~/troubleshooting.md ("IL2CPP").
+-->
+<linker>
+    <assembly fullname="RTMPE.SDK.Runtime" preserve="all" />
+</linker>

@@ -894,8 +894,8 @@ bool IsInRoom                    // true when inside a room
 // Identity & tokens
 ulong  LocalPlayerId             // numeric session ID (valid after SessionAck)
 string LocalPlayerStringId       // room player UUID (valid after JoinRoom/CreateRoom)
-string JwtToken                  // EdDSA (Ed25519) JWT — use with Room Service REST API
-string ReconnectToken            // reconnect token (valid until consumed / cleared)
+RedactedString JwtToken          // EdDSA (Ed25519) JWT; call .Reveal() for the raw bearer (Room Service REST API)
+RedactedString ReconnectToken    // reconnect token; call .Reveal() for the raw value (valid until consumed / cleared)
 bool   CanReconnect              // true when a reconnect token is held
 
 // Last-room snapshot (v1.1)
@@ -1123,6 +1123,7 @@ Disconnected ──────────────────▶ Connectin
 - [ ] `OnDisconnected` handler checks `CanReconnect` before falling back to `Connect(apiKey)`
 - [ ] `autoRejoinLastRoomOnReconnect` matches your UX — disable it to show custom "rejoin?" UI
 - [ ] `enableDebugLogs = false` in the production Settings asset
+- [ ] **iOS / Android (IL2CPP):** an actual on-device build has been run and every `[RtmpeRpc]` fires. RPCs and `NetworkVariable<T>` are dispatched reflectively; the SDK ships a `link.xml` that preserves its own runtime, but your game's RPC methods and any custom `NetworkVariable<T>` types live in your assembly. When the **Managed Stripping Level** is above **Low**, preserve them in a project `link.xml` — see [Troubleshooting → IL2CPP](troubleshooting.md)
 
 ---
 

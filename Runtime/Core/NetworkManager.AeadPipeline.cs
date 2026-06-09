@@ -421,26 +421,9 @@ namespace RTMPE.Core
 
             // Detach the static EnhancedRpcVerifier hooks installed by
             // RecreateRoomAndSpawnManagers so they cannot fire against the
-            // torn-down session (and so the captured registry / session-id
-            // closure is eligible for GC).
-            RTMPE.Rpc.EnhancedRpcVerifier.SelfSessionIdProvider  = null;
-            RTMPE.Rpc.EnhancedRpcVerifier.ObjectExistsVerifier   = null;
-            RTMPE.Rpc.EnhancedRpcVerifier.IsRoomJoined           = null;
-            RTMPE.Rpc.EnhancedRpcVerifier.LocalSessionIdProvider = null;
-            RTMPE.Rpc.EnhancedRpcVerifier.IsRosterMemberSession  = null;
-            // Revert to the static default so a subsequent session that boots
-            // without RecreateRoomAndSpawnManagers (e.g. a unit-test fixture
-            // poking ClearSessionData) inherits the conservative self-only
-            // policy rather than a stale roster-anchored closure.
-            RTMPE.Rpc.EnhancedRpcVerifier.SenderVerifier =
-                RTMPE.Rpc.EnhancedRpcVerifier.DefaultSenderVerifier;
-            // Reset the peer-admission advisory latch so each new session
-            // receives the one-time warning if non-zero peer RPCs are admitted
-            // without a session-id-keyed roster anchor.  Without this reset,
-            // the static latch would suppress the advisory for every session
-            // after the first, silently hiding the architectural limitation
-            // from developers who did not capture the very first warning log.
-            System.Threading.Interlocked.Exchange(ref _peerAdmissionAdvisoryEmitted, 0);
+            // torn-down session and the captured registry / session-id closures
+            // become GC-eligible.  Shared with the Cleanup() teardown path.
+            DetachRpcVerifierHooks();
             _handshakeHandler?.Dispose();  // Zero key material before GC can observe it
             _handshakeHandler = null;
             // Drop the negotiated capability bitmask alongside the rest of
@@ -458,16 +441,18 @@ namespace RTMPE.Core
             // observe it), then collapses the remaining state in lockstep.
             _sessionKeyStore.ResetAllForSession();
 
-            // Drain pending payloads on session boundary so reconnect does
-            // not flush stale data into the new session's sequence/nonce
-            // stream.  _pendingLiveRpcs may hold up to MaxPendingLiveRpcs-
-            // DuringReplay (4096) Enhanced RPC byte[] from the previous room;
-            // _batchPending may hold queued variable-update payloads built
-            // against the previous PacketBuilder counter.  Either set,
-            // dispatched after reconnect, would either re-apply stale state
-            // or violate the gateway's monotonic sequence/nonce contract.
-            // RpcReplayBuffer.Clear drops the pending queue, resets the byte
-            // counter, and clears the CAS guard so the new session starts idle.
+            // Drop queued catch-up payloads on the session boundary so
+            // reconnect does not flush stale data into the new session's
+            // sequence/nonce stream.  The replay buffer may hold historical
+            // (buffered) Enhanced RPCs decoded from the previous room's replay
+            // frame plus up to MaxPendingLiveRpcsDuringReplay (4096) deferred
+            // live RPC byte[]; _batchPending may hold queued variable-update
+            // payloads built against the previous PacketBuilder counter.
+            // Either set, dispatched after reconnect, would either re-apply
+            // stale state or violate the gateway's monotonic sequence/nonce
+            // contract.  RpcReplayBuffer.Clear drops both queues, resets the
+            // byte counter, and lowers the ordering barrier so the new session
+            // starts idle.
             _rpcReplayBuffer.Clear();
 
             // Drain the static RequestIdAllocator pending map at session

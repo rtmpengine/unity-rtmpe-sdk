@@ -661,6 +661,23 @@ namespace RTMPE.Core
         internal void TrackVariable(NetworkVariableBase variable)
         {
             if (variable == null) throw new ArgumentNullException(nameof(variable));
+
+            // VariableId must be unique within a behaviour: the inbound update
+            // path dispatches to the first match by id, so a duplicate would
+            // leave every later variable permanently unreplicated.  Surface the
+            // clash at registration (OnNetworkSpawn) instead of letting it
+            // manifest as silent desync — mirroring the RpcRegistry method-id
+            // collision guard.
+            for (int i = 0; i < _trackedVariables.Count; i++)
+            {
+                if (_trackedVariables[i].VariableId == variable.VariableId)
+                    throw new InvalidOperationException(
+                        $"[RTMPE] {GetType().Name}: two NetworkVariables share " +
+                        $"VariableId {variable.VariableId}.  Give each NetworkVariable " +
+                        "on a behaviour a unique id — inbound updates dispatch by id and " +
+                        "would otherwise reach only the first.");
+            }
+
             _trackedVariables.Add(variable);
 
             // Apply [NetworkVariable(SendRateHz = …)] declaratively, matching

@@ -121,12 +121,16 @@ ulong LocalPlayerId { get; }
 // receives a successful Create/Join response. Used by NetworkBehaviour.IsOwner.
 string LocalPlayerStringId { get; }
 
-// EdDSA (Ed25519) JWT bearer token issued at SessionAck. Use with Room Service REST API.
-string JwtToken { get; }
+// EdDSA (Ed25519) JWT bearer token issued at SessionAck. Use with the Room
+// Service REST API. Returned as an opaque RedactedString so a stray log line
+// cannot leak it — call .Reveal() at the point of use to get the raw string,
+// or .IsEmpty to test for presence without revealing.
+RedactedString JwtToken { get; }
 
-// Reconnect token issued at SessionAck. Non-null whenever a token is held and
-// not yet consumed.
-string ReconnectToken { get; }
+// Reconnect token issued at SessionAck. Non-empty whenever a token is held and
+// not yet consumed. Same RedactedString wrapper as JwtToken — call .Reveal()
+// for the raw value.
+RedactedString ReconnectToken { get; }
 
 // True when the SDK holds a valid reconnect token.
 bool CanReconnect { get; }

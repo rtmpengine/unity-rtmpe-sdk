@@ -143,13 +143,14 @@ namespace RTMPE.Tests
         public void Dispose_DiscardsPendingSends()
         {
             var transport = new CountingTransport();
-            var thread    = new NetworkThread(transport, maxOutboundQueueSize: 8);
+            var thread    = new NetworkThread(transport, sendQueueMaxItems: 8);
             thread.Start();
             // Stop first so Send below can't drain through the live loop.
             thread.Stop();
-            // Send after Stop must be rejected ( fast-path).
-            Assert.IsFalse(thread.Send(new byte[] { 0x01 }),
-                "Send after Stop must return false");
+            // Send after Stop is rejected by the entry guard, so nothing is enqueued.
+            thread.Send(new byte[] { 0x01 });
+            Assert.AreEqual(0, thread.SendQueueCount,
+                "Send after Stop must not enqueue");
             // Dispose must not throw and must release the queue cleanly.
             Assert.DoesNotThrow(() => thread.Dispose());
         }
@@ -161,19 +162,19 @@ namespace RTMPE.Tests
         public void Send_AfterStop_NotTransmittedOnNextStart()
         {
             var transport = new CountingTransport();
-            using var thread = new NetworkThread(transport, maxOutboundQueueSize: 16);
+            using var thread = new NetworkThread(transport, sendQueueMaxItems: 16);
 
             thread.Start();
             Assert.IsTrue(SpinWait.SpinUntil(() => thread.IsRunning, 2_000),
                 "thread must be running before Stop");
             thread.Stop();
 
-            // Producer racing with Stop: must be rejected.
+            // Producer racing with Stop: the entry guard rejects each send, so
+            // none are enqueued for a future drain.
             for (int i = 0; i < 10; i++)
-            {
-                Assert.IsFalse(thread.Send(new byte[] { (byte)i }),
-                    "Send after Stop must return false");
-            }
+                thread.Send(new byte[] { (byte)i });
+            Assert.AreEqual(0, thread.SendQueueCount,
+                "post-Stop sends must not enqueue");
 
             int sentBeforeRestart = transport.SendCount;
 
@@ -199,23 +200,18 @@ namespace RTMPE.Tests
         {
             // Use a transport that BLOCKS in Send so the queue cannot drain.
             var blocking = new BlockingTransport();
-            using var thread = new NetworkThread(blocking, maxOutboundQueueSize: 4);
+            using var thread = new NetworkThread(blocking, sendQueueMaxItems: 4);
             thread.Start();
 
-            // First packet enters Send and parks; the rest fill the queue.
-            // 1 in-flight + 4 queued = 5 accepted. Subsequent sends drop.
-            int accepted = 0;
-            int rejected = 0;
+            // The worker parks in the blocked transport on the first packet; the
+            // queue then fills to its cap and every further send is dropped
+            // (drop-newest). Send is fire-and-forget, so saturation is observed
+            // through the drop counter rather than a return value.
             for (int i = 0; i < 32; i++)
-            {
-                if (thread.Send(new byte[] { (byte)i })) accepted++;
-                else rejected++;
-            }
+                thread.Send(new byte[] { (byte)i });
 
-            Assert.GreaterOrEqual(rejected, 20,
-                "With queue size 4 and a blocked sender, most of 32 sends must be dropped");
-            Assert.GreaterOrEqual(thread.DroppedSendCount, rejected,
-                "Drop counter must reflect every rejected send");
+            Assert.GreaterOrEqual(thread.SendQueueDroppedCount, 20L,
+                "With queue size 4 and a blocked sender, most of 32 sends must be dropped and counted");
 
             blocking.Release();
             thread.Stop();

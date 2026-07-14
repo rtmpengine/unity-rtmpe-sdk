@@ -1,0 +1,9 @@
+# Drop-folder for the compiled RTMPE Roslyn analyzer DLLs
+# (RTMPE.SDK.Analyzers.dll + its RTMPE.SDK.Conversion.Core.dll dependency).
+#
+# Populated at package time by scripts/package-analyzers.sh. The folder name
+# carries a trailing '~' so the Unity asset pipeline ignores it (matching
+# Samples~/ and Documentation~/), keeping the committed tree free of any
+# unverified .meta. The final non-tilde, RoslynAnalyzer-labelled placement is
+# resolved by the human-gated Unity load spike recorded in
+# ../../Tooling/COMPILER_COMPATIBILITY.md.

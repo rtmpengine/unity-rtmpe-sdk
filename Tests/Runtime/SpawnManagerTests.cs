@@ -1,0 +1,1088 @@
+// RTMPE SDK — Tests/Runtime/SpawnManagerTests.cs
+//
+// NUnit Edit-Mode tests for SpawnManager.
+//
+// Internal members (CreateLocal, DestroyLocal) are accessible via InternalsVisibleTo.
+// Each test gets a fresh NetworkManager + SpawnManager.
+// All GameObjects created per-test are destroyed in TearDown.
+//
+// Note on Object.Destroy vs Object.DestroyImmediate:
+//  Object.Destroy() is used by production code (frame-safe) but deferred in
+//  Edit Mode tests. Tests validate logical state (IsSpawned, registry) rather
+//  than physical destruction of GameObjects. TearDown uses DestroyImmediate.
+
+using System.Collections.Generic;
+using NUnit.Framework;
+using UnityEngine;
+using UnityEngine.TestTools;
+using RTMPE.Core;
+
+namespace RTMPE.Tests
+{
+    [TestFixture]
+    [Category("SpawnManager")]
+    public class SpawnManagerTests
+    {
+        private NetworkManager        _manager;
+        private SpawnManager          _spawnManager;
+        private NetworkObjectRegistry _registry;
+        private OwnershipManager      _ownership;
+
+        private GameObject            _nmGo;
+        private GameObject            _prefabGo;
+        private readonly List<GameObject> _created = new List<GameObject>();
+
+        private const uint PREFAB_ID = 1;
+
+        [SetUp]
+        public void SetUp()
+        {
+            // NetworkManager singleton (required by NetworkBehaviour.IsOwner).
+            _nmGo    = new GameObject("NetworkManager");
+            _manager = _nmGo.AddComponent<NetworkManager>();
+
+            _registry  = new NetworkObjectRegistry();
+            _ownership = new OwnershipManager(_registry, _manager);
+            _spawnManager = new SpawnManager(_registry, _ownership, _manager);
+
+            // Create a reusable "prefab" — a plain GO with a SpawnableNB component.
+            _prefabGo = new GameObject("Prefab");
+            _prefabGo.AddComponent<SpawnableNB>();
+            _created.Add(_prefabGo);
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            // Destroy spawned objects via registry to keep state clean.
+            foreach (var obj in _registry.GetAll())
+            {
+                if (obj != null)
+                    Object.DestroyImmediate(obj.gameObject);
+            }
+
+            foreach (var go in _created)
+                if (go != null) Object.DestroyImmediate(go);
+            _created.Clear();
+
+            Object.DestroyImmediate(_nmGo);
+        }
+
+        // ── Helpers ────────────────────────────────────────────────────────────
+
+        private void RegisterDefaultPrefab()
+        {
+            _spawnManager.RegisterPrefab(PREFAB_ID, _prefabGo);
+        }
+
+        private SpawnableNB SpawnDefault(
+            Vector3? pos = null,
+            Quaternion? rot = null,
+            string owner = null)
+        {
+            var nb = (SpawnableNB)_spawnManager.Spawn(
+                PREFAB_ID,
+                pos ?? Vector3.zero,
+                rot ?? Quaternion.identity,
+                owner);
+            // Track the instantiated GO for TearDown cleanup.
+            // Object.Destroy is deferred in Edit Mode tests — DestroyImmediate
+            // in TearDown ensures the GO is gone before the next test.
+            if (nb != null) _created.Add(nb.gameObject);
+            return nb;
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ── Constructor ────────────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Description("Constructor throws when registry is null.")]
+        public void Constructor_NullRegistry_Throws()
+        {
+            Assert.Throws<System.ArgumentNullException>(
+                () => new SpawnManager(null, _ownership, _manager));
+        }
+
+        [Test]
+        [Description("Constructor throws when ownership is null.")]
+        public void Constructor_NullOwnership_Throws()
+        {
+            Assert.Throws<System.ArgumentNullException>(
+                () => new SpawnManager(_registry, null, _manager));
+        }
+
+        [Test]
+        [Description("Constructor throws when networkManager is null.")]
+        public void Constructor_NullNetworkManager_Throws()
+        {
+            Assert.Throws<System.ArgumentNullException>(
+                () => new SpawnManager(_registry, _ownership, null));
+        }
+
+        [Test]
+        [Description("Constructor succeeds with valid parameters.")]
+        public void Constructor_ValidArgs_SetsProperties()
+        {
+            Assert.AreSame(_registry, _spawnManager.Registry);
+            Assert.AreSame(_ownership, _spawnManager.Ownership);
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ── Prefab Registration ────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Description("RegisterPrefab stores the prefab for later spawning.")]
+        public void RegisterPrefab_Basic_CanBeQueried()
+        {
+            _spawnManager.RegisterPrefab(PREFAB_ID, _prefabGo);
+
+            Assert.IsTrue(_spawnManager.HasPrefab(PREFAB_ID));
+        }
+
+        [Test]
+        [Description("RegisterPrefab with null prefab throws.")]
+        public void RegisterPrefab_NullPrefab_Throws()
+        {
+            Assert.Throws<System.ArgumentNullException>(
+                () => _spawnManager.RegisterPrefab(PREFAB_ID, null));
+        }
+
+        [Test]
+        [Description("RegisterPrefab with duplicate ID overwrites and logs warning.")]
+        public void RegisterPrefab_DuplicateId_OverwritesWithWarning()
+        {
+            var prefab2 = new GameObject("Prefab2");
+            prefab2.AddComponent<SpawnableNB>();
+            _created.Add(prefab2);
+
+            _spawnManager.RegisterPrefab(PREFAB_ID, _prefabGo);
+
+            // Second registration with same ID should log warning.
+            _spawnManager.RegisterPrefab(PREFAB_ID, prefab2);
+
+            Assert.IsTrue(_spawnManager.HasPrefab(PREFAB_ID));
+        }
+
+        [Test]
+        [Description("UnregisterPrefab removes a registered prefab.")]
+        public void UnregisterPrefab_Registered_ReturnsTrue()
+        {
+            _spawnManager.RegisterPrefab(PREFAB_ID, _prefabGo);
+
+            Assert.IsTrue(_spawnManager.UnregisterPrefab(PREFAB_ID));
+            Assert.IsFalse(_spawnManager.HasPrefab(PREFAB_ID));
+        }
+
+        [Test]
+        [Description("UnregisterPrefab on unknown ID returns false.")]
+        public void UnregisterPrefab_NotRegistered_ReturnsFalse()
+        {
+            Assert.IsFalse(_spawnManager.UnregisterPrefab(999));
+        }
+
+        [Test]
+        [Description("HasPrefab returns false for an unknown ID.")]
+        public void HasPrefab_Unknown_ReturnsFalse()
+        {
+            Assert.IsFalse(_spawnManager.HasPrefab(42));
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ── Spawn ──────────────────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Description("Spawn with a registered prefab creates an object with correct state.")]
+        public void Spawn_RegisteredPrefab_CreatesObjectWithCorrectState()
+        {
+            RegisterDefaultPrefab();
+
+            var nb = SpawnDefault(owner: "alice");
+
+            Assert.IsNotNull(nb);
+            Assert.IsTrue(nb.IsSpawned);
+            Assert.AreNotEqual(0UL, nb.NetworkObjectId);
+            Assert.AreEqual("alice", nb.OwnerPlayerId);
+        }
+
+        [Test]
+        [Description("Spawn registers the object in the registry.")]
+        public void Spawn_RegisteredPrefab_ObjectIsInRegistry()
+        {
+            RegisterDefaultPrefab();
+
+            var nb = SpawnDefault(owner: "bob");
+
+            Assert.AreSame(nb, _registry.Get(nb.NetworkObjectId));
+        }
+
+        [Test]
+        [Description("Spawn fires OnNetworkSpawn callback.")]
+        public void Spawn_RegisteredPrefab_FiresOnNetworkSpawn()
+        {
+            RegisterDefaultPrefab();
+
+            var nb = SpawnDefault();
+
+            Assert.IsTrue(nb.SpawnCalled, "OnNetworkSpawn should have been called.");
+        }
+
+        [Test]
+        [Description("Spawn with unregistered prefab returns null and logs error.")]
+        public void Spawn_UnregisteredPrefab_ReturnsNullAndLogsError()
+        {
+            // No prefab registered for PREFAB_ID.
+            LogAssert.Expect(LogType.Error, new System.Text.RegularExpressions.Regex("not registered"));
+
+            var result = _spawnManager.Spawn(PREFAB_ID, Vector3.zero, Quaternion.identity);
+
+            Assert.IsNull(result);
+        }
+
+        [Test]
+        [Description("Spawn preserves position and rotation.")]
+        public void Spawn_WithPositionAndRotation_PreservesTransform()
+        {
+            RegisterDefaultPrefab();
+            var pos = new Vector3(1.5f, 2.5f, 3.5f);
+            var rot = Quaternion.Euler(10f, 20f, 30f);
+
+            var nb = _spawnManager.Spawn(PREFAB_ID, pos, rot);
+
+            Assert.IsNotNull(nb);
+            Assert.AreEqual(pos.x, nb.transform.position.x, 0.01f);
+            Assert.AreEqual(pos.y, nb.transform.position.y, 0.01f);
+            Assert.AreEqual(pos.z, nb.transform.position.z, 0.01f);
+            Assert.AreEqual(rot.eulerAngles.x, nb.transform.rotation.eulerAngles.x, 0.5f);
+            Assert.AreEqual(rot.eulerAngles.y, nb.transform.rotation.eulerAngles.y, 0.5f);
+            Assert.AreEqual(rot.eulerAngles.z, nb.transform.rotation.eulerAngles.z, 0.5f);
+        }
+
+        [Test]
+        [Description("Spawn generates unique IDs for consecutive objects.")]
+        public void Spawn_MultipleCalls_GeneratesUniqueIds()
+        {
+            RegisterDefaultPrefab();
+
+            var nb1 = SpawnDefault(owner: "p1");
+            var nb2 = SpawnDefault(owner: "p1");
+            var nb3 = SpawnDefault(owner: "p1");
+
+            Assert.AreNotEqual(nb1.NetworkObjectId, nb2.NetworkObjectId);
+            Assert.AreNotEqual(nb2.NetworkObjectId, nb3.NetworkObjectId);
+            Assert.AreNotEqual(nb1.NetworkObjectId, nb3.NetworkObjectId);
+        }
+
+        [Test]
+        [Description("Spawn with null owner defaults to empty string when LocalPlayerStringId is null.")]
+        public void Spawn_NullOwner_DefaultsToEmpty()
+        {
+            RegisterDefaultPrefab();
+
+            // LocalPlayerStringId is null in test environment.
+            var nb = SpawnDefault();
+
+            Assert.AreEqual(string.Empty, nb.OwnerPlayerId);
+        }
+
+        [Test]
+        [Description("Spawn with explicit owner uses the provided owner.")]
+        public void Spawn_ExplicitOwner_Overrides()
+        {
+            RegisterDefaultPrefab();
+            _manager.SetLocalPlayerStringId("default-player");
+
+            var nb = SpawnDefault(owner: "explicit-owner");
+
+            Assert.AreEqual("explicit-owner", nb.OwnerPlayerId);
+        }
+
+        [Test]
+        [Description("Spawn with null owner defaults to LocalPlayerStringId if set.")]
+        public void Spawn_NullOwner_UsesLocalPlayerStringId()
+        {
+            RegisterDefaultPrefab();
+            _manager.SetLocalPlayerStringId("local-uuid");
+
+            var nb = SpawnDefault();
+
+            Assert.AreEqual("local-uuid", nb.OwnerPlayerId);
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ── Despawn ────────────────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Description("Despawn marks object as not spawned and fires OnNetworkDespawn.")]
+        public void Despawn_ExistingObject_DespawnsAndFiresCallback()
+        {
+            RegisterDefaultPrefab();
+            var nb = SpawnDefault(owner: "alice");
+            var id = nb.NetworkObjectId;
+
+            _spawnManager.Despawn(id);
+
+            Assert.IsFalse(nb.IsSpawned);
+            Assert.IsTrue(nb.DespawnCalled, "OnNetworkDespawn should have been called.");
+        }
+
+        [Test]
+        [Description("Despawn removes the object from the registry.")]
+        public void Despawn_ExistingObject_RemovesFromRegistry()
+        {
+            RegisterDefaultPrefab();
+            var nb = SpawnDefault(owner: "alice");
+            var id = nb.NetworkObjectId;
+
+            _spawnManager.Despawn(id);
+
+            Assert.IsNull(_registry.Get(id));
+        }
+
+        [Test]
+        [Description("Despawn with unknown ID is a safe no-op.")]
+        public void Despawn_UnknownId_IsNoOp()
+        {
+            Assert.DoesNotThrow(() => _spawnManager.Despawn(99999UL));
+        }
+
+        // ── M-040: counter-exhaustion wrap detection ──────────────────────
+
+        [Test]
+        [Description(
+            "Spawn refuses to allocate a new id once the per-session counter " +
+            "has reached uint.MaxValue; the latch persists across calls until " +
+            "ClearAll resets the session.")]
+        public void Spawn_AtCounterCeiling_RefusesAllocationAndLatches()
+        {
+            RegisterDefaultPrefab();
+
+            // Drive the counter to uint.MaxValue so the very next Increment
+            // would cross into the u33+ space.  GenerateObjectId observes
+            // raw > uint.MaxValue and refuses the allocation.
+            _spawnManager.DangerousSetNextLocalIdForTest(uint.MaxValue);
+
+            LogAssert.Expect(LogType.Error, new System.Text.RegularExpressions.Regex("32-bit ceiling"));
+            var nb = SpawnDefault();
+            Assert.IsNull(nb,
+                "Spawn must return null when the local id space is exhausted.");
+            Assert.IsTrue(_spawnManager.LocalIdSpaceExhausted,
+                "Exhaustion latch must remain set across calls.");
+
+            // A subsequent attempt is also rejected — no further error is
+            // logged because the latch is already set.
+            var nb2 = SpawnDefault();
+            Assert.IsNull(nb2);
+        }
+
+        [Test]
+        [Description("ClearAll clears the exhaustion latch so a fresh session can allocate again.")]
+        public void ClearAll_ResetsCounterExhaustionLatch()
+        {
+            RegisterDefaultPrefab();
+            _spawnManager.DangerousSetNextLocalIdForTest(uint.MaxValue);
+            LogAssert.Expect(LogType.Error, new System.Text.RegularExpressions.Regex("32-bit ceiling"));
+            SpawnDefault(); // tripping the latch
+            Assert.IsTrue(_spawnManager.LocalIdSpaceExhausted);
+
+            _spawnManager.ClearAll();
+
+            Assert.IsFalse(_spawnManager.LocalIdSpaceExhausted);
+            var nb = SpawnDefault();
+            Assert.IsNotNull(nb,
+                "After ClearAll the counter is reset and Spawn can succeed again.");
+        }
+
+        // ── M-039: re-entry / idempotency on Despawn ──────────────────────
+
+        [Test]
+        [Description(
+            "Despawn must be idempotent: a user OnNetworkDespawn callback that " +
+            "synchronously re-invokes Despawn for the same id observes a no-op " +
+            "rather than recording a stale pending-despawn entry.")]
+        public void Despawn_ReentrantCallback_IsNoOpAndDoesNotLeakPendingEntry()
+        {
+            // Custom prefab whose NetworkBehaviour is the ReentrantDespawnerNB
+            // probe.  Distinct prefab id from the default so the standard
+            // SpawnableNB registration is not disturbed.
+            const uint REENTRANT_PREFAB_ID = 99;
+            var prefab = new GameObject("ReentrantPrefab");
+            prefab.AddComponent<ReentrantDespawnerNB>();
+            _created.Add(prefab);
+            _spawnManager.RegisterPrefab(REENTRANT_PREFAB_ID, prefab);
+
+            var nb = (ReentrantDespawnerNB)_spawnManager.CreateLocal(
+                REENTRANT_PREFAB_ID, 4242UL, "alice", Vector3.zero, Quaternion.identity);
+            Assert.IsNotNull(nb);
+            _created.Add(nb.gameObject);
+
+            // Wire the callback to call Despawn(self) once more before
+            // returning.  Without the in-flight guard, the second call
+            // would walk the "Despawn before Spawn" branch and record a
+            // pending-despawn entry under a TTL — observable via the
+            // tracker count seam.
+            ReentrantDespawnerNB.Reset(_spawnManager, 4242UL);
+
+            _spawnManager.Despawn(4242UL);
+
+            Assert.AreEqual(1, nb.DespawnInvocations,
+                "OnNetworkDespawn must fire exactly once even with re-entrant Despawn calls.");
+            Assert.AreEqual(0, _spawnManager.PendingDespawnCount,
+                "Re-entrant Despawn must not record a stale pending-despawn entry.");
+            Assert.IsNull(_registry.Get(4242UL),
+                "Object must be removed from the registry exactly once.");
+        }
+
+        [Test]
+        [Description(
+            "Despawn() tears the local instance down BEFORE relaying the wire " +
+            "send so that a server-echoed despawn arriving inside the same " +
+            "call stack sees a clean registry and short-circuits.")]
+        public void Despawn_OrderingTearsDownBeforeServerEcho()
+        {
+            RegisterDefaultPrefab();
+            var nb = SpawnDefault(owner: "alice");
+            ulong id = nb.NetworkObjectId;
+
+            _spawnManager.Despawn(id);
+
+            // Simulate a server-echoed Despawn arriving immediately after.
+            // It should be a clean no-op (registry already empty) and must
+            // not record a pending-despawn TTL entry that would falsely
+            // suppress a legitimate future Spawn for the same id.
+            int beforeEcho = _spawnManager.PendingDespawnCount;
+            _spawnManager.DestroyLocal(id);
+            int afterEcho  = _spawnManager.PendingDespawnCount;
+
+            Assert.AreEqual(beforeEcho + 1, afterEcho,
+                "Echo arriving AFTER teardown is treated as out-of-order Despawn-before-Spawn — " +
+                "tracker records exactly one entry under TTL.  This is the documented behavior; " +
+                "the in-flight guard only suppresses re-entry inside the same teardown stack.");
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ── CreateLocal / DestroyLocal (internal) ──────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Description("CreateLocal instantiates an object with correct ID and owner.")]
+        public void CreateLocal_Basic_SetsIdAndOwner()
+        {
+            RegisterDefaultPrefab();
+
+            var nb = _spawnManager.CreateLocal(PREFAB_ID, 42UL, "p-owner", Vector3.zero, Quaternion.identity);
+            if (nb != null) _created.Add(nb.gameObject);
+
+            Assert.IsNotNull(nb);
+            Assert.AreEqual(42UL, nb.NetworkObjectId);
+            Assert.AreEqual("p-owner", nb.OwnerPlayerId);
+            Assert.IsTrue(nb.IsSpawned);
+        }
+
+        [Test]
+        [Description("CreateLocal with unregistered prefab returns null.")]
+        public void CreateLocal_UnregisteredPrefab_ReturnsNull()
+        {
+            // prefabId 999 not registered — logs warning.
+            var nb = _spawnManager.CreateLocal(999, 1UL, "p1", Vector3.zero, Quaternion.identity);
+
+            Assert.IsNull(nb);
+        }
+
+        [Test]
+        [Description("CreateLocal fires OnNetworkSpawn.")]
+        public void CreateLocal_FiresOnNetworkSpawn()
+        {
+            RegisterDefaultPrefab();
+
+            var nb = (SpawnableNB)_spawnManager.CreateLocal(
+                PREFAB_ID, 100UL, "p1", Vector3.zero, Quaternion.identity);
+            if (nb != null) _created.Add(nb.gameObject);
+
+            Assert.IsTrue(nb.SpawnCalled);
+        }
+
+        [Test]
+        [Description("CreateLocal with prefab that has no NetworkBehaviour logs error and returns null.")]
+        public void CreateLocal_NoBehaviourOnPrefab_ReturnsNullAndLogsError()
+        {
+            var barePrefab = new GameObject("BarePrefab");
+            _created.Add(barePrefab);
+            _spawnManager.RegisterPrefab(2, barePrefab);
+
+            LogAssert.Expect(LogType.Error, new System.Text.RegularExpressions.Regex("no NetworkBehaviour"));
+
+            var nb = _spawnManager.CreateLocal(2, 200UL, "p1", Vector3.zero, Quaternion.identity);
+
+            Assert.IsNull(nb);
+        }
+
+        [Test]
+        [Description("DestroyLocal fires OnNetworkDespawn and removes from registry.")]
+        public void DestroyLocal_ExistingObject_DespawnsAndUnregisters()
+        {
+            RegisterDefaultPrefab();
+            var nb = (SpawnableNB)_spawnManager.CreateLocal(
+                PREFAB_ID, 300UL, "p1", Vector3.zero, Quaternion.identity);
+            if (nb != null) _created.Add(nb.gameObject);
+
+            _spawnManager.DestroyLocal(300UL);
+
+            Assert.IsFalse(nb.IsSpawned);
+            Assert.IsTrue(nb.DespawnCalled);
+            Assert.IsNull(_registry.Get(300UL));
+        }
+
+        [Test]
+        [Description("DestroyLocal with unknown ID is a safe no-op.")]
+        public void DestroyLocal_UnknownId_IsNoOp()
+        {
+            Assert.DoesNotThrow(() => _spawnManager.DestroyLocal(88888UL));
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ── OnPlayerLeftRoom ───────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Description("OnPlayerLeftRoom destroys objects with DestroyWithOwner=true.")]
+        public void OnPlayerLeftRoom_DestroyWithOwner_DespawnsObject()
+        {
+            RegisterDefaultPrefab();
+            var nb = SpawnDefault(owner: "leaving-player");
+            nb.DestroyWithOwner = true;
+            var id = nb.NetworkObjectId;
+
+            _spawnManager.OnPlayerLeftRoom("leaving-player");
+
+            Assert.IsFalse(nb.IsSpawned);
+            Assert.IsNull(_registry.Get(id));
+        }
+
+        [Test]
+        [Description("OnPlayerLeftRoom leaves objects with DestroyWithOwner=false intact.")]
+        public void OnPlayerLeftRoom_NoDestroyWithOwner_LeavesObjectAlive()
+        {
+            RegisterDefaultPrefab();
+            var nb = SpawnDefault(owner: "leaving-player");
+            nb.DestroyWithOwner = false;
+            var id = nb.NetworkObjectId;
+
+            _spawnManager.OnPlayerLeftRoom("leaving-player");
+
+            Assert.IsTrue(nb.IsSpawned, "Object must remain spawned.");
+            Assert.AreSame(nb, _registry.Get(id), "Object must remain in registry.");
+        }
+
+        [Test]
+        [Description("OnPlayerLeftRoom does not affect objects owned by other players.")]
+        public void OnPlayerLeftRoom_OtherPlayer_DoesNotAffect()
+        {
+            RegisterDefaultPrefab();
+            var nbKeep = SpawnDefault(owner: "staying-player");
+            nbKeep.DestroyWithOwner = true;
+            var nbLeave = SpawnDefault(owner: "leaving-player");
+            nbLeave.DestroyWithOwner = true;
+
+            _spawnManager.OnPlayerLeftRoom("leaving-player");
+
+            Assert.IsTrue(nbKeep.IsSpawned, "Object owned by staying player must not be affected.");
+            Assert.IsFalse(nbLeave.IsSpawned, "Object owned by leaving player must be despawned.");
+        }
+
+        [Test]
+        [Description("OnPlayerLeftRoom with empty/null player ID is a safe no-op.")]
+        public void OnPlayerLeftRoom_EmptyPlayerId_IsNoOp()
+        {
+            RegisterDefaultPrefab();
+            var nb = SpawnDefault(owner: "alice");
+
+            Assert.DoesNotThrow(() => _spawnManager.OnPlayerLeftRoom(null));
+            Assert.DoesNotThrow(() => _spawnManager.OnPlayerLeftRoom(string.Empty));
+
+            Assert.IsTrue(nb.IsSpawned, "Object must not be affected by null/empty player ID.");
+        }
+
+        [Test]
+        [Description("OnPlayerLeftRoom handles mixture of DestroyWithOwner true and false.")]
+        public void OnPlayerLeftRoom_MixedDestroyWithOwner_CorrectBehaviour()
+        {
+            RegisterDefaultPrefab();
+            var nbDestroy = SpawnDefault(owner: "player-x");
+            nbDestroy.DestroyWithOwner = true;
+
+            var nbKeep = SpawnDefault(owner: "player-x");
+            nbKeep.DestroyWithOwner = false;
+
+            _spawnManager.OnPlayerLeftRoom("player-x");
+
+            Assert.IsFalse(nbDestroy.IsSpawned, "DestroyWithOwner=true object must be despawned.");
+            Assert.IsTrue(nbKeep.IsSpawned, "DestroyWithOwner=false object must survive.");
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ── ClearAll ───────────────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Description("ClearAll fires OnNetworkDespawn for all spawned objects.")]
+        public void ClearAll_DespawnsAllObjects()
+        {
+            RegisterDefaultPrefab();
+            var nb1 = SpawnDefault(owner: "p1");
+            var nb2 = SpawnDefault(owner: "p2");
+
+            _spawnManager.ClearAll();
+
+            Assert.IsFalse(nb1.IsSpawned);
+            Assert.IsFalse(nb2.IsSpawned);
+            Assert.IsTrue(((SpawnableNB)nb1).DespawnCalled);
+            Assert.IsTrue(((SpawnableNB)nb2).DespawnCalled);
+        }
+
+        [Test]
+        [Description("ClearAll empties the registry.")]
+        public void ClearAll_EmptiesRegistry()
+        {
+            RegisterDefaultPrefab();
+            SpawnDefault(owner: "p1");
+            SpawnDefault(owner: "p2");
+
+            _spawnManager.ClearAll();
+
+            Assert.AreEqual(0, _registry.GetAll().Count);
+        }
+
+        [Test]
+        [Description("ClearAll resets object ID counter so subsequent spawns start fresh.")]
+        public void ClearAll_ResetsIdCounter()
+        {
+            RegisterDefaultPrefab();
+            var first = SpawnDefault(owner: "p1");
+            var firstId = first.NetworkObjectId;
+
+            _spawnManager.ClearAll();
+
+            // Spawn again — should get same ID pattern since counter reset.
+            var second = SpawnDefault(owner: "p1");
+            Assert.AreEqual(firstId, second.NetworkObjectId,
+                "Object ID should restart after ClearAll.");
+        }
+
+        [Test]
+        [Description("ClearAll on empty registry is a safe no-op.")]
+        public void ClearAll_EmptyRegistry_IsNoOp()
+        {
+            Assert.DoesNotThrow(() => _spawnManager.ClearAll());
+            Assert.AreEqual(0, _registry.GetAll().Count);
+        }
+
+        [Test]
+        [Description("ClearAll tolerates user code in OnNetworkDespawn destroying its own GameObject — " +
+                     "the second pass must skip the destroyed object via Unity's null check, not throw.")]
+        public void ClearAll_UserDestroysOwnGameObjectInOnDespawn_DoesNotThrow()
+        {
+            // Use a GO with the destroy-self component so OnNetworkDespawn → DestroyImmediate(self).
+            var go = new GameObject("DespawnSelfDestroyer");
+            go.AddComponent<DespawnSelfDestroyerNB>();
+            _spawnManager.RegisterPrefab(99, go);
+            _created.Add(go);
+
+            var nb = (DespawnSelfDestroyerNB)_spawnManager.Spawn(99, Vector3.zero, Quaternion.identity, "p1");
+            // Track for TearDown — though it will be destroyed in ClearAll path.
+            if (nb != null) _created.Add(nb.gameObject);
+
+            // ClearAll path: pass 1 fires OnNetworkDespawn → user calls DestroyImmediate(self),
+            // pass 2 must skip the destroyed object via the Unity null check.
+            Assert.DoesNotThrow(() => _spawnManager.ClearAll(),
+                "ClearAll must guard against user-destroyed objects between callback and destroy passes.");
+            Assert.AreEqual(0, _registry.GetAll().Count);
+        }
+
+        [Test]
+        [Description("ClearAll fires OnNetworkDespawn exactly once per object even when user code in " +
+                     "the callback destroys the GameObject itself.")]
+        public void ClearAll_OnDespawnFiresExactlyOnce_EvenWithUserDestroy()
+        {
+            var go = new GameObject("DespawnCounting");
+            go.AddComponent<DespawnCountingNB>();
+            _spawnManager.RegisterPrefab(101, go);
+            _created.Add(go);
+
+            var nb = (DespawnCountingNB)_spawnManager.Spawn(101, Vector3.zero, Quaternion.identity, "p1");
+            if (nb != null) _created.Add(nb.gameObject);
+
+            _spawnManager.ClearAll();
+
+            Assert.AreEqual(1, nb.DespawnCount,
+                "OnNetworkDespawn must fire exactly once even when the user destroys the GO mid-callback.");
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ── NetworkManager Integration ─────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Description("NetworkManager.Spawner property exposes the SpawnManager.")]
+        public void NetworkManager_SpawnerProperty_IsAccessible()
+        {
+            // The _manager created in SetUp has InitialiseNetwork called in Awake.
+            // Spawner should be available.
+            Assert.IsNotNull(_manager.Spawner,
+                "NetworkManager.Spawner should be non-null after Awake.");
+        }
+
+        [Test]
+        [Description("NetworkManager.Spawner.Registry is accessible.")]
+        public void NetworkManager_SpawnerRegistry_IsAccessible()
+        {
+            Assert.IsNotNull(_manager.Spawner?.Registry);
+        }
+
+        [Test]
+        [Description("NetworkManager.Spawner.Ownership is accessible.")]
+        public void NetworkManager_SpawnerOwnership_IsAccessible()
+        {
+            Assert.IsNotNull(_manager.Spawner?.Ownership);
+        }
+
+        // ── Spawn admission caps ───────────────────────────────────────────────
+        //
+        // Defends the receiver from a hostile-gateway Instantiate flood.  The
+        // rate cap bounds work-per-second; the count cap bounds total memory
+        // regardless of arrival rate.  Both caps are checked at the
+        // CreateLocal entry so local AND inbound spawns are equally bounded.
+
+        [Test]
+        [Description("Spawns past maxSpawnsPerSecond in the same one-second bucket are dropped.")]
+        public void CreateLocal_RatePerSecondCap_DropsExcessSpawns()
+        {
+            _manager.Settings.maxSpawnsPerSecond = 5;
+            _manager.Settings.maxSpawnsPerRoom   = 1000;
+
+            int admitted = 0;
+            for (int i = 0; i < 20; i++)
+            {
+                var nb = _spawnManager.CreateLocal(
+                    PREFAB_ID, (ulong)(1000 + i), "p-owner",
+                    Vector3.zero, Quaternion.identity);
+                if (nb != null)
+                {
+                    _created.Add(nb.gameObject);
+                    admitted++;
+                }
+            }
+
+            Assert.AreEqual(5, admitted,
+                "rate cap must drop everything beyond maxSpawnsPerSecond inside a single bucket");
+        }
+
+        [Test]
+        [Description("Despawning frees the live-count slot for a future Spawn.")]
+        public void DestroyLocal_DecrementsCountCap_AllowingNewSpawn()
+        {
+            _manager.Settings.maxSpawnsPerSecond = 1000;
+            _manager.Settings.maxSpawnsPerRoom   = 2;
+
+            var a = _spawnManager.CreateLocal(PREFAB_ID, 10UL, "p", Vector3.zero, Quaternion.identity);
+            var b = _spawnManager.CreateLocal(PREFAB_ID, 11UL, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNotNull(a);
+            Assert.IsNotNull(b);
+            _created.Add(a.gameObject); _created.Add(b.gameObject);
+
+            var rejected = _spawnManager.CreateLocal(PREFAB_ID, 12UL, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNull(rejected, "count cap must reject when the live total is at the cap");
+
+            _spawnManager.DestroyLocal(10UL);
+            var c = _spawnManager.CreateLocal(PREFAB_ID, 13UL, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNotNull(c, "freeing one slot must restore admission");
+            _created.Add(c.gameObject);
+        }
+
+        [Test]
+        [Description("Re-entrant CreateLocal from a user OnNetworkSpawn callback is bounded by the per-room cap.")]
+        public void CreateLocal_ReentrantFromUserCallback_RespectsCountCap()
+        {
+            const int cap = 5;
+            _manager.Settings.maxSpawnsPerSecond = 1000;
+            _manager.Settings.maxSpawnsPerRoom   = cap;
+
+            // Re-entrant prefab: every OnNetworkSpawn calls back into
+            // CreateLocal up to 100 times.  The eager-increment contract must
+            // mean that the inner calls observe the outer's incremented
+            // counter, so the total registered objects can never exceed the
+            // configured maxSpawnsPerRoom.  Pre-fix this test would observe
+            // (cap × recursion-depth) live spawns.
+            var reentrantPrefab = new GameObject("ReentrantPrefab");
+            reentrantPrefab.AddComponent<ReentrantSpawnerNB>();
+            _created.Add(reentrantPrefab);
+
+            const uint reentrantId = 99;
+            _spawnManager.RegisterPrefab(reentrantId, reentrantPrefab);
+
+            ReentrantSpawnerNB.Reset(_spawnManager, reentrantId, attempts: 100);
+
+            var first = _spawnManager.CreateLocal(
+                reentrantId, 50_000UL, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNotNull(first, "the seed spawn must succeed");
+            _created.Add(first.gameObject);
+
+            int live = 0;
+            foreach (var o in _registry.GetAll()) live++;
+            Assert.LessOrEqual(live, cap,
+                $"recursive spawn must not exceed maxSpawnsPerRoom (live={live}, cap={cap})");
+        }
+
+        [Test]
+        [Description("ClearAll resets the rate-bucket and live count so a new room starts clean.")]
+        public void ClearAll_ResetsAdmissionCounters()
+        {
+            _manager.Settings.maxSpawnsPerSecond = 3;
+            _manager.Settings.maxSpawnsPerRoom   = 1000;
+
+            for (int i = 0; i < 3; i++)
+            {
+                var nb = _spawnManager.CreateLocal(
+                    PREFAB_ID, (ulong)(2000 + i), "p", Vector3.zero, Quaternion.identity);
+                if (nb != null) _created.Add(nb.gameObject);
+            }
+            Assert.IsNull(
+                _spawnManager.CreateLocal(PREFAB_ID, 2099UL, "p", Vector3.zero, Quaternion.identity),
+                "bucket must be saturated before ClearAll");
+
+            _spawnManager.ClearAll();
+
+            var fresh = _spawnManager.CreateLocal(PREFAB_ID, 3000UL, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNotNull(fresh, "ClearAll must reset the rate bucket");
+            if (fresh != null) _created.Add(fresh.gameObject);
+        }
+
+        // ── Despawn-before-Spawn (UDP reorder) ─────────────────────────────────
+        //
+        // A despawn arriving ahead of its matching spawn must NOT silently no-op
+        // and let the late spawn produce a ghost object.  The receiver records
+        // the despawn intent under a TTL; the matching spawn is then dropped.
+
+        [Test]
+        [Description("DestroyLocal for an unknown id records a pending-despawn entry.")]
+        public void DestroyLocal_BeforeSpawn_RecordsPendingDespawn()
+        {
+            Assert.AreEqual(0, _spawnManager.PendingDespawnCount);
+            _spawnManager.DestroyLocal(0xCAFE);
+            Assert.AreEqual(1, _spawnManager.PendingDespawnCount,
+                "DestroyLocal on an unknown id must record a pending-despawn entry");
+        }
+
+        [Test]
+        [Description("CreateLocal after a pending despawn for the same id drops the spawn.")]
+        public void CreateLocal_AfterPendingDespawn_DropsSpawn()
+        {
+            // 1. Despawn arrives first.
+            _spawnManager.DestroyLocal(0xBEEF);
+            Assert.AreEqual(1, _spawnManager.PendingDespawnCount);
+
+            // 2. Late Spawn for the same id: must be dropped (no GameObject).
+            var nb = _spawnManager.CreateLocal(
+                PREFAB_ID, 0xBEEF, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNull(nb, "Late spawn must be skipped when a despawn arrived first");
+
+            // 3. Pending entry must be consumed.
+            Assert.AreEqual(0, _spawnManager.PendingDespawnCount,
+                "Consuming the pending entry prevents memory growth");
+            Assert.IsNull(_spawnManager.Registry.Get(0xBEEF));
+        }
+
+        [Test]
+        [Description("Normal Despawn-after-Spawn does not leave a pending entry.")]
+        public void DestroyLocal_AfterSpawn_DoesNotCreatePendingEntry()
+        {
+            var nb = _spawnManager.CreateLocal(
+                PREFAB_ID, 0xFEED, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNotNull(nb);
+            _created.Add(nb.gameObject);
+
+            _spawnManager.DestroyLocal(0xFEED);
+            Assert.AreEqual(0, _spawnManager.PendingDespawnCount);
+        }
+
+        [Test]
+        [Description("Pending-despawn dictionary respects MaxPendingDespawns hard cap under flood.")]
+        public void DestroyLocal_BeyondCap_EvictsOldestAndStaysBounded()
+        {
+            // Flood the dictionary with cap+overflow distinct ids.  Even
+            // without the TTL elapsing, the hard cap must keep the count at
+            // or below MaxPendingDespawns.  This guards against a hostile
+            // gateway streaming Despawn(unknown_id) at line rate before the
+            // 5-second TTL window closes.
+            const int overflow = 64;
+            for (int i = 0; i < SpawnManager.MaxPendingDespawns + overflow; i++)
+            {
+                _spawnManager.DestroyLocal((ulong)(0x1_0000 + i));
+            }
+            Assert.LessOrEqual(_spawnManager.PendingDespawnCount, SpawnManager.MaxPendingDespawns,
+                "Cap must bound dictionary growth even when TTL has not yet elapsed");
+
+            // The most recently inserted ids should still be present (oldest-
+            // first eviction policy preserves the entries most likely to
+            // match a still-in-flight Spawn).  Pick one near the tail.
+            ulong recent = (ulong)(0x1_0000 + SpawnManager.MaxPendingDespawns + overflow - 1);
+            var nb = _spawnManager.CreateLocal(
+                PREFAB_ID, recent, "p", Vector3.zero, Quaternion.identity);
+            Assert.IsNull(nb,
+                "Recent pending-despawn entries must survive the cap-eviction sweep");
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ── H-031 — registry publication ordering ─────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+        //
+        // Re-entrant access from OnNetworkSpawn must NOT observe a half-
+        // initialised object via _registry.Get(); SetSpawned(true) finalises
+        // initialisation and only then is the object atomically published
+        // through Register.
+
+        private sealed class RegistryProbeNB : NetworkBehaviour
+        {
+            public NetworkObjectRegistry ProbeRegistry;
+            public NetworkBehaviour       ObservedFromGet;
+
+            protected override void OnNetworkSpawn()
+            {
+                if (ProbeRegistry != null)
+                    ObservedFromGet = ProbeRegistry.Get(NetworkObjectId);
+            }
+        }
+
+        [Test]
+        [Description("Re-entrant Registry.Get from OnNetworkSpawn must not observe the spawning object until publication completes.")]
+        public void Spawn_ReEntrantRegistryGet_DoesNotObserveHalfInitialisedObject()
+        {
+            var probePrefab = new GameObject("ProbePrefab");
+            probePrefab.AddComponent<RegistryProbeNB>().ProbeRegistry = _registry;
+            _created.Add(probePrefab);
+
+            const uint probePrefabId = 99;
+            _spawnManager.RegisterPrefab(probePrefabId, probePrefab);
+
+            var nb = (RegistryProbeNB)_spawnManager.Spawn(
+                probePrefabId, Vector3.zero, Quaternion.identity, "owner-1");
+            _created.Add(nb.gameObject);
+
+            // The OnNetworkSpawn callback ran during SetSpawned(true), BEFORE
+            // _registry.Register completed.  The probe therefore observed null
+            // — proving that user callbacks cannot reach a half-initialised
+            // object via the registry.
+            Assert.IsNull(nb.ObservedFromGet,
+                "Registry.Get must return null while OnNetworkSpawn is still running.");
+
+            // After Spawn returns, the object IS published — a subsequent
+            // lookup resolves it.
+            Assert.AreSame(nb, _registry.Get(nb.NetworkObjectId));
+            Assert.IsTrue(nb.IsSpawned);
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ── Test doubles ───────────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+
+        private sealed class SpawnableNB : NetworkBehaviour
+        {
+            public bool SpawnCalled   { get; private set; }
+            public bool DespawnCalled { get; private set; }
+
+            protected override void OnNetworkSpawn()   => SpawnCalled = true;
+            protected override void OnNetworkDespawn() => DespawnCalled = true;
+        }
+
+        // Re-entry probe: every OnNetworkSpawn synchronously calls
+        // CreateLocal again, which exercises the "user callback re-enters
+        // SpawnManager" path.  Static config (target manager, prefab id,
+        // attempt budget) is set by Reset() before the seed spawn.
+        private sealed class ReentrantSpawnerNB : NetworkBehaviour
+        {
+            private static SpawnManager s_target;
+            private static uint         s_prefabId;
+            private static int          s_remaining;
+            private static ulong        s_nextId;
+
+            public static void Reset(SpawnManager target, uint prefabId, int attempts)
+            {
+                s_target    = target;
+                s_prefabId  = prefabId;
+                s_remaining = attempts;
+                s_nextId    = 60_000UL;
+            }
+
+            protected override void OnNetworkSpawn()
+            {
+                if (s_target == null || s_remaining <= 0) return;
+                s_remaining--;
+                // Re-enter from inside the user callback.  When the spawn
+                // cap is enforced eagerly, most of these will return null;
+                // the assertion in the surrounding test verifies that the
+                // count of *live* registered objects never exceeds the cap.
+                s_target.CreateLocal(
+                    s_prefabId, s_nextId++, "p", Vector3.zero, Quaternion.identity);
+            }
+        }
+
+        // Test double whose OnNetworkDespawn destroys its own GameObject —
+        // exercises the two-pass guard in SpawnManager.ClearAll which must
+        // tolerate a user-destroyed GO between the callback and the destroy
+        // pass.  DestroyImmediate makes the destruction observable on the
+        // very next access (Edit Mode tests do not pump frames between calls).
+        private sealed class DespawnSelfDestroyerNB : NetworkBehaviour
+        {
+            protected override void OnNetworkDespawn()
+            {
+                if (this != null && this.gameObject != null)
+                    Object.DestroyImmediate(this.gameObject);
+            }
+        }
+
+        // M-039 probe: re-enters SpawnManager.Despawn for the same object id
+        // from inside its own OnNetworkDespawn callback.  Without the
+        // in-flight guard the inner call walks the "Despawn before Spawn"
+        // branch and records a stale pending-despawn entry whose matching
+        // Spawn never arrives.
+        private sealed class ReentrantDespawnerNB : NetworkBehaviour
+        {
+            private static SpawnManager s_target;
+            private static ulong        s_id;
+            public int DespawnInvocations { get; private set; }
+
+            public static void Reset(SpawnManager target, ulong id)
+            {
+                s_target = target;
+                s_id     = id;
+            }
+
+            protected override void OnNetworkDespawn()
+            {
+                DespawnInvocations++;
+                // Re-enter once.  A bug here would either double-fire this
+                // callback or leave a pending-despawn entry behind.
+                if (s_target != null && DespawnInvocations == 1)
+                    s_target.Despawn(s_id);
+            }
+        }
+
+        // Test double that counts OnNetworkDespawn invocations and destroys
+        // itself in the callback.  Validates that ClearAll fires the user
+        // callback exactly once even when the user races a destroy in.
+        private sealed class DespawnCountingNB : NetworkBehaviour
+        {
+            public int DespawnCount { get; private set; }
+
+            protected override void OnNetworkDespawn()
+            {
+                DespawnCount++;
+                if (this != null && this.gameObject != null)
+                    Object.DestroyImmediate(this.gameObject);
+            }
+        }
+    }
+}

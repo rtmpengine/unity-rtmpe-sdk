@@ -1,0 +1,428 @@
+// RTMPE SDK — Runtime/Crypto/Internal/Ed25519Verify.cs
+//
+// Ed25519 signature VERIFICATION (RFC 8032 §5.1.7).
+//
+// This implements verification only (not signing — the server signs, the client verifies).
+// All arithmetic is in GF(2^255-19) or on the Edwards25519 group.
+//
+// Used during the ECDH handshake: verify sign(server_static_privkey, server_ephemeral_pub)
+// before proceeding with ECDH, to prevent man-in-the-middle key substitution.
+//
+// Pure C# — no native dependencies. System.Security.Cryptography.SHA512 is used
+// for the SHA-512 hash, which is available in .NET Standard 2.1.
+//
+// ============================================================================
+// SECURITY / THREAT MODEL
+// ============================================================================
+// This is a PURE-MANAGED C# cryptographic implementation.
+//
+// WHAT IT PROTECTS AGAINST (in scope):
+//   • MITM key substitution: verifying the server's Ed25519 signature on the
+//     ephemeral key ensures the server holds the known static private key.
+//   • Signature forgery by network-level attackers without the private key.
+//
+// WHAT IT DOES NOT PROTECT AGAINST (out of scope):
+//   • Timing side-channels in BigInteger point arithmetic. Variable-time
+//     scalar multiplication could leak bits of the signature scalar to a
+//     local attacker with timing measurement capability.
+//
+// RISK ASSESSMENT:
+//   Signature verification (client role) only — no private key is held by
+//   this code; timing leakage cannot expose a client secret. LOW risk.
+//
+//   Edge case: ScalarMult(n=0) returns the identity point.
+//   When n is zero, BigInteger.Log(0,2) would throw; this case is guarded explicitly.
+//
+// STRICT-VERIFICATION POLICY:
+//   • Public-key and R-point must be canonical (y < p, no encoding ambiguity).
+//   • Public-key and R-point must NOT be in the order-8 torsion subgroup.
+//   These rules align this verifier with ed25519-dalek's verify_strict
+//   (used by the Rust gateway), eliminating cross-implementation
+//   malleability and small-subgroup attacks.
+//
+// TESTING:
+//   RFC 8032 test vectors, n=0 edge case, signature mutation tests, and
+//   the eight published low-order Ed25519 points (Hamburg/Ladd Decaf §3).
+// ============================================================================
+
+using System;
+using System.Numerics;
+using System.Security.Cryptography;
+
+namespace RTMPE.Crypto.Internal
+{
+    /// <summary>
+    /// Ed25519 signature verification (RFC 8032 §5.1).
+    /// </summary>
+    internal static class Ed25519Verify
+    {
+        // ── Field / curve constants ─────────────────────────────────────────
+
+        // p = 2^255 - 19
+        private static readonly BigInteger P = (BigInteger.One << 255) - 19;
+
+        // Group order l = 2^252 + 27742317777372353535851937790883648493
+        private static readonly BigInteger L = (BigInteger.One << 252)
+            + BigInteger.Parse("27742317777372353535851937790883648493");
+
+        // d = -121665/121666 mod p
+        // Pre-computed decimal value from RFC 8032 §5.1.
+        private static readonly BigInteger D =
+            BigInteger.Parse("37095705934669439343138083508754565189542113879843219016388785533085940283555");
+
+        // sqrt(-1) mod p = 2^((p-1)/4) mod p
+        private static readonly BigInteger SqrtM1 =
+            BigInteger.Parse("19681161376707505956807079304988542015446066515923890162744021073123829784752");
+
+        // Base point (Bx, By) from RFC 8032 §5.1.
+        //
+        // By = 4 * modInverse(5, p). Bx is the unique x in [0, p) with sign
+        // bit 0 such that (Bx, By) lies on Edwards25519
+        //   −x^2 + y^2 = 1 + d*x^2*y^2 .
+        // These values are cross-checked against the RFC 8032 §6 reference
+        // implementation in the unit-test suite (see RFC 8032 §7
+        // test-vector verification — failure here means every signature
+        // check would silently fail).
+        private static readonly BigInteger By =
+            BigInteger.Parse("46316835694926478169428394003475163141307993866256225615783033603165251855960");
+        private static readonly BigInteger Bx =
+            BigInteger.Parse("15112221349535400772501151409588531511454012693041857206046113283949847762202");
+
+        // ── Point representation ─────────────────────────────────────────────
+
+        // Extended homogeneous coordinates (X, Y, Z, T) where x = X/Z, y = Y/Z, T = x*y.
+        private struct Point
+        {
+            public BigInteger X, Y, Z, T;
+
+            public static readonly Point Identity = new Point
+            {
+                X = BigInteger.Zero,
+                Y = BigInteger.One,
+                Z = BigInteger.One,
+                T = BigInteger.Zero
+            };
+        }
+
+        // ── Field helpers ────────────────────────────────────────────────────
+
+        private static BigInteger FMod(BigInteger a) => ((a % P) + P) % P;
+        private static BigInteger FAdd(BigInteger a, BigInteger b) => FMod(a + b);
+        private static BigInteger FSub(BigInteger a, BigInteger b) => FMod(a - b);
+        private static BigInteger FMul(BigInteger a, BigInteger b) => FMod(a * b);
+        private static BigInteger FInv(BigInteger a)               => BigInteger.ModPow(a, P - 2, P);
+
+        // ── Edwards25519 point operations ────────────────────────────────────
+
+        /// <summary>Extended twisted Edwards point addition (RFC 8032 §5.1.4).</summary>
+        private static Point PointAdd(Point P1, Point P2)
+        {
+            var A = FMul(FSub(P1.Y, P1.X), FSub(P2.Y, P2.X));
+            var B = FMul(FAdd(P1.Y, P1.X), FAdd(P2.Y, P2.X));
+            var C = FMul(FMul(P1.T, 2 * D % P), P2.T);
+            var Dv = FMul(FMul(P1.Z, 2), P2.Z);
+            var E  = FSub(B, A);
+            var F  = FSub(Dv, C);
+            var G  = FAdd(Dv, C);
+            var H  = FAdd(B, A);
+            return new Point
+            {
+                X = FMul(E, F),
+                Y = FMul(G, H),
+                Z = FMul(F, G),
+                T = FMul(E, H)
+            };
+        }
+
+        /// <summary>Extended twisted Edwards point doubling (RFC 8032 §5.1.4).</summary>
+        private static Point PointDouble(Point P1)
+        {
+            // Formulas: dbl-2008-hwcd
+            // A = X1^2, B = Y1^2, C = 2*Z1^2, H = A+B
+            // E = H-(X1+Y1)^2, G = A-B, F = C+G
+            // X3 = E*F, Y3 = G*H, Z3 = F*G, T3 = E*H
+            var A    = FMul(P1.X, P1.X);
+            var B    = FMul(P1.Y, P1.Y);
+            var C    = FMul(FMul(2, P1.Z), P1.Z);
+            var H    = FAdd(A, B);
+            var xpy  = FMod(P1.X + P1.Y);
+            var E    = FSub(H, FMul(xpy, xpy));
+            var G    = FSub(A, B);
+            var F    = FAdd(C, G);
+            return new Point
+            {
+                X = FMul(E, F),
+                Y = FMul(G, H),
+                Z = FMul(F, G),
+                T = FMul(E, H)
+            };
+        }
+
+        /// <summary>
+        /// Scalar multiplication on Edwards25519 using the double-and-add method
+        /// (processes scalar bits from most significant to least significant).
+        /// </summary>
+        private static Point ScalarMult(Point pt, BigInteger n)
+        {
+            // Guard: multiplying by 0 returns the identity (neutral element).
+            // Adversarial inputs (e.g. S = 0 in a malformed signature) are
+            // funneled through this branch and cannot trigger an exception.
+            if (n.IsZero) return Point.Identity;
+
+            // Use the exact bit length of the (non-negative) scalar. Earlier
+            // implementations used `(int)BigInteger.Log(n, 2) + 1` which for
+            // certain near-power-of-two scalars rounds the IEEE-754 double
+            // result down by one ULP, dropping the high bit of the scalar
+            // and silently producing the wrong point. `BitLength` is
+            // integer-exact on every target (see below).
+            int bits = BitLength(n);
+
+            var Q = Point.Identity;
+            for (int i = bits - 1; i >= 0; i--)
+            {
+                Q = PointDouble(Q);
+                if ((n >> i & BigInteger.One) == BigInteger.One)
+                    Q = PointAdd(Q, pt);
+            }
+            return Q;
+        }
+
+        /// <summary>
+        /// Exact bit length of a non-negative <see cref="BigInteger"/>.
+        /// <c>BigInteger.GetBitLength()</c> is .NET 5+ and is absent from the
+        /// .NET Standard 2.1 BCL surface (Unity's declared minimum, 2022.3), so
+        /// the portable shift-count fallback is used there.  Both are
+        /// integer-exact — unlike the older <c>(int)BigInteger.Log(n, 2) + 1</c>,
+        /// whose IEEE-754 rounding could drop the scalar's high bit and silently
+        /// produce the wrong point (SDKC-01).
+        /// </summary>
+        internal static int BitLength(BigInteger n)
+        {
+#if NET5_0_OR_GREATER
+            return (int)n.GetBitLength();
+#else
+            return BitLengthPortable(n);
+#endif
+        }
+
+        /// <summary>
+        /// .NET Standard 2.1-compatible bit length: <c>floor(log2(n)) + 1</c> for
+        /// <c>n &gt; 0</c>, and 0 otherwise — identical to
+        /// <c>BigInteger.GetBitLength()</c> for non-negative input.  Always
+        /// compiled (not behind the <c>#if</c>) so it is unit-tested against the
+        /// BCL on .NET 5+ even though only the netstandard2.1 build path calls it.
+        /// </summary>
+        internal static int BitLengthPortable(BigInteger n)
+        {
+            if (n.Sign <= 0) return 0;
+            int bits = 0;
+            for (BigInteger v = n; v > BigInteger.Zero; v >>= 1) bits++;
+            return bits;
+        }
+
+        // ── Point encoding / decoding ─────────────────────────────────────────
+
+        private static readonly Point BasePoint = new Point
+        {
+            X = FMod(Bx),
+            Y = FMod(By),
+            Z = BigInteger.One,
+            T = FMod(FMul(Bx, By))
+        };
+
+        /// <summary>
+        /// Decode a compressed 32-byte Ed25519 point per RFC 8032 §5.1.3.
+        /// Returns false if the encoding is invalid.
+        /// </summary>
+        /// <remarks>
+        /// Strict canonical-encoding policy (RFC 8032 §5.1.7 + §8.4):
+        ///   • The recovered <c>y</c> coordinate must satisfy <c>0 ≤ y &lt; p</c>.
+        ///     A peer that emits <c>y ≥ p</c> is using a non-canonical encoding;
+        ///     two distinct byte representations would map to the same point and
+        ///     enable cross-implementation malleability with strict verifiers
+        ///     (notably ed25519-dalek's "strict" mode used by the Rust gateway).
+        ///   • If <c>x = 0</c> and the sign bit is 1 the encoding is rejected.
+        ///     RFC 8032 §5.1.3 step 3 forbids this combination.
+        /// </remarks>
+        private static bool DecodePoint(byte[] s, out Point pt)
+        {
+            pt = default;
+            if (s.Length != 32) return false;
+
+            // Copy so we can mask the sign bit without modifying the input.
+            var buf = (byte[])s.Clone();
+            int xSign = (buf[31] >> 7) & 1;
+            buf[31] &= 0x7F; // clear sign bit
+
+            var yBuf = new byte[33];
+            Buffer.BlockCopy(buf, 0, yBuf, 0, 32);
+            // yBuf[32] = 0 (positive BigInteger)
+            var y = new BigInteger(yBuf);
+
+            // Reject non-canonical encodings — the only canonical representation
+            // of a y-coordinate is the unique 0 ≤ y < p value (RFC 8032 §5.1.3).
+            if (y >= P) return false;
+
+            // Recover x: x^2 = (y^2 - 1) / (d*y^2 + 1)
+            var y2  = FMul(y, y);
+            var u   = FSub(y2, BigInteger.One);
+            var v   = FAdd(FMul(D, y2), BigInteger.One);
+            var vInv = FInv(v);
+            var uv  = FMul(u, vInv);
+
+            // Candidate: x = uv^((p+3)/8)
+            // Using the identity: if v * x^2 == u then x is the correct root,
+            // else x = x * sqrt(-1).
+            var exp = (P + 3) / 8;
+            var x   = BigInteger.ModPow(uv, exp, P);
+
+            // Check: vx^2 should equal u
+            var vx2 = FMul(v, FMul(x, x));
+            if (vx2 == FMod(u))
+            {
+                // x is correct (but adjust sign below)
+            }
+            else if (vx2 == FMod(P - u))
+            {
+                // Multiply by sqrt(-1) to get the correct square root
+                x = FMul(x, SqrtM1);
+            }
+            else
+            {
+                return false; // Not a valid point
+            }
+
+            // Adjust sign to match the encoded sign bit.
+            if (x == BigInteger.Zero && xSign == 1) return false;
+            var xSign_actual = (int)(x % 2);
+            if (xSign_actual != xSign)
+                x = P - x;
+
+            pt = new Point
+            {
+                X = x,
+                Y = y,
+                Z = BigInteger.One,
+                T = FMul(x, y)
+            };
+            return true;
+        }
+
+        /// <summary>Check that two group points are equal by cross-multiplying Z coordinates.</summary>
+        private static bool PointEqual(Point p1, Point p2)
+        {
+            // X1/Z1 == X2/Z2  ↔  X1*Z2 == X2*Z1 (mod P)
+            // Y1/Z1 == Y2/Z2  ↔  Y1*Z2 == Y2*Z1 (mod P)
+            return FMul(p1.X, p2.Z) == FMul(p2.X, p1.Z)
+                && FMul(p1.Y, p2.Z) == FMul(p2.Y, p1.Z);
+        }
+
+        /// <summary>
+        /// Test whether a decoded Ed25519 point lies in the order-8 torsion
+        /// subgroup, i.e. has order dividing the cofactor.
+        /// </summary>
+        /// <remarks>
+        /// Edwards25519 has cofactor h = 8. The eight low-order points
+        /// (including identity) satisfy [8]P = identity. Such points
+        /// contribute no security (their discrete-log is trivial) and are
+        /// the classical input to small-subgroup / cofactor-confusion
+        /// attacks — see Hamburg/Ladd "Decaf" §3 and the ed25519-dalek
+        /// strict-verification rationale.
+        ///
+        /// Rejecting them here matches RFC 8032 §5.1.7's recommendation
+        /// (final sentence) and the Rust gateway's
+        /// <c>verify_strict</c> behavior, eliminating cross-implementation
+        /// malleability where the gateway accepts a signature the SDK
+        /// rejects, or vice-versa.
+        ///
+        /// A point on extended coordinates equals identity iff X·Z = 0·Z
+        /// and Y·Z = 1·Z, i.e. <c>X == 0</c> and <c>Y == Z</c> in
+        /// projective form.
+        /// </remarks>
+        private static bool IsSmallOrder(Point pt)
+        {
+            // [8]P = double(double(double(P)))
+            var p2 = PointDouble(pt);
+            var p4 = PointDouble(p2);
+            var p8 = PointDouble(p4);
+            // Identity in (X:Y:Z:T): X = 0 and Y = Z (any non-zero Y/Z pair).
+            return p8.X.IsZero && p8.Y == p8.Z;
+        }
+
+        // ── Public API ────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Verify an Ed25519 signature per RFC 8032 §5.1.7.
+        /// </summary>
+        /// <param name="publicKeyBytes">32-byte compressed Ed25519 public key.</param>
+        /// <param name="message">The message that was signed (server_ephemeral_pub in RTMPE).</param>
+        /// <param name="signature">64-byte Ed25519 signature (R || S).</param>
+        /// <returns>
+        /// <see langword="true"/> if the signature is valid;
+        /// <see langword="false"/> for any invalid input or failed verification.
+        /// </returns>
+        internal static bool Verify(byte[] publicKeyBytes, byte[] message, byte[] signature)
+        {
+            if (publicKeyBytes == null || publicKeyBytes.Length != 32) return false;
+            if (signature      == null || signature.Length      != 64) return false;
+            if (message        == null)                                  return false;
+
+            // 1. Decode the public key A.
+            if (!DecodePoint(publicKeyBytes, out var A)) return false;
+
+            // Strict mode (RFC 8032 §5.1.7 final paragraph + §8.4):
+            // reject any A in the order-8 torsion subgroup. A small-order A
+            // makes the signature equation [S]B == R + [k]A trivially
+            // satisfiable in ways that don't bind the message, opening
+            // signature-malleability and cross-implementation hazards with
+            // the Rust gateway (ed25519-dalek verify_strict).
+            if (IsSmallOrder(A)) return false;
+
+            // 2. Split the signature into R (first 32 bytes) and S (last 32 bytes).
+            var R_bytes = new byte[32];
+            var S_bytes = new byte[32];
+            Buffer.BlockCopy(signature,  0, R_bytes, 0, 32);
+            Buffer.BlockCopy(signature, 32, S_bytes, 0, 32);
+
+            // 3. Decode R.
+            if (!DecodePoint(R_bytes, out var R)) return false;
+
+            // Reject small-order R: same rationale as A above. A small-order
+            // R lets an attacker craft a signature that verifies for any
+            // message under any public key when paired with a small-order A,
+            // and is the canonical malleability vector closed by
+            // ed25519-dalek's strict mode.
+            if (IsSmallOrder(R)) return false;
+
+            // 4. Decode S as a little-endian integer and check S < l.
+            var sBuf = new byte[33];
+            Buffer.BlockCopy(S_bytes, 0, sBuf, 0, 32);
+            var S = new BigInteger(sBuf);
+            if (S < BigInteger.Zero || S >= L) return false;
+
+            // 5. Compute k = SHA-512(R_bytes || publicKeyBytes || message).
+            byte[] kHash;
+            using (var sha = SHA512.Create())
+            {
+                var hashInput = new byte[R_bytes.Length + publicKeyBytes.Length + message.Length];
+                Buffer.BlockCopy(R_bytes,        0, hashInput,  0,                             R_bytes.Length);
+                Buffer.BlockCopy(publicKeyBytes, 0, hashInput,  R_bytes.Length,                publicKeyBytes.Length);
+                Buffer.BlockCopy(message,        0, hashInput,  R_bytes.Length + publicKeyBytes.Length, message.Length);
+                kHash = sha.ComputeHash(hashInput);
+            }
+
+            // k as a 512-bit integer, then reduce mod l.
+            var kBuf = new byte[65]; // 64 data bytes + 1 sign byte
+            Buffer.BlockCopy(kHash, 0, kBuf, 0, 64);
+            var k = new BigInteger(kBuf) % L;
+
+            // 6. Verify: [8][S]B == [8]R + [8][k]A
+            // Optimisation: check [S]B == R + [k]A instead (cofactor = 8 cancels out when S < l).
+            var lhs = ScalarMult(BasePoint, S);
+            var A8k = ScalarMult(A, k);
+            var rhs = PointAdd(R, A8k);
+
+            return PointEqual(lhs, rhs);
+        }
+    }
+}

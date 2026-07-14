@@ -1,0 +1,620 @@
+// RTMPE SDK — Runtime/Protocol/PacketBuilder.cs
+//
+// Builds outbound RTMPE packets with the correct 13-byte header.
+//
+// Header layout (all little-endian):
+//  [0..1]  magic       : u16  = 0x5254 ("RT")
+//  [2]     version     : u8   = 3
+//  [3]     packet_type : u8
+//  [4]     flags       : u8
+//  [5..8]  sequence    : u32  (monotonically increasing, per-connection)
+//  [9..12] payload_len : u32
+//
+// The sequence counter is an instance field (NOT static) so each connection
+// has its own independent counter. Sharing a PacketBuilder across connections
+// is a protocol error.
+
+using System;
+using System.Threading;
+using RTMPE.Core;
+
+namespace RTMPE.Protocol
+{
+    /// <summary>
+    /// Builds RTMPE wire-format packets.
+    /// One instance per connection; never share across connections.
+    /// All methods are safe to call from any thread.
+    /// </summary>
+    public sealed class PacketBuilder
+    {
+        // The sequence counter wraps naturally at uint.MaxValue (2^32-1).
+        // To avoid the Unsafe.As IL2CPP issue, we store as int and cast to uint on write.
+        // Initialised to -1 so the first Interlocked.Increment returns 0, matching the
+        // gateway's expectation that the first packet carries sequence 0.
+        private int _sequenceCounter = -1;
+
+        // Midpoint observability: increments by 1 every time the int
+        // counter crosses from int.MaxValue → int.MinValue, which
+        // corresponds to the wire-domain u32 sequence transitioning from
+        // 0x7FFF_FFFF → 0x8000_0000 — the MIDPOINT of u32 space, not the
+        // full wrap.  This is the operationally-useful early signal: at
+        // the midpoint there are still ~2 billion sends of headroom
+        // before the gateway's replay-window logic begins observing
+        // duplicate sequences after the actual u32 wrap, giving operators
+        // a generous window to plan a re-handshake.  The TRUE u32 wrap
+        // (0xFFFF_FFFF → 0x0000_0000) corresponds to the int counter
+        // going from -1 to 0 — but at that point the warning is already
+        // too late, so we deliberately fire the alert at the midpoint
+        // crossing.
+        private long _sequenceMidpointCrossingCount;
+
+        /// <summary>
+        /// Total number of times the wire sequence counter has crossed
+        /// the u32 midpoint (0x7FFF_FFFF → 0x8000_0000) since this builder
+        /// was constructed.  This is the operational early-warning signal
+        /// for sequence wrap: at midpoint there are still ~2 billion
+        /// sends of headroom before the actual u32 wrap, giving
+        /// dashboards time to plan a re-handshake.  Operators that
+        /// observe a non-zero count should age the connection.
+        /// </summary>
+        public long SequenceMidpointCrossingCount =>
+            System.Threading.Interlocked.Read(ref _sequenceMidpointCrossingCount);
+
+        /// <summary>
+        /// Last assigned wire sequence (uint) — useful for dashboards that
+        /// want to estimate time-to-wrap.  Reads the int counter and casts
+        /// to uint via the same convention as the wire encoding.
+        /// </summary>
+        public uint CurrentSequence => (uint)Volatile.Read(ref _sequenceCounter);
+
+        // ── Public factory methods ────────────────────────────────────────────
+
+        /// <summary>
+        /// Build a <c>HandshakeInit</c> packet (type 0x05) for the symmetric
+        /// PSK path.  Payload is the pre-encrypted API key blob from
+        /// <see cref="Crypto.ApiKeyCipher"/>.
+        /// </summary>
+        public byte[] BuildHandshakeInit(byte[] encryptedApiKeyPayload)
+            => BuildHandshakeInit(encryptedApiKeyPayload, sealedApiKey: false);
+
+        /// <summary>
+        /// Build a <c>HandshakeInit</c> packet (type 0x05), selecting the
+        /// envelope format via <paramref name="sealedApiKey"/>.
+        /// </summary>
+        /// <param name="encryptedApiKeyPayload">
+        /// The pre-encrypted API key blob: the PSK envelope from
+        /// <see cref="Crypto.ApiKeyCipher"/> when <paramref name="sealedApiKey"/>
+        /// is <see langword="false"/>, or the X25519 sealed box from
+        /// <see cref="Crypto.SealedApiKeyCipher"/> when it is
+        /// <see langword="true"/>.</param>
+        /// <param name="sealedApiKey">
+        /// When <see langword="true"/>, sets <see cref="PacketFlags.SealedApiKey"/>
+        /// so the gateway opens the payload with its static X25519 key instead of
+        /// the symmetric PSK.</param>
+        public byte[] BuildHandshakeInit(byte[] encryptedApiKeyPayload, bool sealedApiKey)
+            => Build(
+                PacketType.HandshakeInit,
+                sealedApiKey ? PacketFlags.SealedApiKey : PacketFlags.None,
+                encryptedApiKeyPayload);
+
+        /// <summary>
+        /// Build a <c>HandshakeResponse</c> packet (type 0x07).
+        ///
+        /// <para>Payload layout:</para>
+        /// <list type="bullet">
+        /// <item>bytes 0..31 — client's X25519 ephemeral public key.</item>
+        /// <item>byte 32 (optional) — preferred state-sync wire-format
+        /// version (<see cref="WireFormatVersion"/> as `byte`).  When omitted
+        /// the gateway pins the session to <see cref="WireFormat.LegacyDefault"/>
+        /// (V2) for byte-compatibility with deployed clients that pre-date the
+        /// negotiation byte.</item>
+        /// <item>bytes 33..36 (optional) — <c>client_caps:4 LE</c>, the
+        /// SDK's advertised <see cref="RTMPE.Core.Protocol.CapabilityFlags"/>
+        /// bitmask.  Each bit names an optional protocol feature the SDK
+        /// is willing to honour for the session.  The gateway's response
+        /// returns its own bitmask in the <c>SessionAck</c> tail; the
+        /// session-effective set is the bitwise AND of the two.  Omitting
+        /// the field is equivalent to advertising
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.None"/>.</item>
+        /// </list>
+        ///
+        /// <para>Backwards compatibility:</para>
+        /// <list type="bullet">
+        /// <item><b>Old gateway + new SDK:</b> the trailing bytes fall
+        /// outside the gateway's public-key slice (`payload[..32]`) and
+        /// are silently ignored — the session pins to V2 with no
+        /// negotiated caps just as it does today.</item>
+        /// <item><b>New gateway + old SDK:</b> trailing bytes are absent;
+        /// the gateway defaults the missing cap field to
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.None"/>.</item>
+        /// <item><b>New gateway + new SDK:</b> both sides agree on
+        /// `min(client_pref, gateway_max)` for the wire format and on the
+        /// intersection of the advertised cap sets.</item>
+        /// </list>
+        /// </summary>
+        public byte[] BuildHandshakeResponse(byte[] clientPublicKey)
+            => BuildHandshakeResponse(
+                clientPublicKey,
+                WireFormat.Default,
+                RTMPE.Core.Protocol.CapabilityFlags.None);
+
+        /// <summary>
+        /// Build a <c>HandshakeResponse</c> packet (type 0x07) with an
+        /// explicit wire-format preference and no advertised caps.
+        /// Preserved for callers that have not opted into capability
+        /// negotiation; see the three-argument overload for the cap-aware
+        /// wire layout and back-compat semantics.
+        /// </summary>
+        public byte[] BuildHandshakeResponse(
+            byte[] clientPublicKey,
+            WireFormatVersion preferredWireFormat)
+            => BuildHandshakeResponse(
+                clientPublicKey,
+                preferredWireFormat,
+                RTMPE.Core.Protocol.CapabilityFlags.None);
+
+        /// <summary>
+        /// Build a <c>HandshakeResponse</c> packet (type 0x07) with an
+        /// explicit wire-format preference and a capability advertisement,
+        /// without the Round-1 init-hash echo.  Use the four-argument
+        /// overload to include the echo when
+        /// <see cref="RTMPE.Core.Protocol.CapabilityFlags.InitHashEcho"/> is
+        /// part of the advertised set — without an echo at
+        /// <c>payload[37..69]</c> the gateway will reject the response as
+        /// contradictory.
+        /// </summary>
+        public byte[] BuildHandshakeResponse(
+            byte[] clientPublicKey,
+            WireFormatVersion preferredWireFormat,
+            RTMPE.Core.Protocol.CapabilityFlags clientCaps)
+            => BuildHandshakeResponse(
+                clientPublicKey,
+                preferredWireFormat,
+                clientCaps,
+                initHashEcho: default);
+
+        /// <summary>
+        /// Build a <c>HandshakeResponse</c> packet (type 0x07) with an
+        /// explicit wire-format preference, a capability advertisement, and
+        /// an optional 32-byte Round-1 init-hash echo.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Wire layout decisions follow <paramref name="clientCaps"/>:
+        /// </para>
+        /// <list type="bullet">
+        /// <item><c>None</c> and empty echo → 33-byte payload (pre-capability shape).</item>
+        /// <item>Caps without <see cref="RTMPE.Core.Protocol.CapabilityFlags.InitHashEcho"/>
+        /// → 37-byte payload (caps tail at <c>payload[33..37]</c>).</item>
+        /// <item>Caps including <see cref="RTMPE.Core.Protocol.CapabilityFlags.InitHashEcho"/>
+        /// → 69-byte payload (echo at <c>payload[37..69]</c>).  The echo must
+        /// be the SHA-256 of the Round-1 <c>HandshakeInit</c> ciphertext;
+        /// callers compute it via <see cref="ComputeInitHashEcho"/>.</item>
+        /// </list>
+        /// <para>
+        /// An echo without the matching cap bit is silently dropped: the bit
+        /// is the gateway's signal that the trailing bytes are meaningful.
+        /// The reverse — cap bit advertised but echo of the wrong length —
+        /// throws so the call site catches the contradiction at build time
+        /// rather than at the gateway as an opaque <c>InvalidFormat</c>
+        /// rejection.
+        /// </para>
+        /// </remarks>
+        public byte[] BuildHandshakeResponse(
+            byte[] clientPublicKey,
+            WireFormatVersion preferredWireFormat,
+            RTMPE.Core.Protocol.CapabilityFlags clientCaps,
+            ReadOnlySpan<byte> initHashEcho)
+        {
+            if (clientPublicKey == null || clientPublicKey.Length != 32)
+                throw new ArgumentException("clientPublicKey must be exactly 32 bytes.", nameof(clientPublicKey));
+
+            bool advertisesEcho =
+                (clientCaps & RTMPE.Core.Protocol.CapabilityFlags.InitHashEcho) != 0;
+
+            if (advertisesEcho && initHashEcho.Length != InitHashEchoLen)
+            {
+                throw new ArgumentException(
+                    $"initHashEcho must be exactly {InitHashEchoLen} bytes when " +
+                    $"CapabilityFlags.InitHashEcho is advertised (got {initHashEcho.Length}).",
+                    nameof(initHashEcho));
+            }
+
+            // Omit the cap tail when nothing is advertised so the on-wire
+            // packet stays byte-identical to the pre-cap shape that the
+            // legacy gateway parser accepts.  New gateways treat an
+            // absent tail as `CapabilityFlags.None` per the parser
+            // contract, so the two encodings of "no caps" are observably
+            // equivalent — emitting the shorter form keeps the bytes the
+            // operator sees in packet captures unchanged for the common
+            // case.
+            bool emitCaps = clientCaps != RTMPE.Core.Protocol.CapabilityFlags.None;
+            int payloadLen;
+            if (advertisesEcho)
+            {
+                // 32 (pub key) + 1 (wire format) + 4 (caps) + 32 (echo)
+                payloadLen = InitHashEchoPayloadLen;
+            }
+            else if (emitCaps)
+            {
+                payloadLen = 33 + RTMPE.Core.Protocol.CapabilityFlagsWire.WireSize;
+            }
+            else
+            {
+                payloadLen = 33;
+            }
+
+            // Allocating a fresh buffer keeps the caller's
+            // `clientPublicKey` slice untouched (zeroising is the
+            // consumer's responsibility upstream).
+            var payload = new byte[payloadLen];
+            Buffer.BlockCopy(clientPublicKey, 0, payload, 0, 32);
+            payload[32] = (byte)preferredWireFormat;
+            if (emitCaps)
+            {
+                RTMPE.Core.Protocol.CapabilityFlagsWire.WriteLittleEndian(
+                    payload, offset: 33, clientCaps);
+            }
+            if (advertisesEcho)
+            {
+                initHashEcho.CopyTo(new Span<byte>(payload, InitHashEchoOffset, InitHashEchoLen));
+            }
+            return Build(PacketType.HandshakeResponse, PacketFlags.None, payload);
+        }
+
+        /// <summary>
+        /// Byte length of the Round-1 init-hash echo carried at
+        /// <c>payload[37..69]</c> of a Round-2 <see cref="PacketType.HandshakeResponse"/>.
+        /// Fixed at the SHA-256 digest size; exposed as a named constant so
+        /// every wire-layout reference reads from the same source of truth.
+        /// </summary>
+        public const int InitHashEchoLen = 32;
+
+        /// <summary>
+        /// Offset within the <see cref="PacketType.HandshakeResponse"/>
+        /// payload at which the Round-1 init-hash echo begins.  Sits
+        /// immediately after the 32-byte ephemeral public key, the 1-byte
+        /// wire-format version, and the 4-byte capability tail.
+        /// </summary>
+        public const int InitHashEchoOffset = 37;
+
+        /// <summary>
+        /// Total payload length of a Round-2 <see cref="PacketType.HandshakeResponse"/>
+        /// that carries the init-hash echo: <see cref="InitHashEchoOffset"/>
+        /// + <see cref="InitHashEchoLen"/> = 69 bytes.  Pinned so a future
+        /// reshuffle of the leading fields surfaces in one place.
+        /// </summary>
+        public const int InitHashEchoPayloadLen = InitHashEchoOffset + InitHashEchoLen;
+
+        /// <summary>
+        /// Compute the SHA-256 of the Round-1 <see cref="PacketType.HandshakeInit"/>
+        /// ciphertext, suitable for passing as the <c>initHashEcho</c> argument
+        /// to the four-argument <see cref="BuildHandshakeResponse(byte[], WireFormatVersion, RTMPE.Core.Protocol.CapabilityFlags, ReadOnlySpan{byte})"/>.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The input must be the exact byte sequence the SDK passed to
+        /// <see cref="BuildHandshakeInit"/> as <c>encryptedApiKeyPayload</c>:
+        /// the gateway computes its side of the binding by hashing the same
+        /// bytes it received as the <see cref="PacketType.HandshakeInit"/>
+        /// payload, so any per-byte divergence collapses the echo match.
+        /// The cached value lives on <c>NetworkManager._lastHandshakeInitCiphertext</c>
+        /// for the duration of the handshake.
+        /// </para>
+        /// <para>
+        /// SHA-256 is fixed-output and side-channel-irrelevant for this
+        /// public-data input, so a managed <see cref="System.Security.Cryptography.SHA256"/>
+        /// implementation is sufficient; there is no secret keying material in
+        /// scope.
+        /// </para>
+        /// </remarks>
+        public static byte[] ComputeInitHashEcho(byte[] handshakeInitCiphertext)
+        {
+            if (handshakeInitCiphertext == null)
+                throw new ArgumentNullException(nameof(handshakeInitCiphertext));
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            return sha.ComputeHash(handshakeInitCiphertext);
+        }
+
+        /// <summary>
+        /// **N-1** — build a <c>ReconnectInit</c> packet (type 0x09).
+        /// <para>
+        /// Payload layout: <c>[token_len: u16 LE][token: N bytes UTF-8]</c>.
+        /// </para>
+        /// <para>
+        /// The gateway consumes the token atomically (single-use), verifies
+        /// the source IP matches the binding recorded at issue time, and
+        /// responds with a <see cref="PacketType.Challenge"/> that the client
+        /// answers with a normal <see cref="PacketType.HandshakeResponse"/>.
+        /// </para>
+        /// </summary>
+        /// <param name="reconnectToken">
+        /// The token obtained from the previous <c>SessionAck</c>.  Must be a
+        /// non-empty UTF-8 string no longer than 128 bytes (the gateway caps
+        /// token length at 128).
+        /// </param>
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="reconnectToken"/> is null, empty, or
+        /// its UTF-8 encoding exceeds 128 bytes.
+        /// </exception>
+        public byte[] BuildReconnectInit(string reconnectToken, byte[] proof)
+        {
+            if (proof == null)
+                throw new ArgumentNullException(nameof(proof),
+                    "proof is required.  Compute it via " +
+                    nameof(ComputeReconnectProof) +
+                    "(token, ipMigrationKey), or call " +
+                    nameof(BuildReconnectInitWithoutProof) +
+                    " when no IP-migration key was negotiated.");
+            if (proof.Length != 32)
+                throw new ArgumentException("proof must be exactly 32 bytes.", nameof(proof));
+
+            return BuildReconnectInitInternal(reconnectToken, proof);
+        }
+
+        /// <summary>
+        /// Build a <c>ReconnectInit</c> packet without an HMAC proof.
+        /// Use this only when no IP-migration key was negotiated for the
+        /// previous session (older gateway, or session torn down before
+        /// HKDF expansion completed).  In all other cases, prefer
+        /// <see cref="BuildReconnectInit"/> with a proof so the gateway can
+        /// accept a reconnect from a new IP address (WiFi → 4G migration).
+        /// </summary>
+        public byte[] BuildReconnectInitWithoutProof(string reconnectToken)
+        {
+            return BuildReconnectInitInternal(reconnectToken, null);
+        }
+
+        /// <summary>
+        /// Compute the 32-byte HMAC-SHA256 proof bound to a reconnect token.
+        /// Pair with <see cref="BuildReconnectInit"/>.
+        /// </summary>
+        /// <param name="reconnectToken">
+        /// The token returned in the previous <c>SessionAck</c>.
+        /// </param>
+        /// <param name="ipMigrationKey">
+        /// The 32-byte IP-migration key derived alongside the session keys
+        /// (HKDF info suffix <c>\x02</c> — see <c>HandshakeHandler.DeriveSessionKeys</c>).
+        /// </param>
+        public static byte[] ComputeReconnectProof(string reconnectToken, byte[] ipMigrationKey)
+        {
+            if (string.IsNullOrEmpty(reconnectToken))
+                throw new ArgumentException("reconnectToken must not be null or empty.", nameof(reconnectToken));
+            if (ipMigrationKey == null || ipMigrationKey.Length != 32)
+                throw new ArgumentException("ipMigrationKey must be exactly 32 bytes.", nameof(ipMigrationKey));
+
+            var tokenBytes = System.Text.Encoding.UTF8.GetBytes(reconnectToken);
+            using var hmac = new System.Security.Cryptography.HMACSHA256(ipMigrationKey);
+            return hmac.ComputeHash(tokenBytes);
+        }
+
+        private byte[] BuildReconnectInitInternal(string reconnectToken, byte[] proof)
+        {
+            if (string.IsNullOrEmpty(reconnectToken))
+                throw new ArgumentException("reconnectToken must not be null or empty.", nameof(reconnectToken));
+
+            var tokenBytes = System.Text.Encoding.UTF8.GetBytes(reconnectToken);
+            if (tokenBytes.Length > 128)
+                throw new ArgumentException(
+                    $"reconnectToken UTF-8 length {tokenBytes.Length} exceeds 128 bytes (gateway cap).",
+                    nameof(reconnectToken));
+
+            // Payload: [token_len: u16 LE][token: N][proof: 32 optional]
+            // The gateway detects the proof by checking payload.len() > 2 + token_len.
+            int proofLen = proof != null ? 32 : 0;
+            var payload = new byte[2 + tokenBytes.Length + proofLen];
+            payload[0] = (byte)(tokenBytes.Length & 0xFF);
+            payload[1] = (byte)((tokenBytes.Length >> 8) & 0xFF);
+            Buffer.BlockCopy(tokenBytes, 0, payload, 2, tokenBytes.Length);
+            if (proof != null)
+                Buffer.BlockCopy(proof, 0, payload, 2 + tokenBytes.Length, 32);
+
+            return Build(PacketType.ReconnectInit, PacketFlags.None, payload);
+        }
+
+        /// <summary>
+        /// Build a <c>Heartbeat</c> packet (type 0x03) with no payload.
+        /// </summary>
+        public byte[] BuildHeartbeat()
+            => Build(PacketType.Heartbeat, PacketFlags.None, Array.Empty<byte>());
+
+        /// <summary>
+        /// Build a <c>Disconnect</c> packet (type 0xFF) with no payload.
+        /// </summary>
+        public byte[] BuildDisconnect()
+            => Build(PacketType.Disconnect, PacketFlags.None, Array.Empty<byte>());
+
+        /// <summary>
+        /// Build a <c>Data</c> packet (type 0x10) with optional encryption/compression flags.
+        /// </summary>
+        public byte[] BuildData(byte[] payload, PacketFlags flags = PacketFlags.None)
+            => Build(PacketType.Data, flags, payload ?? Array.Empty<byte>());
+
+        /// <summary>
+        /// Build a <c>Diagnostics</c> packet (type 0x0C) carrying a raw
+        /// length-prefixed diagnostic-log batch. Best-effort (no reliability
+        /// flag); the AEAD pipeline seals it on send like every other packet.
+        /// The payload is bounded by the batcher to fit one datagram, so this
+        /// never trips the <see cref="MaxApplicationPayloadBytes"/> cap.
+        /// </summary>
+        public byte[] BuildDiagnostics(byte[] payload)
+            => Build(PacketType.Diagnostics, PacketFlags.None, payload ?? Array.Empty<byte>());
+
+        // ── Core builder ──────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Wire-validation upper bound on payload length.  Matches the
+        /// parser-side cap in <see cref="PacketParser"/> (1 MiB) and protects
+        /// the build path against an integer-class bug that would let a
+        /// caller pass a 4 GiB array into <see cref="Build"/>.  Defense in
+        /// depth only — every realistic call site is bounded much more
+        /// tightly by <see cref="MaxApplicationPayloadBytes"/>, which is the
+        /// limit a normal builder consumer should hit first.
+        /// </summary>
+        public const int MaxPayloadBytes = 1 * 1024 * 1024;
+
+        // The transport-side datagram envelope is bounded so a legitimately
+        // built packet survives every link in the path (PPPoE, IPsec, IPv6
+        // minimum-MTU networks).  Constants below mirror UdpTransport's
+        // DefaultMaxDatagramSize without taking a Transport assembly
+        // dependency from Protocol — the literal 1200 is documented in
+        // UdpTransport.DefaultMaxDatagramSize and the two values must move
+        // together.  An automated guard against drift is provided by the
+        // transport-suite test "DatagramAndApplicationCapsAreInSync".
+        private const int DefaultDatagramSizeMirror = 1200;
+
+        // 4-byte AEAD seq prefix + 16-byte Poly1305 tag are appended by the
+        // EncryptAndSend pipeline; documented in NetworkManager.cs's encrypt
+        // path.  An application caller hands plaintext to the builder, so the
+        // cap below pre-deducts what AEAD will add later.
+        private const int AeadOverheadBytes = 4 + 16;
+
+        /// <summary>
+        /// Largest application payload that, after the 13-byte RTMPE header
+        /// and the 20-byte AEAD overhead, still fits inside one
+        /// <see cref="DefaultDatagramSizeMirror"/>-byte UDP datagram.
+        /// Exceeding this causes an <see cref="ArgumentException"/> at the
+        /// builder so the caller diagnoses the size error at the call site
+        /// instead of meeting it as a delayed transport failure or, worse,
+        /// silently relying on IP fragmentation (poor on mobile / CGNAT).
+        /// </summary>
+        public const int MaxApplicationPayloadBytes =
+            DefaultDatagramSizeMirror - PacketProtocol.HEADER_SIZE - AeadOverheadBytes;
+
+        /// <summary>
+        /// Build a complete packet: 13-byte header + payload.
+        /// The sequence number is atomically incremented per call.
+        /// </summary>
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="payload"/> exceeds
+        /// <see cref="MaxApplicationPayloadBytes"/> (the layered, MTU-aware
+        /// cap that fires first) or <see cref="MaxPayloadBytes"/> (the
+        /// defense-in-depth wire-validation cap).
+        /// </exception>
+        public byte[] Build(PacketType type, PacketFlags flags, byte[] payload)
+        {
+            if (payload == null) payload = Array.Empty<byte>();
+            return Build(type, flags, payload, payload.Length);
+        }
+
+        /// <summary>
+        /// Build a complete packet using the first <paramref name="payloadLength"/>
+        /// bytes of <paramref name="payload"/>.  Use this overload when
+        /// <paramref name="payload"/> is a pooled or oversized buffer (e.g.,
+        /// rented from <c>ArrayPool&lt;byte&gt;.Shared</c>) whose backing
+        /// length is greater than the logical payload size.
+        /// </summary>
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="payloadLength"/> exceeds the per-payload
+        /// caps or is negative.
+        /// </exception>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when <paramref name="payloadLength"/> exceeds
+        /// <c>payload.Length</c>.
+        /// </exception>
+        public byte[] Build(PacketType type, PacketFlags flags, byte[] payload, int payloadLength)
+        {
+            if (payload == null) payload = Array.Empty<byte>();
+            if (payloadLength < 0 || payloadLength > payload.Length)
+                throw new ArgumentOutOfRangeException(nameof(payloadLength),
+                    $"payloadLength {payloadLength} must be in [0, payload.Length={payload.Length}].");
+
+            // Application-layer cap fires first.  Application payloads
+            // exceeding the transport MTU envelope silently rely on IP
+            // fragmentation (poor on mobile / CGNAT); rejecting at the
+            // builder makes the failure diagnosable at the call site instead
+            // of late in the pipeline as an opaque SocketException.
+            EnsureFitsInDatagram(payloadLength);
+
+            if (payloadLength > MaxPayloadBytes)
+                throw new ArgumentException(
+                    $"payload length {payloadLength} exceeds PacketBuilder.MaxPayloadBytes ({MaxPayloadBytes})",
+                    nameof(payloadLength));
+
+            // Atomic increment — no Unsafe.As required; cast uint at write time.
+            // Interlocked.Increment returns int; casting to uint handles wrap-around correctly.
+            int rawSeq = Interlocked.Increment(ref _sequenceCounter);
+            uint seq   = (uint)rawSeq;
+            // Midpoint detection: when the int counter increments from
+            // int.MaxValue (= u32 0x7FFFFFFF) to int.MinValue (= u32
+            // 0x80000000), the wire-domain u32 has crossed the midpoint
+            // of its space.  At this point ~2 billion further sends remain
+            // before the actual wrap (u32 0xFFFFFFFF → 0x00000000); the
+            // alert fires here precisely so operators have time to plan a
+            // re-handshake well before the gateway's replay-window dedup
+            // begins observing duplicate sequences.  Log exactly once
+            // per builder lifetime.
+            if (rawSeq == int.MinValue)
+            {
+                long count = Interlocked.Increment(ref _sequenceMidpointCrossingCount);
+                if (count == 1)
+                {
+                    UnityEngine.Debug.LogWarning(
+                        "[RTMPE] PacketBuilder: wire sequence counter just crossed " +
+                        "the u32 midpoint.  A full u32 wrap will occur after another " +
+                        "~2 billion sends; plan a re-handshake before the gateway's " +
+                        "replay-window dedup begins observing duplicate sequences.");
+                }
+            }
+
+            var packet = new byte[PacketProtocol.HEADER_SIZE + payloadLength];
+
+            // [0..1] magic (LE u16 = 0x5254)
+            packet[0] = (byte)(PacketProtocol.MAGIC & 0xFF);
+            packet[1] = (byte)(PacketProtocol.MAGIC >> 8);
+
+            // [2] version
+            packet[2] = PacketProtocol.VERSION;
+
+            // [3] type
+            packet[3] = (byte)type;
+
+            // [4] flags
+            packet[4] = (byte)flags;
+
+            // [5..8] sequence (LE u32)
+            packet[5] = (byte)(seq);
+            packet[6] = (byte)(seq >> 8);
+            packet[7] = (byte)(seq >> 16);
+            packet[8] = (byte)(seq >> 24);
+
+            // [9..12] payload_len (LE u32)
+            uint payloadLen = (uint)payloadLength;
+            packet[9]  = (byte)(payloadLen);
+            packet[10] = (byte)(payloadLen >> 8);
+            packet[11] = (byte)(payloadLen >> 16);
+            packet[12] = (byte)(payloadLen >> 24);
+
+            // Payload
+            if (payloadLength > 0)
+                Buffer.BlockCopy(payload, 0, packet, PacketProtocol.HEADER_SIZE, payloadLength);
+
+            return packet;
+        }
+
+        /// <summary>
+        /// Enforce that <paramref name="payloadLength"/> can be wrapped in
+        /// header + AEAD overhead and still fit one transport datagram.
+        /// Throws <see cref="ArgumentException"/> when the payload exceeds
+        /// <see cref="MaxApplicationPayloadBytes"/>.
+        /// </summary>
+        /// <remarks>
+        /// Public for unit-test introspection and for callers that want to
+        /// pre-validate before constructing a payload buffer.  The check is
+        /// embedded in <see cref="Build"/> so every builder consumer benefits
+        /// without an extra call.
+        /// </remarks>
+        public static void EnsureFitsInDatagram(int payloadLength)
+        {
+            if (payloadLength < 0)
+                throw new ArgumentOutOfRangeException(nameof(payloadLength),
+                    "payloadLength must be non-negative.");
+            if (payloadLength > MaxApplicationPayloadBytes)
+                throw new ArgumentException(
+                    $"payload length {payloadLength} exceeds " +
+                    $"PacketBuilder.MaxApplicationPayloadBytes ({MaxApplicationPayloadBytes}). " +
+                    "Fragment the message at the application layer; do not rely on IP fragmentation.",
+                    nameof(payloadLength));
+        }
+    }
+}

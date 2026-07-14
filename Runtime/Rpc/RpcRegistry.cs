@@ -1,0 +1,440 @@
+// RTMPE SDK — Runtime/Rpc/RpcRegistry.cs
+//
+// Discovers [RtmpeRpc]-decorated methods by reflection and maps them to stable
+// wire method IDs using FNV-1a 32-bit hashing of "TypeName.MethodName".
+//
+// Design decisions:
+//  • Lazy per-type discovery: a type's methods are scanned on first access,
+//    not at app startup.  This avoids Assembly.GetTypes() over all loaded
+//    assemblies (expensive on IL2CPP) and eliminates ordering dependencies.
+//  • Thread safety: the _cache dictionary is guarded by a lock.  Unity main-
+//    thread callers (which is the only supported call site) never contend.
+//  • Collision guard: Validate(type) checks that none of the FNV-1a hashes
+//    collide with each other or with the reserved manual RpcMethodId constants.
+//    Call Validate() from NetworkBehaviour.OnNetworkSpawn to catch problems
+//    at object spawn time rather than at first RPC invocation.
+//  • Method name uniqueness: two [RtmpeRpc] methods with the same name on the
+//    same type produce a hash collision — Validate() treats that as a fatal
+//    configuration error (not an overload system).
+
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Text;
+using UnityEngine;
+
+namespace RTMPE.Rpc
+{
+    /// <summary>
+    /// Maps FNV-1a method IDs to <see cref="MethodInfo"/> entries for all
+    /// <see cref="RtmpeRpcAttribute"/>-decorated methods on a given type.
+    /// </summary>
+    public static class RpcRegistry
+    {
+        // ── FNV-1a 32-bit constants ────────────────────────────────────────────
+        private const uint FnvOffsetBasis = 2166136261u;
+        private const uint FnvPrime       = 16777619u;
+
+        // ── Reserved manual method IDs that FNV-1a hashes must not collide with
+        private static readonly HashSet<uint> ReservedIds = new HashSet<uint>
+        {
+            RpcMethodId.Ping,
+            RpcMethodId.TransferOwnership,
+            RpcMethodId.RequestDamage,
+            RpcMethodId.ApplyDamage,
+            RpcMethodId.GameStateChange,
+            RpcMethodId.SyncGameState,
+        };
+
+        // ── Per-type cache: Type → Dictionary<methodId, (MethodInfo, attr)> ──
+        private static readonly Dictionary<Type, Dictionary<uint, (MethodInfo Method, RtmpeRpcAttribute Attr)>> _cache
+            = new Dictionary<Type, Dictionary<uint, (MethodInfo Method, RtmpeRpcAttribute Attr)>>();
+
+        // Types whose [RtmpeRpc] table cannot be built (a reserved-id or intra-type
+        // collision that BuildMap rejects with a throw).  BuildMap only writes the
+        // success cache, so without this a collided type would re-run its whole
+        // reflection scan — and re-throw — on every OwnsMethod probe.  Recording it
+        // once bounds the failure to a single scan per type.
+        private static readonly HashSet<Type> _unmappable = new HashSet<Type>();
+
+        private static readonly object _lock = new object();
+
+        [UnityEngine.RuntimeInitializeOnLoadMethod(
+            UnityEngine.RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetCache()
+        {
+            lock (_lock) { _cache.Clear(); _unmappable.Clear(); }
+        }
+
+        // ── Public API ────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Compute the FNV-1a 32-bit hash of <c>"TypeName.MethodName"</c>.
+        /// This is the stable wire method ID used in Enhanced RPC packets.
+        /// </summary>
+        /// <remarks>
+        /// Hot path: invoked from <see cref="TryGetMethodId"/> on every RPC
+        /// send.  We hash the two strings in-place via FNV-1a's left-to-right
+        /// definition, so the implementation is allocation-free — no
+        /// "Type.Method" concatenation, no UTF-8 byte buffer.  ASCII method
+        /// names hash identically to the previous Encoding.UTF8.GetBytes path
+        /// because every char ≤ 0x7F encodes to a single matching byte.
+        /// </remarks>
+        public static uint ComputeMethodId(string typeName, string methodName)
+        {
+            uint hash = FnvOffsetBasis;
+            hash = HashUtf8(hash, typeName);
+            hash = (hash ^ (byte)'.') * FnvPrime;
+            hash = HashUtf8(hash, methodName);
+            return hash;
+        }
+
+        // Folds <paramref name="s"/>'s UTF-8 byte sequence into FNV-1a without
+        // materialising an intermediate byte[].  ASCII chars (the only ones a
+        // valid C# identifier can contain) hash byte-for-byte identically to
+        // Encoding.UTF8.GetBytes, preserving every previously-issued method ID.
+        private static uint HashUtf8(uint hash, string s)
+        {
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c < 0x80)
+                {
+                    hash = (hash ^ c) * FnvPrime;
+                }
+                else if (c < 0x800)
+                {
+                    hash = (hash ^ (uint)(0xC0 | (c >> 6))) * FnvPrime;
+                    hash = (hash ^ (uint)(0x80 | (c & 0x3F))) * FnvPrime;
+                }
+                else if (!char.IsSurrogate(c))
+                {
+                    hash = (hash ^ (uint)(0xE0 | (c >> 12))) * FnvPrime;
+                    hash = (hash ^ (uint)(0x80 | ((c >> 6) & 0x3F))) * FnvPrime;
+                    hash = (hash ^ (uint)(0x80 | (c & 0x3F))) * FnvPrime;
+                }
+                else if (char.IsHighSurrogate(c) && i + 1 < s.Length && char.IsLowSurrogate(s[i + 1]))
+                {
+                    int cp = char.ConvertToUtf32(c, s[i + 1]);
+                    i++;
+                    hash = (hash ^ (uint)(0xF0 | (cp >> 18))) * FnvPrime;
+                    hash = (hash ^ (uint)(0x80 | ((cp >> 12) & 0x3F))) * FnvPrime;
+                    hash = (hash ^ (uint)(0x80 | ((cp >> 6) & 0x3F))) * FnvPrime;
+                    hash = (hash ^ (uint)(0x80 | (cp & 0x3F))) * FnvPrime;
+                }
+                else
+                {
+                    // Lone surrogate — encode as U+FFFD replacement char to match
+                    // Encoding.UTF8 fallback behaviour (3-byte sequence).
+                    hash = (hash ^ 0xEFu) * FnvPrime;
+                    hash = (hash ^ 0xBFu) * FnvPrime;
+                    hash = (hash ^ 0xBDu) * FnvPrime;
+                }
+            }
+            return hash;
+        }
+
+        /// <summary>
+        /// Look up the <see cref="MethodInfo"/> for <paramref name="methodId"/> on
+        /// <paramref name="type"/>, together with its <see cref="RtmpeRpcAttribute"/>.
+        /// Returns <see langword="false"/> when the type has no [RtmpeRpc] method
+        /// with that ID.
+        /// </summary>
+        public static bool TryFindMethod(
+            Type type,
+            uint methodId,
+            out MethodInfo method,
+            out RtmpeRpcAttribute attr)
+        {
+            var map = GetOrBuild(type);
+            if (map.TryGetValue(methodId, out var entry))
+            {
+                method = entry.Method;
+                attr   = entry.Attr;
+                return true;
+            }
+
+            method = null;
+            attr   = null;
+            return false;
+        }
+
+        /// <summary>
+        /// Resolve which of <paramref name="candidateTypes"/> declares the
+        /// [RtmpeRpc] method identified by <paramref name="methodId"/>, so an
+        /// inbound Enhanced RPC can reach a method that lives on any
+        /// NetworkBehaviour of the addressed object — not only the routing anchor.
+        ///
+        /// <para>The anchor (<paramref name="anchorIndex"/>) takes precedence:
+        /// when it owns the id, its index is returned unconditionally, leaving the
+        /// anchor-owned case byte-identical to pre-resolution behaviour.  Otherwise
+        /// the remaining candidates are scanned — a single owner resolves to its
+        /// index, while two or more owners (a short-name/FNV collision the wire
+        /// cannot disambiguate, since <see cref="ComputeMethodId"/> keys on the
+        /// unqualified type name) resolve to <see langword="false"/> so the caller
+        /// falls back to the anchor rather than dispatch to an arbitrary
+        /// component.</para>
+        ///
+        /// <para>Null candidates are skipped.  A candidate whose [RtmpeRpc] table
+        /// cannot be built — a reserved-id or intra-type collision that
+        /// <c>BuildMap</c> rejects with a throw — is treated as non-owning rather
+        /// than allowed to propagate out of the dispatch path.</para>
+        /// </summary>
+        /// <param name="candidateTypes">
+        /// The component types on the addressed object, in caller order.
+        /// </param>
+        /// <param name="anchorIndex">
+        /// Index of the routing anchor within <paramref name="candidateTypes"/>,
+        /// or a negative value when the anchor is absent from the list.
+        /// </param>
+        /// <param name="methodId">The FNV-1a id to resolve.</param>
+        /// <param name="index">The resolved owner's index, or -1 when none.</param>
+        /// <returns>
+        /// <see langword="true"/> with a unique owner's index; <see langword="false"/>
+        /// (index -1) when no candidate owns the id or when the id is ambiguous.
+        /// </returns>
+        public static bool TryResolveOwningType(
+            IReadOnlyList<Type> candidateTypes, int anchorIndex, uint methodId, out int index)
+        {
+            index = -1;
+            if (candidateTypes == null) return false;
+
+            // Anchor precedence: the registered routing component wins outright,
+            // so an id it owns never triggers the ambiguity scan below.
+            if (anchorIndex >= 0 && anchorIndex < candidateTypes.Count
+                && OwnsMethod(candidateTypes[anchorIndex], methodId))
+            {
+                index = anchorIndex;
+                return true;
+            }
+
+            for (int i = 0; i < candidateTypes.Count; i++)
+            {
+                if (i == anchorIndex || !OwnsMethod(candidateTypes[i], methodId)) continue;
+                if (index >= 0)
+                {
+                    // A second owner — the id maps to more than one component and
+                    // the wire cannot say which. Refuse rather than guess.
+                    index = -1;
+                    return false;
+                }
+                index = i;
+            }
+            return index >= 0;
+        }
+
+        /// <summary>
+        /// Whether <paramref name="type"/> declares an [RtmpeRpc] method with
+        /// <paramref name="methodId"/>, absorbing the collision throw a malformed
+        /// type would otherwise raise from <see cref="TryFindMethod"/> — a type the
+        /// registry refuses to map cannot own a dispatchable id.
+        /// </summary>
+        private static bool OwnsMethod(Type type, uint methodId)
+        {
+            if (type == null) return false;
+
+            // A type already known to be unmappable can own no dispatchable id, and
+            // re-probing it would re-run BuildMap's reflection scan and re-throw on
+            // every packet — short-circuit before touching the registry.
+            lock (_lock)
+            {
+                if (_unmappable.Contains(type)) return false;
+            }
+
+            try
+            {
+                return TryFindMethod(type, methodId, out _, out _);
+            }
+            catch (InvalidOperationException)
+            {
+                lock (_lock) { _unmappable.Add(type); }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Look up the wire method ID for a named [RtmpeRpc] method on
+        /// <paramref name="type"/>.
+        /// Returns <see langword="false"/> when no such method is registered
+        /// (wrong name or missing attribute).
+        /// </summary>
+        public static bool TryGetMethodId(Type type, string methodName, out uint methodId)
+        {
+            methodId = ComputeMethodId(type.Name, methodName);
+            var map  = GetOrBuild(type);
+            return map.ContainsKey(methodId);
+        }
+
+        /// <summary>
+        /// Validate all [RtmpeRpc] methods on <paramref name="type"/> for hash
+        /// collisions with reserved IDs or with each other.  Called automatically
+        /// from <c>NetworkBehaviour.OnNetworkSpawn</c> for early error detection.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when one or more [RtmpeRpc] methods on <paramref name="type"/>
+        /// produce an FNV-1a hash that collides with a reserved
+        /// <see cref="RpcMethodId"/> constant or with another method on the same
+        /// type.  The exception message lists every conflicting method so the
+        /// developer can rename them in a single pass.
+        /// </exception>
+        public static void Validate(Type type)
+        {
+            if (type == null) throw new ArgumentNullException(nameof(type));
+            var collisions = CollectCollisions(type);
+            if (collisions.Count == 0) return;
+
+            var sb = new StringBuilder();
+            sb.Append("[RTMPE] RpcRegistry.Validate: ");
+            sb.Append(collisions.Count);
+            sb.Append(" RPC method ID collision(s) detected on type '");
+            sb.Append(type.Name);
+            sb.Append("':");
+            foreach (var c in collisions)
+            {
+                sb.Append("\n  • ");
+                sb.Append(c);
+            }
+            sb.Append("\nRename the conflicting [RtmpeRpc] methods to resolve.");
+            throw new InvalidOperationException(sb.ToString());
+        }
+
+        // ── Private helpers ───────────────────────────────────────────────────
+
+        private static Dictionary<uint, (MethodInfo Method, RtmpeRpcAttribute Attr)> GetOrBuild(Type type)
+        {
+            lock (_lock)
+            {
+                if (_cache.TryGetValue(type, out var existing))
+                    return existing;
+
+                var map = BuildMap(type);
+                _cache[type] = map;
+                return map;
+            }
+        }
+
+        private static Dictionary<uint, (MethodInfo Method, RtmpeRpcAttribute Attr)> BuildMap(Type type)
+        {
+            var map = new Dictionary<uint, (MethodInfo Method, RtmpeRpcAttribute Attr)>();
+
+            // Scan public instance methods INCLUDING those inherited from
+            // base classes.  The hash key is `ComputeMethodId(type.Name,
+            // method.Name)` — keyed on the runtime type's name, not the
+            // declaring type — so a [RtmpeRpc] method declared on a base
+            // class participates in dispatch under the runtime subtype's
+            // hash on both sides of the wire.  Without inheritance, a
+            // common OO pattern (BasePlayer : NetworkBehaviour declaring
+            // a shared `[RtmpeRpc] Damage(int)` that subclasses inherit)
+            // would silently fail at dispatch time on every Subclass
+            // instance.  C#'s method-resolution rules handle override /
+            // shadow correctly: GetMethods returns the most-derived
+            // implementation for virtual methods, and shadowed methods
+            // surface as the derived-type's declaration — which is the
+            // intended dispatch target in both cases.
+            var methods = type.GetMethods(
+                BindingFlags.Instance |
+                BindingFlags.Public);
+
+            foreach (var mi in methods)
+            {
+                // inherit: true is a defensive default only: [RtmpeRpc] is
+                // declared Inherited=false, so an override that drops the
+                // attribute is intentionally not dispatched — a method registers
+                // only when it carries the attribute on its own declaration.
+                var attr = mi.GetCustomAttribute<RtmpeRpcAttribute>(inherit: true);
+                if (attr == null) continue;
+
+                uint id = ComputeMethodId(type.Name, mi.Name);
+
+                // Check against reserved manual IDs.
+                if (ReservedIds.Contains(id))
+                {
+                    // Hard-throw: a reserved-id collision means the SDK
+                    // cannot dispatch this method without overlapping a
+                    // built-in.  Silently dropping the entry would let the
+                    // caller invoke the method and never see it fire.  The
+                    // SDK refuses to start until the developer renames it.
+                    throw new InvalidOperationException(
+                        $"[RTMPE] RpcRegistry: method '{type.Name}.{mi.Name}' produces FNV-1a " +
+                        $"hash 0x{id:X8} which collides with a reserved RpcMethodId. " +
+                        "Rename the method to resolve the collision.");
+                }
+
+                // Check for intra-type collision (same type, two methods hash to same ID).
+                if (map.TryGetValue(id, out var existing))
+                {
+                    // Object's `Equals` / `GetHashCode` / `ToString` /
+                    // `MemberwiseClone` etc. are inherited by every type —
+                    // they do not carry [RtmpeRpc] so they never reach
+                    // here.  Any duplicate at this point is therefore a
+                    // genuine same-name [RtmpeRpc] definition (e.g. an
+                    // overload) which is unsupported by the FNV-keyed
+                    // dispatch table.  Hard-throw so the developer cannot
+                    // ship a binary in which one of the two collided
+                    // methods would silently never dispatch.
+                    throw new InvalidOperationException(
+                        $"[RTMPE] RpcRegistry: method '{type.Name}.{mi.Name}' has FNV-1a " +
+                        $"hash 0x{id:X8} that collides with [RtmpeRpc] method " +
+                        $"'{type.Name}.{existing.Method.Name}' on the same type. " +
+                        "Rename one of the methods to resolve the collision.");
+                }
+
+                map[id] = (mi, attr);
+            }
+
+            return map;
+        }
+
+        /// <summary>
+        /// Re-scans <paramref name="type"/> from scratch (independent of the
+        /// per-type cache built by <see cref="BuildMap"/>) and returns the list
+        /// of collision descriptions.  Empty list ⇒ no collisions.
+        /// </summary>
+        /// <remarks>
+        /// We deliberately do NOT consult <see cref="GetOrBuild"/> here:
+        /// <see cref="BuildMap"/> drops collided methods and only logs them, so
+        /// the cached map is not authoritative for collision detection.
+        /// Re-scanning is O(methods) and runs once per type at first
+        /// <see cref="OnNetworkSpawn"/> — negligible.
+        /// </remarks>
+        private static List<string> CollectCollisions(Type type)
+        {
+            var collisions = new List<string>();
+            var seen       = new Dictionary<uint, string>();
+
+            // Match BuildMap's discovery scope so the validator and the
+            // dispatch path see the same set of [RtmpeRpc] methods.
+            // Inherited [RtmpeRpc] attributes participate in dispatch and
+            // therefore must participate in collision validation too.
+            var methods = type.GetMethods(
+                BindingFlags.Instance |
+                BindingFlags.Public);
+
+            foreach (var mi in methods)
+            {
+                var attr = mi.GetCustomAttribute<RtmpeRpcAttribute>(inherit: true);
+                if (attr == null) continue;
+
+                uint id = ComputeMethodId(type.Name, mi.Name);
+
+                if (ReservedIds.Contains(id))
+                {
+                    collisions.Add(
+                        $"'{type.Name}.{mi.Name}' (FNV-1a 0x{id:X8}) collides with reserved RpcMethodId");
+                    continue;
+                }
+
+                if (seen.TryGetValue(id, out var prior))
+                {
+                    collisions.Add(
+                        $"'{type.Name}.{mi.Name}' (FNV-1a 0x{id:X8}) collides with prior '{prior}'");
+                    continue;
+                }
+
+                seen[id] = mi.Name;
+            }
+
+            return collisions;
+        }
+    }
+}

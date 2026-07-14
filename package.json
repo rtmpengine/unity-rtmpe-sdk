@@ -1,0 +1,30 @@
+{
+    "name": "com.rtmpe.sdk",
+    "version": "1.9.7",
+    "displayName": "RTMPE SDK",
+    "description": "Real-Time Multiplayer Engine — Unity client SDK for converting single-player games to multiplayer in under 15 minutes.",
+    "license": "MIT",
+    "unity": "6000.0",
+    "documentationUrl": "https://github.com/rtmpengine/unity-rtmpe-sdk/blob/main/Documentation~/index.md",
+    "licensesUrl": "https://github.com/rtmpengine/unity-rtmpe-sdk/blob/main/LICENSE.md",
+    "keywords": [
+        "multiplayer",
+        "networking",
+        "realtime",
+        "kcp",
+        "udp",
+        "flatbuffers"
+    ],
+    "author": {
+        "name": "RTMPE",
+        "url": "https://github.com/rtmpengine"
+    },
+    "dependencies": {},
+    "samples": [
+        {
+            "displayName": "Basic Connection",
+            "description": "Demonstrates connecting to the RTMPE server, handling connection events, and graceful disconnect.",
+            "path": "Samples~/BasicConnection"
+        }
+    ]
+}

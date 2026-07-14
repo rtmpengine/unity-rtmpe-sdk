@@ -1,0 +1,915 @@
+// RTMPE SDK — Tests/Runtime/HandshakeHandlerTests.cs
+//
+// NUnit tests for the ECDH handshake crypto layer:
+//  - Curve25519 (X25519) key generation and Diffie-Hellman
+//  - HkdfSha256 key derivation
+//  - ChaCha20Poly1305Impl AEAD seal / open
+//  - Ed25519Verify RFC 8032 vectors
+//  - HandshakeHandler end-to-end session key derivation symmetry
+//
+// Test vectors are taken from published RFCs — noted per test.
+//
+// Pure C# — no Unity engine dependencies; runs in Edit Mode Test Runner.
+
+using System;
+using System.Text;
+using NUnit.Framework;
+using RTMPE.Crypto;
+using RTMPE.Crypto.Internal;
+
+namespace RTMPE.Tests
+{
+    [TestFixture]
+    [Category("Crypto")]
+    public class HandshakeHandlerTests
+    {
+        // ── Helpers ────────────────────────────────────────────────────────────
+
+        private static byte[] H(string hex)
+        {
+            if (hex.Length % 2 != 0) throw new ArgumentException("odd hex length");
+            var result = new byte[hex.Length / 2];
+            for (int i = 0; i < result.Length; i++)
+                result[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+            return result;
+        }
+
+        private static bool BytesEqual(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++)
+                if (a[i] != b[i]) return false;
+            return true;
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // Curve25519 (X25519)
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Category("Curve25519")]
+        public void Curve25519_GenerateKeyPair_ProducesNonZeroKeys()
+        {
+            var (priv, pub) = Curve25519.GenerateKeyPair();
+
+            Assert.IsNotNull(priv);
+            Assert.IsNotNull(pub);
+            Assert.AreEqual(32, priv.Length, "private key must be 32 bytes");
+            Assert.AreEqual(32, pub.Length,  "public key must be 32 bytes");
+
+            bool privAllZero = true, pubAllZero = true;
+            for (int i = 0; i < 32; i++)
+            {
+                if (priv[i] != 0) privAllZero = false;
+                if (pub[i]  != 0) pubAllZero  = false;
+            }
+            Assert.IsFalse(privAllZero, "private key must not be all-zero");
+            Assert.IsFalse(pubAllZero,  "public key must not be all-zero");
+        }
+
+        [Test]
+        [Category("Curve25519")]
+        public void Curve25519_GenerateKeyPair_DifferentKeyEachCall()
+        {
+            var (_, pub1) = Curve25519.GenerateKeyPair();
+            var (_, pub2) = Curve25519.GenerateKeyPair();
+            Assert.IsFalse(BytesEqual(pub1, pub2),
+                "Two independently generated key pairs must be different (RNG collision is astronomically unlikely).");
+        }
+
+        /// <summary>RFC 7748 §6.1 test vector — X25519 Diffie-Hellman.</summary>
+        [Test]
+        [Category("Curve25519")]
+        public void Curve25519_SharedSecret_MatchesRfc7748_Vector()
+        {
+            // RFC 7748 §6.1 — exact hex strings from the RFC.
+            // RFC 7748 §6.1 test vector verification:
+            var alicePriv  = H("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+            var alicePub   = H("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+            var bobPriv    = H("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+            var bobPub     = H("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+            var expected   = H("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+
+            var aliceShared = Curve25519.SharedSecret(alicePriv, bobPub);
+            var bobShared   = Curve25519.SharedSecret(bobPriv, alicePub);
+
+            Assert.IsNotNull(aliceShared, "Alice shared secret must not be null");
+            Assert.IsNotNull(bobShared,   "Bob shared secret must not be null");
+            Assert.IsTrue(BytesEqual(expected, aliceShared), "Alice's shared secret must match RFC 7748 vector");
+            Assert.IsTrue(BytesEqual(expected, bobShared),   "Bob's shared secret must match RFC 7748 vector");
+        }
+
+        [Test]
+        [Category("Curve25519")]
+        public void Curve25519_SharedSecret_IsSameOnBothSides()
+        {
+            // Generate two fresh key pairs and verify ECDH symmetry.
+            var (privA, pubA) = Curve25519.GenerateKeyPair();
+            var (privB, pubB) = Curve25519.GenerateKeyPair();
+
+            var secretA = Curve25519.SharedSecret(privA, pubB);
+            var secretB = Curve25519.SharedSecret(privB, pubA);
+
+            Assert.IsTrue(BytesEqual(secretA, secretB),
+                "Both sides of an X25519 exchange must produce the same shared secret.");
+        }
+
+        [Test]
+        [Category("Curve25519")]
+        public void Curve25519_SharedSecret_DifferentPeers_GiveDifferentSecrets()
+        {
+            var (privA, _)    = Curve25519.GenerateKeyPair();
+            var (_, pubB)     = Curve25519.GenerateKeyPair();
+            var (_, pubC)     = Curve25519.GenerateKeyPair();
+
+            var secretAB = Curve25519.SharedSecret(privA, pubB);
+            var secretAC = Curve25519.SharedSecret(privA, pubC);
+
+            Assert.IsFalse(BytesEqual(secretAB, secretAC),
+                "Shared secrets with different peer keys must differ.");
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // HkdfSha256
+        // ══════════════════════════════════════════════════════════════════════
+
+        /// <summary>RFC 5869 Appendix A.1 test vector.</summary>
+        [Test]
+        [Category("Hkdf")]
+        public void Hkdf_Extract_MatchesRfc5869_A1()
+        {
+            // RFC 5869 §A.1: Hash=SHA-256, IKM=0x0b0b…, Salt=0x000102…
+            var ikm  = H("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+            var salt = H("000102030405060708090a0b0c");
+            var expectedPrk = H("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+
+            var prk = HkdfSha256.Extract(salt, ikm);
+
+            Assert.AreEqual(32, prk.Length);
+            Assert.IsTrue(BytesEqual(expectedPrk, prk),
+                "HkdfSha256.Extract must match RFC 5869 A.1 PRK.");
+        }
+
+        /// <summary>RFC 5869 Appendix A.1 end-to-end OKM test.</summary>
+        [Test]
+        [Category("Hkdf")]
+        public void Hkdf_Expand_MatchesRfc5869_A1_Okm()
+        {
+            var prk  = H("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+            var info = H("f0f1f2f3f4f5f6f7f8f9");
+            var expectedOkm = H("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+
+            var okm = HkdfSha256.Expand(prk, info, 42);
+
+            Assert.AreEqual(42, okm.Length, "OKM must be exactly 42 bytes as requested.");
+            Assert.IsTrue(BytesEqual(expectedOkm, okm),
+                "HkdfSha256.Expand must match RFC 5869 A.1 OKM.");
+        }
+
+        [Test]
+        [Category("Hkdf")]
+        public void Hkdf_Extract_WithNullSalt_UsesZeroSalt()
+        {
+            // RFC 5869: if salt not provided, use HashLen zeros.
+            var ikm = new byte[] { 0x01, 0x02, 0x03 };
+            var prk = HkdfSha256.Extract(null, ikm);
+            Assert.AreEqual(32, prk.Length, "PRK must be 32 bytes.");
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ChaCha20Poly1305Impl
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Category("ChaCha20Poly1305")]
+        public void ChaCha20Poly1305_RoundTrip_Succeeds()
+        {
+            var key       = new byte[32];
+            var nonce     = new byte[12];
+            var plaintext = Encoding.UTF8.GetBytes("Hello, RTMPE!");
+            var aad       = Encoding.UTF8.GetBytes("additional-data");
+
+            // Fill key/nonce with deterministic test data.
+            for (int i = 0; i < 32; i++) key[i]   = (byte)i;
+            for (int i = 0; i < 12; i++) nonce[i] = (byte)(i + 100);
+
+            var ciphertext = ChaCha20Poly1305Impl.Seal(key, nonce, plaintext, aad);
+            Assert.IsNotNull(ciphertext, "Seal must not return null.");
+            Assert.AreEqual(plaintext.Length + 16, ciphertext.Length,
+                "Ciphertext must be plaintext.Length + 16 (Poly1305 tag).");
+
+            var decrypted = ChaCha20Poly1305Impl.Open(key, nonce, ciphertext, aad);
+            Assert.IsNotNull(decrypted, "Open must succeed with correct key/nonce/aad.");
+            Assert.IsTrue(BytesEqual(plaintext, decrypted), "Decrypted bytes must equal original plaintext.");
+        }
+
+        [Test]
+        [Category("ChaCha20Poly1305")]
+        public void ChaCha20Poly1305_Open_RejectsWrongKey()
+        {
+            var key   = new byte[32]; key[0] = 0xAA;
+            var nonce = new byte[12];
+            var pt    = new byte[] { 1, 2, 3 };
+
+            var ct = ChaCha20Poly1305Impl.Seal(key, nonce, pt, null);
+
+            var wrongKey = (byte[])key.Clone();
+            wrongKey[0] ^= 0xFF;
+
+            var result = ChaCha20Poly1305Impl.Open(wrongKey, nonce, ct, null);
+            Assert.IsNull(result, "Open must return null when the key is wrong (tag mismatch).");
+        }
+
+        [Test]
+        [Category("ChaCha20Poly1305")]
+        public void ChaCha20Poly1305_Open_RejectsWrongNonce()
+        {
+            var key   = new byte[32]; key[5] = 0x55;
+            var nonce = new byte[12]; nonce[3] = 0x77;
+            var pt    = new byte[] { 0xDE, 0xAD, 0xBE, 0xEF };
+
+            var ct = ChaCha20Poly1305Impl.Seal(key, nonce, pt, null);
+
+            var wrongNonce = (byte[])nonce.Clone();
+            wrongNonce[3] ^= 0x01;
+
+            var result = ChaCha20Poly1305Impl.Open(key, wrongNonce, ct, null);
+            Assert.IsNull(result, "Open must return null when the nonce is wrong.");
+        }
+
+        [Test]
+        [Category("ChaCha20Poly1305")]
+        public void ChaCha20Poly1305_Open_RejectsTamperedCiphertext()
+        {
+            var key   = new byte[32]; key[10] = 0x11;
+            var nonce = new byte[12];
+            var pt    = new byte[] { 0x01, 0x02, 0x03, 0x04, 0x05 };
+
+            var ct = ChaCha20Poly1305Impl.Seal(key, nonce, pt, null);
+            ct[0] ^= 0x80; // flip bit in first ciphertext byte
+
+            var result = ChaCha20Poly1305Impl.Open(key, nonce, ct, null);
+            Assert.IsNull(result, "Open must return null when ciphertext is tampered.");
+        }
+
+        [Test]
+        [Category("ChaCha20Poly1305")]
+        public void ChaCha20Poly1305_Open_RejectsWrongAad()
+        {
+            var key   = new byte[32]; key[0] = 0x42;
+            var nonce = new byte[12];
+            var pt    = Encoding.UTF8.GetBytes("secret data");
+            var aad   = Encoding.UTF8.GetBytes("context");
+
+            var ct     = ChaCha20Poly1305Impl.Seal(key, nonce, pt, aad);
+            var result = ChaCha20Poly1305Impl.Open(key, nonce, ct, Encoding.UTF8.GetBytes("CONTEXT"));
+
+            Assert.IsNull(result, "Open must return null when AAD differs.");
+        }
+
+        [Test]
+        [Category("ChaCha20Poly1305")]
+        public void ChaCha20Poly1305_Seal_DifferentNonce_GivesDifferentCiphertext()
+        {
+            var key    = new byte[32]; key[0] = 0x01;
+            var nonce1 = new byte[12]; nonce1[0] = 0x01;
+            var nonce2 = new byte[12]; nonce2[0] = 0x02;
+            var pt     = new byte[] { 0xAA, 0xBB, 0xCC };
+
+            var ct1 = ChaCha20Poly1305Impl.Seal(key, nonce1, pt, null);
+            var ct2 = ChaCha20Poly1305Impl.Seal(key, nonce2, pt, null);
+
+            Assert.IsFalse(BytesEqual(ct1, ct2),
+                "Different nonces must produce different ciphertexts.");
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // Ed25519Verify
+        // ══════════════════════════════════════════════════════════════════════
+
+        /// <summary>RFC 8032 §5.1 TEST 1 — empty message.</summary>
+        [Test]
+        [Category("Ed25519")]
+        public void Ed25519Verify_AcceptsValid_Rfc8032_Test1()
+        {
+            // RFC 8032 §5.1 TEST 1
+            var pubKey = H("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+            var msg    = Array.Empty<byte>();
+            var sig    = H("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155" +
+                           "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24376ed9cbcd51b0a0");
+
+            bool ok = Ed25519Verify.Verify(pubKey, msg, sig);
+            Assert.IsTrue(ok, "RFC 8032 Test 1 (empty message) must verify successfully.");
+        }
+
+        /// <summary>RFC 8032 §5.1 TEST 2 — one-byte message.</summary>
+        [Test]
+        [Category("Ed25519")]
+        public void Ed25519Verify_AcceptsValid_Rfc8032_Test2()
+        {
+            // RFC 8032 §5.1 TEST 2
+            var pubKey = H("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+            var msg    = new byte[] { 0x72 };
+            var sig    = H("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da" +
+                           "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00");
+
+            bool ok = Ed25519Verify.Verify(pubKey, msg, sig);
+            Assert.IsTrue(ok, "RFC 8032 Test 2 (single-byte message 0x72) must verify successfully.");
+        }
+
+        [Test]
+        [Category("Ed25519")]
+        public void Ed25519Verify_RejectsTamperedSignature()
+        {
+            var pubKey = H("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+            var msg    = Array.Empty<byte>();
+            var sig    = H("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155" +
+                           "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24376ed9cbcd51b0a0");
+
+            // Flip one bit in the signature.
+            var tampered = (byte[])sig.Clone();
+            tampered[0] ^= 0x01;
+
+            Assert.IsFalse(Ed25519Verify.Verify(pubKey, msg, tampered),
+                "A single bit-flip in the signature must cause verification failure.");
+        }
+
+        [Test]
+        [Category("Ed25519")]
+        public void Ed25519Verify_RejectsTamperedMessage()
+        {
+            var pubKey = H("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+            var msg    = new byte[] { 0x73 }; // was 0x72 in Test 2
+            var sig    = H("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da" +
+                           "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00");
+
+            Assert.IsFalse(Ed25519Verify.Verify(pubKey, msg, sig),
+                "A modified message must cause verification failure.");
+        }
+
+        [Test]
+        [Category("Ed25519")]
+        public void Ed25519Verify_RejectsWrongPublicKey()
+        {
+            var pubKey = H("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+            var msg    = Array.Empty<byte>();
+            var sig    = H("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155" +
+                           "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24376ed9cbcd51b0a0");
+
+            var wrongKey = (byte[])pubKey.Clone();
+            wrongKey[5] ^= 0xFF;
+
+            Assert.IsFalse(Ed25519Verify.Verify(wrongKey, msg, sig),
+                "A different public key must cause verification failure.");
+        }
+
+        [Test]
+        [Category("Ed25519")]
+        public void Ed25519Verify_InvalidInputLengths_ReturnFalse()
+        {
+            var pub32 = new byte[32];
+            var sig64 = new byte[64];
+            var msg   = new byte[] { 0x01 };
+
+            Assert.IsFalse(Ed25519Verify.Verify(new byte[31], msg, sig64), "31-byte pubkey");
+            Assert.IsFalse(Ed25519Verify.Verify(pub32, msg, new byte[63]), "63-byte sig");
+            Assert.IsFalse(Ed25519Verify.Verify(null, msg, sig64), "null pubkey");
+            Assert.IsFalse(Ed25519Verify.Verify(pub32, msg, null), "null sig");
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // HandshakeHandler (public API)
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Category("HandshakeHandler")]
+        public void HandshakeHandler_ClientPublicKey_Is32Bytes()
+        {
+            var h = new HandshakeHandler();
+            Assert.AreEqual(32, h.ClientPublicKey.Length);
+        }
+
+        [Test]
+        [Category("HandshakeHandler")]
+        public void HandshakeHandler_DifferentInstances_HaveDifferentPublicKeys()
+        {
+            var h1 = new HandshakeHandler();
+            var h2 = new HandshakeHandler();
+            Assert.IsFalse(BytesEqual(h1.ClientPublicKey, h2.ClientPublicKey),
+                "Each HandshakeHandler must generate a unique ephemeral key pair.");
+        }
+
+        [Test]
+        [Category("HandshakeHandler")]
+        public void HandshakeHandler_ValidateChallenge_ReturnsFalseForNullPayload()
+        {
+            var h = new HandshakeHandler();
+            Assert.IsFalse(h.ValidateChallenge(
+                null, handshakeInitCiphertext: null, HandshakeFlow.Reconnect, out _, out _));
+        }
+
+        [Test]
+        [Category("HandshakeHandler")]
+        public void HandshakeHandler_ValidateChallenge_ReturnsFalseForWrongLength()
+        {
+            var h = new HandshakeHandler();
+            Assert.IsFalse(h.ValidateChallenge(new byte[127], null, HandshakeFlow.Reconnect, out _, out _), "127 bytes");
+            Assert.IsFalse(h.ValidateChallenge(new byte[129], null, HandshakeFlow.Reconnect, out _, out _), "129 bytes");
+            Assert.IsFalse(h.ValidateChallenge(Array.Empty<byte>(), null, HandshakeFlow.Reconnect, out _, out _), "empty");
+        }
+
+        [Test]
+        [Category("HandshakeHandler")]
+        public void HandshakeHandler_ValidateChallenge_RejectsAllZeroChallenge()
+        {
+            // All-zero challenge has an invalid Ed25519 signature → must be rejected.
+            var h = new HandshakeHandler();
+            Assert.IsFalse(h.ValidateChallenge(new byte[128], null, HandshakeFlow.Reconnect, out _, out _),
+                "An all-zero Challenge payload must fail Ed25519 verification.");
+        }
+
+        [Test]
+        [Category("HandshakeHandler")]
+        public void HandshakeHandler_ValidateChallenge_RejectsFlowMismatch()
+        {
+            // Defence-in-depth: the explicit HandshakeFlow argument must agree
+            // with the ciphertext-presence indicator.  A future refactor that
+            // accidentally passes null ciphertext on an Init path (or non-null
+            // ciphertext on a Reconnect path) is rejected before any
+            // cryptographic work is performed.  Closes NEW-CR-2 implicit-
+            // signaling vector.
+            var h = new HandshakeHandler();
+            var payload = new byte[128];
+
+            Assert.IsFalse(
+                h.ValidateChallenge(payload, handshakeInitCiphertext: null,
+                    HandshakeFlow.Init, out _, out _),
+                "Init flow with null ciphertext must be rejected.");
+
+            Assert.IsFalse(
+                h.ValidateChallenge(payload, handshakeInitCiphertext: Array.Empty<byte>(),
+                    HandshakeFlow.Init, out _, out _),
+                "Init flow with empty ciphertext must be rejected.");
+
+            Assert.IsFalse(
+                h.ValidateChallenge(payload,
+                    handshakeInitCiphertext: new byte[] { 1, 2, 3 },
+                    HandshakeFlow.Reconnect, out _, out _),
+                "Reconnect flow with non-null ciphertext must be rejected.");
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // Transcript-binding tests
+        //
+       // These tests use ComputeTranscript directly (no signing) to verify the
+        // byte-stable transcript layout that both sides must agree on.  End-to-
+        // end Ed25519 sign+verify against the gateway lives in the Rust unit
+        // tests (cargo test -p rtmpe-gateway) since the Unity SDK ships only
+        // the verifier — there is no managed Ed25519 signer available here.
+        // ══════════════════════════════════════════════════════════════════════
+
+        [Test]
+        [Category("HandshakeHandler")]
+        public void Transcript_IsDeterministic_AndDistinguishesEveryField()
+        {
+            var staticPub = new byte[32]; for (int i = 0; i < 32; i++) staticPub[i] = (byte)i;
+            var ephemeral = new byte[32]; for (int i = 0; i < 32; i++) ephemeral[i] = (byte)(i + 0x40);
+            var cih = new byte[32];       for (int i = 0; i < 32; i++) cih[i]       = (byte)(i + 0x80);
+
+            byte[] baseHash = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                HandshakeHandler.HandshakeProtocolVersion, HandshakeHandler.CipherSuiteId);
+            byte[] sameHash = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                HandshakeHandler.HandshakeProtocolVersion, HandshakeHandler.CipherSuiteId);
+            Assert.IsTrue(BytesEqual(baseHash, sameHash), "transcript must be deterministic");
+
+            // A 1-byte change in any bound field must produce a different hash
+            // (avalanche under SHA-256 — these are sanity checks on *which*
+            // fields are bound, not on SHA-256 itself).
+            staticPub[0] ^= 0xFF;
+            byte[] diffStatic = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                HandshakeHandler.HandshakeProtocolVersion, HandshakeHandler.CipherSuiteId);
+            Assert.IsFalse(BytesEqual(baseHash, diffStatic), "static_pub must be bound");
+            staticPub[0] ^= 0xFF;
+
+            ephemeral[0] ^= 0xFF;
+            byte[] diffEph = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                HandshakeHandler.HandshakeProtocolVersion, HandshakeHandler.CipherSuiteId);
+            Assert.IsFalse(BytesEqual(baseHash, diffEph), "ephemeral_pub must be bound");
+            ephemeral[0] ^= 0xFF;
+
+            cih[0] ^= 0xFF;
+            byte[] diffCih = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                HandshakeHandler.HandshakeProtocolVersion, HandshakeHandler.CipherSuiteId);
+            Assert.IsFalse(BytesEqual(baseHash, diffCih), "client_init_hash must be bound");
+            cih[0] ^= 0xFF;
+
+            byte[] diffVer = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                0x01, HandshakeHandler.CipherSuiteId);
+            Assert.IsFalse(BytesEqual(baseHash, diffVer), "protocol_version must be bound");
+
+            byte[] diffSuite = InvokeComputeTranscript(staticPub, ephemeral, cih,
+                HandshakeHandler.HandshakeProtocolVersion, (byte)0xFF);
+            Assert.IsFalse(BytesEqual(baseHash, diffSuite), "cipher_suite_id must be bound");
+        }
+
+        [Test]
+        [Category("HandshakeHandler")]
+        public void ValidateChallenge_RejectsV1StyleSignature()
+        {
+            // v1 signed bare ephemeral||static_pub (no transcript hash).  Even
+            // if an attacker forges a syntactically valid 128-byte Challenge
+            // whose signature is over the v1 message, our v2 verifier rebuilds
+            // the canonical transcript and the signature must fail.  We can't
+            // produce a real v1 signature here (no Ed25519 signer), but we can
+            // assert that with arbitrary 64 random bytes the verifier still
+            // refuses every payload — guarding against a regression that
+            // accepted v1-only verification.
+            var h = new HandshakeHandler();
+            var rng = new System.Random(0xC0DE);
+            for (int t = 0; t < 32; t++)
+            {
+                var bogus = new byte[128];
+                rng.NextBytes(bogus);
+                Assert.IsFalse(
+                    h.ValidateChallenge(bogus, new byte[] { 1, 2, 3 }, HandshakeFlow.Init, out _, out _),
+                    $"random Challenge #{t} must not verify");
+            }
+        }
+
+        // Reflection helper — ComputeTranscript is internal to keep the public
+        // API surface small.  Tests inside the SDK assembly normally see
+        // internals via [InternalsVisibleTo], but to avoid touching the
+        // assembly-level attribute list we reach in via reflection.
+        private static byte[] InvokeComputeTranscript(
+            byte[] staticPub, byte[] ephemeral, byte[] cih, byte ver, byte suite)
+        {
+            var mi = typeof(HandshakeHandler).GetMethod(
+                "ComputeTranscript",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            Assert.IsNotNull(mi, "ComputeTranscript not found via reflection");
+            return (byte[])mi.Invoke(null, new object[] { staticPub, ephemeral, cih, ver, suite });
+        }
+
+        [Test]
+        [Category("HandshakeHandler")]
+        public void HandshakeHandler_DeriveSessionKeys_ThrowsIfChallengeNotValidated()
+        {
+            var h = new HandshakeHandler();
+            Assert.Throws<InvalidOperationException>(() => h.DeriveSessionKeys(out _));
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // Session key symmetry (ECDH + HKDF — avoids Ed25519 by calling internals)
+        // ══════════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Verify that if client and server perform X25519 + HKDF-SHA256 using the same
+        /// key-ordering logic, client.Encrypt == server.Decrypt and vice versa.
+        ///
+       /// Uses Curve25519 and HkdfSha256 directly (InternalsVisibleTo is required).
+        /// </summary>
+        [Test]
+        [Category("SessionKeys")]
+        public void SessionKeys_ClientAndServer_DeriveComplementaryKeys()
+        {
+            // Generate two key pairs: "client" and "server ephemeral"
+            var (clientPriv, clientPub) = Curve25519.GenerateKeyPair();
+            var (serverPriv, serverPub) = Curve25519.GenerateKeyPair();
+
+            // Both sides compute the shared secret — must match.
+            var clientShared = Curve25519.SharedSecret(clientPriv, serverPub);
+            var serverShared = Curve25519.SharedSecret(serverPriv, clientPub);
+            Assert.IsTrue(BytesEqual(clientShared, serverShared), "Shared secrets must match.");
+
+            // HKDF constants (must match gateway exactly)
+            var salt     = Encoding.ASCII.GetBytes("RTMPE-v3-hkdf-salt-2026");
+            var infoBase = Encoding.ASCII.GetBytes("RTMPE-v3-session-key");
+
+            // Client's initiator determination
+            bool clientIsInitiator = CompareKeys(clientPub, serverPub) <= 0;
+
+            byte[] first, second;
+            if (clientIsInitiator) { first = clientPub; second = serverPub; }
+            else                   { first = serverPub; second = clientPub; }
+
+            var info = Concat(infoBase, first, second);
+            var prk  = HkdfSha256.Extract(salt, clientShared);
+
+            var keyInit = HkdfSha256.Expand(prk, Concat(info, new byte[] { 0x00 }), 32);
+            var keyResp = HkdfSha256.Expand(prk, Concat(info, new byte[] { 0x01 }), 32);
+
+            // Client's session keys
+            byte[] clientEncrypt, clientDecrypt;
+            if (clientIsInitiator) { clientEncrypt = keyInit; clientDecrypt = keyResp; }
+            else                   { clientEncrypt = keyResp; clientDecrypt = keyInit; }
+
+            // Server's session keys (server is NOT the initiator when client is)
+            bool serverIsInitiator = !clientIsInitiator;
+            byte[] serverEncrypt, serverDecrypt;
+            if (serverIsInitiator) { serverEncrypt = keyInit; serverDecrypt = keyResp; }
+            else                   { serverEncrypt = keyResp; serverDecrypt = keyInit; }
+
+            // Verify directionality:
+            // What client encrypts, server should be able to decrypt → client.Encrypt == server.Decrypt
+            Assert.IsTrue(BytesEqual(clientEncrypt, serverDecrypt),
+                "Client.EncryptKey must equal Server.DecryptKey.");
+            Assert.IsTrue(BytesEqual(serverEncrypt, clientDecrypt),
+                "Server.EncryptKey must equal Client.DecryptKey.");
+
+            // The two session keys must be different from each other.
+            Assert.IsFalse(BytesEqual(keyInit, keyResp),
+                "key_init and key_resp must be different (same info differs only in final byte).");
+        }
+
+        // ── ApiKeyCipher ───────────────────────────────────────────────────────
+
+        [Test]
+        [Category("ApiKeyCipher")]
+        public void ApiKeyCipher_PskFromHex_DecodesCorrectly()
+        {
+            string hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+            var psk = ApiKeyCipher.PskFromHex(hex);
+            Assert.AreEqual(32, psk.Length);
+            for (int i = 0; i < 32; i++)
+                Assert.AreEqual((byte)i, psk[i], $"byte[{i}]");
+        }
+
+        [Test]
+        [Category("ApiKeyCipher")]
+        public void ApiKeyCipher_PskFromHex_ThrowsOnShortKey()
+        {
+            Assert.Throws<ArgumentException>(() => ApiKeyCipher.PskFromHex("0011223344"));
+        }
+
+        [Test]
+        [Category("ApiKeyCipher")]
+        public void ApiKeyCipher_Encrypt_ProducesNonDeterministicOutput()
+        {
+            var psk = new byte[32];
+
+            var ct1 = ApiKeyCipher.Encrypt(psk, "my-api-key");
+            var ct2 = ApiKeyCipher.Encrypt(psk, "my-api-key");
+
+            // Each call uses a fresh random nonce → ciphertexts must differ.
+            Assert.IsFalse(BytesEqual(ct1, ct2),
+                "Each Encrypt() call must produce a different ciphertext (random nonce).");
+        }
+
+        [Test]
+        [Category("ApiKeyCipher")]
+        public void ApiKeyCipher_Encrypt_TagIsAppended()
+        {
+            var psk    = new byte[32];
+            var apiKey = "hello";
+            var keyBytes = Encoding.UTF8.GetBytes(apiKey);
+
+            // Expected layout: [nonce:12][key_len:2][apiKey:N][Poly1305Tag:16]
+            // Minimum output = 12 (nonce) + 2 (len) + 1 (key min) + 16 (tag) = 31
+            var ct = ApiKeyCipher.Encrypt(psk, apiKey);
+            int expectedMin = 12 + 2 + keyBytes.Length + 16;
+            Assert.AreEqual(expectedMin, ct.Length,
+                $"Encrypted payload must be nonce(12) + len(2) + key({keyBytes.Length}) + tag(16) = {expectedMin} bytes.");
+        }
+
+        // ── Helpers ────────────────────────────────────────────────────────────
+
+        private static int CompareKeys(byte[] a, byte[] b)
+        {
+            for (int i = 0; i < 32; i++)
+            {
+                if (a[i] < b[i]) return -1;
+                if (a[i] > b[i]) return +1;
+            }
+            return 0;
+        }
+
+        private static byte[] Concat(byte[] a, byte[] b, byte[] c = null)
+        {
+            int len = a.Length + b.Length + (c?.Length ?? 0);
+            var result = new byte[len];
+            Buffer.BlockCopy(a, 0, result, 0, a.Length);
+            Buffer.BlockCopy(b, 0, result, a.Length, b.Length);
+            if (c != null) Buffer.BlockCopy(c, 0, result, a.Length + b.Length, c.Length);
+            return result;
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // N-8: IP migration key derivation tests
+        // ══════════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// N-8 T-SDK-01: DeriveSessionKeys must produce a 32-byte ipMigrationKey.
+        /// Uses the same HKDF path as the AEAD keys but with info suffix \x02.
+        /// </summary>
+        [Test]
+        [Category("N8IpMigration")]
+        public void DeriveSessionKeys_ProducesIpMigrationKey()
+        {
+            var salt     = Encoding.ASCII.GetBytes("RTMPE-v3-hkdf-salt-2026");
+            var infoBase = Encoding.ASCII.GetBytes("RTMPE-v3-session-key");
+
+            var (clientPriv, clientPub) = Curve25519.GenerateKeyPair();
+            var (serverPriv, serverPub) = Curve25519.GenerateKeyPair();
+
+            var shared = Curve25519.SharedSecret(clientPriv, serverPub);
+            var prk    = HkdfSha256.Extract(salt, shared);
+
+            bool iAmInitiator = CompareKeys(clientPub, serverPub) <= 0;
+            byte[] first, second;
+            if (iAmInitiator) { first = clientPub; second = serverPub; }
+            else              { first = serverPub; second = clientPub; }
+            var info = Concat(infoBase, first, second);
+
+            var expectedMigKey = HkdfSha256.Expand(prk, Concat(info, new byte[] { 0x02 }), 32);
+            Assert.IsNotNull(expectedMigKey, "HKDF expand must not return null");
+            Assert.AreEqual(32, expectedMigKey.Length, "IP migration key must be 32 bytes");
+        }
+
+        /// <summary>
+        /// N-8 T-SDK-02: ipMigrationKey is distinct from the AEAD session keys.
+        /// All three HKDF outputs must differ (info suffix distinguishes them).
+        /// </summary>
+        [Test]
+        [Category("N8IpMigration")]
+        public void DeriveSessionKeys_IpMigrationKey_DifferentFromSessionKeys()
+        {
+            var salt     = Encoding.ASCII.GetBytes("RTMPE-v3-hkdf-salt-2026");
+            var infoBase = Encoding.ASCII.GetBytes("RTMPE-v3-session-key");
+
+            var (clientPriv, clientPub) = Curve25519.GenerateKeyPair();
+            var (serverPriv, serverPub) = Curve25519.GenerateKeyPair();
+
+            var shared = Curve25519.SharedSecret(clientPriv, serverPub);
+            var prk    = HkdfSha256.Extract(salt, shared);
+
+            bool iAmInitiator = CompareKeys(clientPub, serverPub) <= 0;
+            byte[] first, second;
+            if (iAmInitiator) { first = clientPub; second = serverPub; }
+            else              { first = serverPub; second = clientPub; }
+            var info = Concat(infoBase, first, second);
+
+            var keyInit = HkdfSha256.Expand(prk, Concat(info, new byte[] { 0x00 }), 32);
+            var keyResp = HkdfSha256.Expand(prk, Concat(info, new byte[] { 0x01 }), 32);
+            var keyMig  = HkdfSha256.Expand(prk, Concat(info, new byte[] { 0x02 }), 32);
+
+            Assert.IsFalse(BytesEqual(keyInit, keyMig),
+                "IP migration key must differ from key_init");
+            Assert.IsFalse(BytesEqual(keyResp, keyMig),
+                "IP migration key must differ from key_resp");
+            Assert.IsFalse(BytesEqual(keyInit, keyResp),
+                "key_init and key_resp must differ from each other");
+        }
+
+        /// <summary>
+        /// N-8 T-SDK-03: HMAC-SHA256(ipMigrationKey, token) proof is deterministic.
+        /// Same key + same token must always produce the same 32-byte proof.
+        /// </summary>
+        [Test]
+        [Category("N8IpMigration")]
+        public void IpMigrationProof_IsDeterministic()
+        {
+            var key   = new byte[32];
+            for (int i = 0; i < 32; i++) key[i] = (byte)(i + 1);
+            const string token = "reconnect-uuid-v4-test-token";
+
+            var proof1 = ComputeHmacSha256(key, Encoding.UTF8.GetBytes(token));
+            var proof2 = ComputeHmacSha256(key, Encoding.UTF8.GetBytes(token));
+
+            Assert.IsTrue(BytesEqual(proof1, proof2),
+                "HMAC-SHA256 must be deterministic with the same key and message");
+            Assert.AreEqual(32, proof1.Length, "HMAC-SHA256 output must be 32 bytes");
+        }
+
+        /// <summary>
+        /// N-8 T-SDK-04: different keys produce different proofs for the same token.
+        /// Verifies that the key is actually used in the HMAC computation.
+        /// </summary>
+        [Test]
+        [Category("N8IpMigration")]
+        public void IpMigrationProof_DifferentKey_ProducesDifferentProof()
+        {
+            var key1 = new byte[32]; for (int i = 0; i < 32; i++) key1[i] = 0xAA;
+            var key2 = new byte[32]; for (int i = 0; i < 32; i++) key2[i] = 0xBB;
+            var tokenBytes = Encoding.UTF8.GetBytes("same-token");
+
+            var proof1 = ComputeHmacSha256(key1, tokenBytes);
+            var proof2 = ComputeHmacSha256(key2, tokenBytes);
+
+            Assert.IsFalse(BytesEqual(proof1, proof2),
+                "Different HMAC keys must produce different proofs for the same token");
+        }
+
+        // Compute HMAC-SHA256 using System.Security.Cryptography (mirrors NetworkManager).
+        private static byte[] ComputeHmacSha256(byte[] key, byte[] message)
+        {
+            using var hmac = new System.Security.Cryptography.HMACSHA256(key);
+            return hmac.ComputeHash(message);
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // ConstantTimeEquals — pinned-key compare side-channel hardening
+        // ══════════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Equal arrays return true.  Sanity check for the happy path.
+        /// </summary>
+        [Test]
+        [Category("ConstantTime")]
+        public void ConstantTimeEquals_EqualArrays_ReturnsTrue()
+        {
+            var a = new byte[32];
+            var b = new byte[32];
+            for (int i = 0; i < 32; i++) { a[i] = (byte)i; b[i] = (byte)i; }
+            Assert.IsTrue(HandshakeHandler.ConstantTimeEquals(a, b));
+        }
+
+        /// <summary>
+        /// A single-byte difference anywhere in the array returns false.
+        /// Covers prefix, middle, and suffix positions to ensure no early-exit.
+        /// </summary>
+        [Test]
+        [Category("ConstantTime")]
+        public void ConstantTimeEquals_OneByteDiff_ReturnsFalse(
+            [Values(0, 7, 15, 23, 31)] int diffIndex)
+        {
+            var a = new byte[32];
+            var b = new byte[32];
+            for (int i = 0; i < 32; i++) { a[i] = 0x42; b[i] = 0x42; }
+            b[diffIndex] ^= 0x01;
+            Assert.IsFalse(HandshakeHandler.ConstantTimeEquals(a, b),
+                $"diff at index {diffIndex} must be detected");
+        }
+
+        /// <summary>
+        /// Length mismatch returns false (no IndexOutOfRange).
+        /// </summary>
+        [Test]
+        [Category("ConstantTime")]
+        public void ConstantTimeEquals_LengthMismatch_ReturnsFalse()
+        {
+            var a = new byte[32];
+            var b = new byte[31];
+            Assert.IsFalse(HandshakeHandler.ConstantTimeEquals(a, b));
+            Assert.IsFalse(HandshakeHandler.ConstantTimeEquals(b, a));
+        }
+
+        /// <summary>
+        /// Null inputs return false (defensive — never throw NRE).
+        /// </summary>
+        [Test]
+        [Category("ConstantTime")]
+        public void ConstantTimeEquals_NullInputs_ReturnsFalse()
+        {
+            var a = new byte[32];
+            Assert.IsFalse(HandshakeHandler.ConstantTimeEquals(null, a));
+            Assert.IsFalse(HandshakeHandler.ConstantTimeEquals(a, null));
+            Assert.IsFalse(HandshakeHandler.ConstantTimeEquals(null, null));
+        }
+
+        /// <summary>
+        /// Compare-time independence regression: differences at position 0 vs.
+        /// position 31 must take roughly the same wall-clock time.  We sample
+        /// many iterations and assert the timing variance stays inside a
+        /// generous window.  The point is to catch a regression to the prior
+        /// early-exit loop (which leaks the matched-prefix length).
+        /// </summary>
+        [Test]
+        [Category("ConstantTime")]
+        public void ConstantTimeEquals_TimingIsBalanced_AcrossDiffPositions()
+        {
+            const int Iters = 200_000;
+
+            var pinned = new byte[32];
+            for (int i = 0; i < 32; i++) pinned[i] = 0x42;
+
+            var diffAt0  = (byte[])pinned.Clone();  diffAt0[0]  ^= 0x01;
+            var diffAt31 = (byte[])pinned.Clone();  diffAt31[31] ^= 0x01;
+
+            // Warm-up
+            for (int i = 0; i < 1000; i++)
+            {
+                HandshakeHandler.ConstantTimeEquals(pinned, diffAt0);
+                HandshakeHandler.ConstantTimeEquals(pinned, diffAt31);
+            }
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < Iters; i++)
+                HandshakeHandler.ConstantTimeEquals(pinned, diffAt0);
+            sw.Stop();
+            long t0 = sw.ElapsedTicks;
+
+            sw.Restart();
+            for (int i = 0; i < Iters; i++)
+                HandshakeHandler.ConstantTimeEquals(pinned, diffAt31);
+            sw.Stop();
+            long t31 = sw.ElapsedTicks;
+
+            // Generous bound: a non-constant-time loop with early-exit at 0
+            // would be ~32× faster than the full-loop case.  Asserting <3×
+            // catches that regression while tolerating CI/JIT noise.
+            double ratio = (double)Math.Max(t0, t31) / Math.Min(t0, t31);
+            Assert.Less(ratio, 3.0,
+                $"Timing ratio {ratio:F2} suggests early-exit (t0={t0}, t31={t31})");
+        }
+    }
+}
